@@ -34,6 +34,14 @@ STATUS_CHECK_DELAY_SECONDS = 180
 # Tag used to remember the instance's original (pre-downgrade) instance type
 ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 
+# Tag used to opt an instance out of the weekend/public-holiday skip logic.
+# Values: 'true' (start/stop every day as normal) or 'nonstop' (never auto-stop)
+EXCEPTION_TAG = 'equip:infra:autoscheduler:exception'
+
+# SSM parameter (StringList) holding public holiday dates as YYYY-MM-DD,
+# e.g. "2026-01-01,2026-01-26,2026-04-13,2026-04-25,2026-12-25,2026-12-26"
+HOLIDAY_PARAM_NAME = '/autoscheduler/Holidays'
+
 # Instance size ordering (smallest -> largest) used to compute downgrade steps
 SIZE_ORDER = [
     'nano', 'micro', 'small', 'medium', 'large',
@@ -47,6 +55,7 @@ ec2_client = boto3.client('ec2', region_name=region)
 sns_client = boto3.client('sns', region_name=region)
 sts_client = boto3.client('sts')
 scheduler_client = boto3.client('scheduler', region_name=region)
+ssm_client = boto3.client('ssm', region_name=region)
 
 # Instance tracking (reset each invocation)
 instance_names = {}
@@ -58,6 +67,9 @@ app_instances = []
 # Capacity-fallback tracking (reset each invocation)
 downgrade_events = []   # (instance_id, name, original_type, downgraded_type)
 start_failures = []     # (instance_id, name, reason)
+
+# Weekend/holiday skip tracking (reset each invocation)
+skipped_for_holiday = []  # (instance_id, name) — would have started, but skipped
 
 
 # ---------- Helpers ----------
@@ -83,6 +95,34 @@ def get_tag_value(instance, key):
         for tag in instance.tags:
             if tag['Key'] == key:
                 return tag['Value']
+    return None
+
+
+def is_weekend(local_dt):
+    return local_dt.weekday() >= 5  # Saturday=5, Sunday=6
+
+
+def get_public_holidays():
+    """Fetch the holiday date list from SSM. Returns a set of 'YYYY-MM-DD'
+    strings. Fails safe: on any error, logs it and returns an empty set
+    rather than blocking the whole run — a weekday will still work normally,
+    it just won't know about that day's holiday status."""
+    try:
+        response = ssm_client.get_parameter(Name=HOLIDAY_PARAM_NAME)
+        raw_value = response['Parameter']['Value']
+        dates = {d.strip() for d in raw_value.split(',') if d.strip()}
+        return dates
+    except ClientError as e:
+        print(f"WARNING: could not read holiday list from SSM ({HOLIDAY_PARAM_NAME}): {e}. "
+              f"Proceeding as if no holidays are configured for today.")
+        return set()
+
+
+def get_exception_type(instance):
+    """Returns 'true', 'nonstop', or None based on the EXCEPTION_TAG value."""
+    value = get_tag_value(instance, EXCEPTION_TAG)
+    if value:
+        return value.strip().lower()
     return None
 
 
@@ -196,12 +236,30 @@ def lambda_handler(event, context):
 
     downgrade_events.clear()
     start_failures.clear()
+    skipped_for_holiday.clear()
 
     sydney_now = datetime.now(ZoneInfo("Australia/Sydney"))
     ct_sec = sydney_now.hour * 3600 + sydney_now.minute * 60
     timestamp = sydney_now.strftime("%Y-%m-%d %H:%M %Z")
+    today_str = sydney_now.strftime("%Y-%m-%d")
+
+    public_holidays = get_public_holidays()
+    weekend_today = is_weekend(sydney_now)
+    holiday_today = today_str in public_holidays
+    is_skip_day = weekend_today or holiday_today
+
+    if is_skip_day:
+        reason = "Public Holiday" if holiday_today else "Weekend"
+        print(f"Today ({today_str}) is a {reason}. Only instances tagged "
+              f"'{EXCEPTION_TAG} = true' will be started.")
 
     message_lines = [f"🚀 EC2 Autoscheduler Report\n\n📅 Timestamp: {timestamp}\n"]
+    if is_skip_day:
+        reason = "Public Holiday" if holiday_today else "Weekend"
+        message_lines.append(
+            f"📌 Today is a {reason} — normal auto-start is skipped except for "
+            f"instances tagged '{EXCEPTION_TAG} = true'.\n"
+        )
 
     # Evaluate instances
     for instance in ec2_resource.instances.all():
@@ -221,33 +279,52 @@ def lambda_handler(event, context):
                     autostop_flag = value
 
         if scheduler_flag == 'enabled':
+            exception_type = get_exception_type(instance)  # None, 'true', or 'nonstop'
+
             try:
                 if autostart_flag and ':' in autostart_flag:
                     hh, mm = map(int, autostart_flag.split(':'))
                     sta_sec = hh * 3600 + mm * 60
                     if 0 <= (ct_sec - sta_sec) < 300 and instance.state['Name'] == 'stopped':
-                        role = get_instance_role(instance)
-                        if trigger_type == 'db' and role == 'db':
-                            db_instances.append(instance_id)
-                        elif trigger_type == 'app' and role == 'app':
-                            app_instances.append(instance_id)
-                        elif trigger_type == 'all':
-                            if role == 'db':
+                        # On a weekend/public holiday, only instances explicitly
+                        # tagged as an exception ('true') are allowed to start.
+                        if is_skip_day and exception_type != 'true':
+                            skipped_for_holiday.append((instance_id, instance_name))
+                        else:
+                            role = get_instance_role(instance)
+                            if trigger_type == 'db' and role == 'db':
                                 db_instances.append(instance_id)
-                            elif role == 'app':
+                            elif trigger_type == 'app' and role == 'app':
                                 app_instances.append(instance_id)
-                        autostart_instance_ids.append(instance_id)
+                            elif trigger_type == 'all':
+                                if role == 'db':
+                                    db_instances.append(instance_id)
+                                elif role == 'app':
+                                    app_instances.append(instance_id)
+                            autostart_instance_ids.append(instance_id)
 
                 if autostop_flag and ':' in autostop_flag:
                     hh, mm = map(int, autostop_flag.split(':'))
                     sto_sec = hh * 3600 + mm * 60
                     if 0 <= (ct_sec - sto_sec) < 300 and instance.state['Name'] == 'running':
-                        autostop_instance_ids.append(instance_id)
+                        # 'nonstop' instances are never auto-stopped, any day of the week.
+                        if exception_type == 'nonstop':
+                            print(f"Skipping stop for {instance_id} ({instance_name}) — tagged nonstop")
+                        else:
+                            autostop_instance_ids.append(instance_id)
             except Exception as e:
                 print(f"Error parsing time for instance {instance_id}: {e}")
 
     notify_start = False
     notify_stop = False
+
+    if skipped_for_holiday:
+        notify_start = True
+        reason = "Public Holiday" if holiday_today else "Weekend"
+        message_lines.append(
+            f"\n⏭️ Skipped Auto-Start ({reason}, no '{EXCEPTION_TAG} = true' tag):\n"
+            + get_event_table(skipped_for_holiday, ["Instance ID", "Name"])
+        )
 
     # Start actions (per-instance, with capacity fallback)
     if autostart_instance_ids:
@@ -302,6 +379,10 @@ def lambda_handler(event, context):
 
     # Nothing to check later? Don't bother scheduling Lambda 2.
     if not autostart_instance_ids and not autostop_instance_ids:
+        if skipped_for_holiday:
+            # No real action happened, so there's nothing for Lambda 2 to check —
+            # send the holiday-skip notice directly instead of scheduling a delay.
+            send_sns_notification("\n".join(message_lines), sns_topic_start_arn)
         print("No start/stop actions this cycle; skipping status-check scheduling.")
         return
 
