@@ -137,14 +137,27 @@ def get_daily_metric(cw_client, namespace, metric_name, dimensions,
 # S3 upload
 # ---------------------------------------------------------------------------
 
-def upload_html_to_s3(s3_client, bucket, key, html_body):
-    s3_client.put_object(
+def upload_html_to_s3(s3_client, bucket, key, html_body, kms_key_id=None):
+    """
+    kms_key_id: ARN or key ID of the customer managed KMS key the bucket
+    requires. If the bucket enforces SSE-KMS with a specific CMK (a
+    common bucket-policy requirement), this MUST be passed - PutObject
+    will be denied otherwise, or may be encrypted with the wrong key if
+    the caller has access to more than one CMK.
+    """
+    put_kwargs = dict(
         Bucket=bucket,
         Key=key,
         Body=html_body.encode("utf-8"),
         ContentType="text/html",
-        ServerSideEncryption="AES256",
     )
+    if kms_key_id:
+        put_kwargs["ServerSideEncryption"] = "aws:kms"
+        put_kwargs["SSEKMSKeyId"] = kms_key_id
+    else:
+        put_kwargs["ServerSideEncryption"] = "AES256"
+
+    s3_client.put_object(**put_kwargs)
     return f"s3://{bucket}/{key}"
 
 
@@ -158,6 +171,21 @@ def upload_html_to_s3(s3_client, bucket, key, html_body):
 # need to sign with a long-term access key belonging to an IAM user that
 # has s3:GetObject on the bucket. Store that key pair in Secrets Manager
 # and only use it for signing (never for anything else).
+#
+# SSE-KMS WITH A CUSTOMER MANAGED KEY - SECOND REQUIREMENT:
+# If the bucket enforces SSE-KMS with a customer managed key (CMK), an
+# IAM policy granting s3:GetObject is NOT enough. When someone clicks the
+# presigned link, S3 calls KMS to decrypt the object using the identity
+# that SIGNED the URL (the signing IAM user here) - not the anonymous
+# clicker. That means the signing user needs BOTH:
+#   1. An IAM policy statement allowing kms:Decrypt on the CMK, AND
+#   2. A statement in the CMK's own key policy (resource policy)
+#      granting that same principal kms:Decrypt - IAM policy alone does
+#      not satisfy this unless the key policy has a statement enabling
+#      IAM policies to take effect for that principal.
+# Without both, the presigned link returns a 403/KMS AccessDenied to
+# whoever clicks it, even though the S3 permission looks correct.
+# See iam-policy-presign-signing-user.json and kms-key-policy-snippet.json.
 # ---------------------------------------------------------------------------
 
 def get_signing_credentials(secrets_client, secret_id):
@@ -357,6 +385,7 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 BUCKET = os.environ["REPORT_BUCKET"]
 TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 SIGNING_SECRET_ID = os.environ["SIGNING_SECRET_ID"]
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]  # CMK ARN or key ID the bucket requires for SSE-KMS
 WARN_PCT = float(os.environ.get("WARN_THRESHOLD_PCT", "75"))
 BAD_PCT = float(os.environ.get("BAD_THRESHOLD_PCT", "90"))
 
@@ -657,7 +686,7 @@ def lambda_handler(event, context):
     html_report = render_html(data, start_date, end_date, generated_at)
 
     key = f"fsx-report/{start_date.strftime('%Y')}/{start_date.strftime('%m')}/fsx-report-{start_date.strftime('%Y-%m')}.html"
-    s3_uri = upload_html_to_s3(s3, BUCKET, key, html_report)
+    s3_uri = upload_html_to_s3(s3, BUCKET, key, html_report, kms_key_id=KMS_KEY_ID)
 
     url = generate_presigned_url(BUCKET, key, REGION, SIGNING_SECRET_ID)
 
