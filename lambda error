@@ -1,10 +1,1 @@
-{
-  "errorMessage": "'aws_access_key_id'",
-  "errorType": "KeyError",
-  "requestId": "1ac703a6-0675-4772-904a-62049b1caca1",
-  "stackTrace": [
-    "  File \"/var/task/lambda_function.py\", line 691, in lambda_handler\n    url = generate_presigned_url(BUCKET, key, REGION, SIGNING_SECRET_ID)\n",
-    "  File \"/var/task/lambda_function.py\", line 199, in generate_presigned_url\n    ACCESS_KEY, SECRET_KEY = get_signing_credentials(secrets_client, secret_id)\n",
-    "  File \"/var/task/lambda_function.py\", line 194, in get_signing_credentials\n    return secret[\"aws_access_key_id\"], secret[\"aws_secret_access_key\"]\n"
-  ]
-}
+{"ACCESS_KEY":"AKIAQXUIXxxxxxxxNF","SECRET_KEY":"g06NwXxxxxxxxxxxxxxxcMlBeDLwQg"}
