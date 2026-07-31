@@ -1,1 +1,7 @@
-{"ACCESS_KEY":"AKIAQXUIXxxxxxxxNF","SECRET_KEY":"g06NwXxxxxxxxxxxxxxxcMlBeDLwQg"}
+<Error>
+<Code>InvalidArgument</Code>
+<Message>Requests specifying Server Side Encryption with AWS KMS managed keys require AWS Signature Version 4.</Message>
+<ArgumentName>Authorization</ArgumentName>
+<RequestId>C2SNA77D94NXEN4C</RequestId>
+<HostId>3q/DUx2P4ygqYEiSr88BhwfIuAy+d8UoxV9QNOr40qZcxAVfBUS1mF/ZR8CShSiOKTEhrysLeacjWIB35ZY/QKQAQ7Dg6OyV</HostId>
+</Error>
