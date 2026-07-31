@@ -3,38 +3,36 @@ FSx for NetApp ONTAP - Monthly Audit / Capacity Report
 --------------------------------------------------------
 Triggered by EventBridge on the 1st of each month. Builds a daily
 (day 1 -> last day) capacity/performance report for the PREVIOUS month
-covering every FSx ONTAP file system, its SVMs and volumes, uploads an
-HTML report to S3, signs a 7-day presigned URL, and emails it via SNS.
+covering every FSx ONTAP file system, its SVMs and volumes (excluding
+SVM root volumes), uploads an HTML report to S3, signs a 7-day
+presigned URL, and emails it via SNS.
 
 ENV VARS REQUIRED:
   REPORT_BUCKET          - S3 bucket to store the report
   SNS_TOPIC_ARN           - SNS topic to notify
   SIGNING_SECRET_ID       - Secrets Manager secret holding long-term IAM
                              user keys used ONLY to sign the 7-day URL
-                             Secret JSON: {"aws_access_key_id": "...",
-                                           "aws_secret_access_key": "..."}
+  KMS_KEY_ID              - CMK ARN/ID if REPORT_BUCKET enforces SSE-KMS
   WARN_THRESHOLD_PCT      - optional, default "75"
   BAD_THRESHOLD_PCT       - optional, default "90"
 
-KNOWN AWS LIMITATION - PLEASE VALIDATE BEFORE RELYING ON THIS IN AUDIT:
-  Per-volume CloudWatch metrics (StorageCapacity/StorageUsed dimensioned
-  by FileSystemId + StorageVirtualMachineId + VolumeId) are exposed by
-  AWS for FSx ONTAP, but exact availability/naming can vary by file
-  system creation date / AWS region rollout. This code queries CloudWatch
-  first and, if that comes back empty for a volume, falls back to the
-  volume's CURRENT capacity from the FSx API (describe_volumes) so the
-  report never silently shows a blank month - it flags it instead as
-  "CloudWatch history unavailable, showing current snapshot only."
-  Check the AWS/FSx namespace in the CloudWatch console for your file
-  systems and adjust METRIC_DIMENSION_SETS below if needed.
+CLOUDWATCH METRICS USED (verified against AWS docs, docs.aws.amazon.com/
+fsx/latest/ONTAPGuide/volume-metrics.html):
+  Per-volume "Volume metrics" take TWO dimensions only - FileSystemId
+  and VolumeId (no StorageVirtualMachineId):
+    - StorageCapacity  (volume size in bytes)      - stat: Maximum
+    - StorageUsed      (used logical capacity)     - stat: Average
+  Per-volume "Detailed volume metrics" add StorageTier and DataType
+  dimensions and are used here to get REAL snapshot size per volume:
+    - StorageUsed with StorageTier=All, DataType=Snapshot - stat: Average
+      (this includes ONTAP's default 5% snapshot reserve)
 
-  Per-volume SNAPSHOT SIZE is NOT exposed via the FSx or CloudWatch APIs
-  today - only via the ONTAP REST/CLI management API on the SVM
-  management LIF, which requires network reachability into the FSx VPC.
-  This report includes a "Snapshot Size" column that will show "N/A -
-  requires ONTAP API" unless you implement get_snapshot_size_ontap_api()
-  below (stub provided) with an ONTAP API client running from a Lambda
-  attached to the FSx VPC/subnet.
+ROOT VOLUME EXCLUSION:
+  Every SVM has exactly one root volume, identified reliably via
+  describe_volumes -> Volumes[].OntapConfiguration.StorageVirtualMachineRoot
+  (Boolean). This report excludes any volume where that flag is true,
+  since root volumes hold SVM config, not user data, and aren't useful
+  for capacity/growth reporting.
 """
 
 import os
@@ -45,6 +43,7 @@ import calendar
 import datetime
 import boto3
 from botocore.exceptions import ClientError
+from botocore.client import Config
 
 # =============================================================================
 # Shared helper code (normally in report_common.py) - inlined here so
@@ -222,11 +221,17 @@ def generate_presigned_url(bucket, key, region, secret_id, expires_seconds=7 * 2
     secrets_client = boto3.client("secretsmanager", region_name=region)
     access_key, secret_key = get_signing_credentials(secrets_client, secret_id)
 
+    # signature_version MUST be s3v4 here. Presigned URLs for objects
+    # encrypted with SSE-KMS are rejected ("Requests specifying Server
+    # Side Encryption with AWS KMS managed keys require AWS Signature
+    # Version 4") unless the client is explicitly forced to SigV4 - some
+    # boto3/region combinations don't default to it for presigning.
     signing_s3 = boto3.client(
         "s3",
         region_name=region,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
     )
     url = signing_s3.generate_presigned_url(
         "get_object",
@@ -460,15 +465,19 @@ def list_volumes(svm_id):
     return vols
 
 
-def get_snapshot_size_ontap_api(volume):
+def get_snapshot_daily_series(file_system_id, volume_id, start_date, end_date):
     """
-    STUB - AWS does not expose per-volume snapshot size via FSx or
-    CloudWatch APIs. To populate this, call the ONTAP REST API
-    (`/storage/volumes/{uuid}/snapshots`) against the SVM management LIF
-    from a Lambda attached to the FSx VPC, using credentials from Secrets
-    Manager. Left unimplemented here intentionally rather than guessing.
+    Real per-volume snapshot size using the "Detailed volume metrics"
+    StorageUsed, scoped to StorageTier=All / DataType=Snapshot. Includes
+    ONTAP's default 5% snapshot reserve. Stat: Average (per AWS docs).
     """
-    return None
+    dims = [
+        {"Name": "FileSystemId", "Value": file_system_id},
+        {"Name": "VolumeId", "Value": volume_id},
+        {"Name": "StorageTier", "Value": "All"},
+        {"Name": "DataType", "Value": "Snapshot"},
+    ]
+    return get_daily_metric(cw, "AWS/FSx", "StorageUsed", dims, start_date, end_date, stat="Average")
 
 
 # ---------------------------------------------------------------------------
@@ -476,13 +485,16 @@ def get_snapshot_size_ontap_api(volume):
 # ---------------------------------------------------------------------------
 
 def get_volume_daily_series(file_system_id, svm_id, volume_id, start_date, end_date):
+    # Per-volume "Volume metrics" take only FileSystemId + VolumeId.
+    # There is no StorageVirtualMachineId dimension on these metrics -
+    # including it (as an earlier version of this code did) silently
+    # returns zero data points for every day.
     dims = [
         {"Name": "FileSystemId", "Value": file_system_id},
-        {"Name": "StorageVirtualMachineId", "Value": svm_id},
         {"Name": "VolumeId", "Value": volume_id},
     ]
-    capacity_series = get_daily_metric(cw, "AWS/FSx", "StorageCapacity", dims, start_date, end_date)
-    used_series = get_daily_metric(cw, "AWS/FSx", "StorageUsed", dims, start_date, end_date)
+    capacity_series = get_daily_metric(cw, "AWS/FSx", "StorageCapacity", dims, start_date, end_date, stat="Maximum")
+    used_series = get_daily_metric(cw, "AWS/FSx", "StorageUsed", dims, start_date, end_date, stat="Average")
     return capacity_series, used_series
 
 
@@ -493,6 +505,7 @@ def get_volume_daily_series(file_system_id, svm_id, volume_id, start_date, end_d
 def build_report_data(start_date, end_date):
     file_systems = list_ontap_file_systems()
     data = []
+    excluded_root_volume_count = 0
 
     for fs in file_systems:
         fs_id = fs["FileSystemId"]
@@ -514,9 +527,18 @@ def build_report_data(start_date, end_date):
             svm_entry = {"id": svm_id, "name": svm_name, "volumes": []}
 
             for vol in list_volumes(svm_id):
+                vconf = vol.get("OntapConfiguration", {})
+
+                # Exclude SVM root volumes - they hold SVM config, not
+                # user data, and aren't meaningful for capacity/growth
+                # reporting. StorageVirtualMachineRoot is a reliable
+                # Boolean field from describe_volumes (not a name guess).
+                if vconf.get("StorageVirtualMachineRoot") is True:
+                    excluded_root_volume_count += 1
+                    continue
+
                 vol_id = vol["VolumeId"]
                 vol_name = vol.get("Name", "")
-                vconf = vol.get("OntapConfiguration", {})
                 size_bytes_now = vconf.get("SizeInBytes")
                 tiering_policy = (vconf.get("TieringPolicy") or {}).get("Name", "NONE")
                 snapshot_policy = vconf.get("SnapshotPolicy", "N/A")
@@ -525,6 +547,7 @@ def build_report_data(start_date, end_date):
                 cap_series, used_series = get_volume_daily_series(
                     fs_id, svm_id, vol_id, start_date, end_date
                 )
+                snapshot_series = get_snapshot_daily_series(fs_id, vol_id, start_date, end_date)
 
                 cw_has_data = any(v is not None for v in used_series.values())
 
@@ -540,7 +563,7 @@ def build_report_data(start_date, end_date):
                         used = None
                     free = (cap - used) if (cap is not None and used is not None) else None
                     util_pct = (used / cap * 100.0) if (cap and used is not None) else None
-                    snap_size = get_snapshot_size_ontap_api(vol) if d == end_date else None
+                    snap_size = snapshot_series.get(d)
                     daily_rows.append({
                         "date": d, "capacity": cap, "used": used,
                         "free": free, "util_pct": util_pct, "snapshot": snap_size,
@@ -574,14 +597,14 @@ def build_report_data(start_date, end_date):
             fs_entry["svms"].append(svm_entry)
         data.append(fs_entry)
 
-    return data
+    return data, excluded_root_volume_count
 
 
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
 
-def render_html(data, start_date, end_date, generated_at):
+def render_html(data, start_date, end_date, generated_at, excluded_root_count=0):
     all_volumes = []
     for fs in data:
         for svm in fs["svms"]:
@@ -609,7 +632,7 @@ def render_html(data, start_date, end_date, generated_at):
 <div class="header">
   <div>
     <h1>FSx for NetApp ONTAP &mdash; Monthly Capacity &amp; Performance Report</h1>
-    <div class="sub">{len(data)} file system(s) &middot; {len(all_volumes)} volume(s) &middot; audit / capacity-planning record</div>
+    <div class="sub">{len(data)} file system(s) &middot; {len(all_volumes)} data volume(s) &middot; {excluded_root_count} SVM root volume(s) excluded &middot; audit / capacity-planning record</div>
   </div>
   <div class="period">
     Period: {start_date.isoformat()} &rarr; {end_date.isoformat()}<br>
@@ -679,7 +702,7 @@ def render_html(data, start_date, end_date, generated_at):
                 for row in v["daily"]:
                     cls, _ = util_class(row["util_pct"])
                     util_disp = f'<span class="pill-util {cls}">{row["util_pct"]:.1f}%</span>' if row["util_pct"] is not None else "N/A"
-                    snap_disp = fmt_bytes(row["snapshot"]) if row["snapshot"] is not None else "N/A - requires ONTAP API"
+                    snap_disp = fmt_bytes(row["snapshot"]) if row["snapshot"] is not None else "N/A"
                     html.append(
                         f'<tr><td>{row["date"].isoformat()}</td><td>{fmt_bytes(row["capacity"])}</td>'
                         f'<td>{fmt_bytes(row["used"])}</td><td>{fmt_bytes(row["free"])}</td><td>{util_disp}</td><td class="text">{snap_disp}</td></tr>'
@@ -706,8 +729,8 @@ def lambda_handler(event, context):
     start_date, end_date = get_previous_month_range()
     generated_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    data = build_report_data(start_date, end_date)
-    html_report = render_html(data, start_date, end_date, generated_at)
+    data, excluded_root_count = build_report_data(start_date, end_date)
+    html_report = render_html(data, start_date, end_date, generated_at, excluded_root_count)
 
     key = f"fsx-report/{start_date.strftime('%Y')}/{start_date.strftime('%m')}/fsx-report-{start_date.strftime('%Y-%m')}.html"
     s3_uri = upload_html_to_s3(s3, BUCKET, key, html_report, kms_key_id=KMS_KEY_ID)
