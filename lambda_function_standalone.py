@@ -191,7 +191,31 @@ def upload_html_to_s3(s3_client, bucket, key, html_body, kms_key_id=None):
 def get_signing_credentials(secrets_client, secret_id):
     resp = secrets_client.get_secret_value(SecretId=secret_id)
     secret = json.loads(resp["SecretString"])
-    return secret["aws_access_key_id"], secret["aws_secret_access_key"]
+
+    # Accept the documented snake_case shape, the raw shape you get if
+    # you paste `aws iam create-access-key` output directly into the
+    # secret (PascalCase: AccessKeyId / SecretAccessKey), and a simple
+    # ACCESS_KEY / SECRET_KEY shape some teams use by convention.
+    access_key = (
+        secret.get("aws_access_key_id")
+        or secret.get("AccessKeyId")
+        or secret.get("ACCESS_KEY")
+    )
+    secret_key = (
+        secret.get("aws_secret_access_key")
+        or secret.get("SecretAccessKey")
+        or secret.get("SECRET_KEY")
+    )
+
+    if not access_key or not secret_key:
+        raise KeyError(
+            "Secret '%s' does not contain recognized credential keys. "
+            "Expected one of: aws_access_key_id/aws_secret_access_key, "
+            "AccessKeyId/SecretAccessKey, or ACCESS_KEY/SECRET_KEY. "
+            "Found keys: %s"
+            % (secret_id, list(secret.keys()))
+        )
+    return access_key, secret_key
 
 
 def generate_presigned_url(bucket, key, region, secret_id, expires_seconds=7 * 24 * 60 * 60):
