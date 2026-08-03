@@ -9,13 +9,25 @@ CSV export button, and uploads the report to S3 under:
     s3://<bucket>/EC2Inventory/<Year>/<Month>/<Date>/<filename>.html
     s3://<bucket>/EC2Inventory/<Year>/<Month>/<Date>/<filename>.csv   (optional server-side copy)
 
-Usage:
-    python3 ec2_inventory.py --bucket my-inventory-bucket
-    python3 ec2_inventory.py --bucket my-inventory-bucket --regions us-east-1 ap-south-1
-    python3 ec2_inventory.py --bucket my-inventory-bucket --regions ALL
-    python3 ec2_inventory.py --bucket my-inventory-bucket --no-upload   # local file only
+Runs identically as:
+  1. A CLI script:
+       python3 ec2_inventory.py --bucket my-inventory-bucket
+       python3 ec2_inventory.py --bucket my-inventory-bucket --regions us-east-1 ap-south-1
+       python3 ec2_inventory.py --bucket my-inventory-bucket --regions ALL
+       python3 ec2_inventory.py --no-upload --output-dir /tmp   # local file only
 
-Requires: boto3, botocore  (pip install boto3 --break-system-packages)
+  2. An AWS Lambda function (handler = ec2_inventory.lambda_handler), configured via
+     environment variables:
+       BUCKET_NAME   (required)  - S3 bucket to upload the report to
+       REGIONS       (optional)  - comma-separated regions, or "ALL". Defaults to DEFAULT_REGIONS below.
+       EXTERNAL_ID   (optional)  - STS ExternalId used when assuming spoke roles
+
+     Or by passing the same keys in the EventBridge/test event payload, e.g.:
+       {"bucket": "my-inventory-bucket", "regions": "us-east-1,ap-south-1", "external_id": "..."}
+     Event values take priority over environment variables.
+
+Requires: boto3, botocore (already bundled in the standard AWS Lambda Python runtime;
+          for CLI use: pip install boto3 --break-system-packages)
 """
 
 import argparse
@@ -23,6 +35,7 @@ import csv
 import html
 import io
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -581,7 +594,118 @@ def upload_to_s3(bucket, html_content, csv_content, prefix="EC2Inventory"):
 
 
 # --------------------------------------------------------------------------
-# main
+# Core runner - shared by both the CLI entry point and the Lambda handler
+# --------------------------------------------------------------------------
+def run_inventory(bucket=None, regions=None, external_id=None,
+                   output_dir="/tmp", upload=True, write_local=True):
+    """Gather inventory, build the report, optionally write it locally and
+    upload it to S3. Returns a summary dict (used by lambda_handler for its
+    response body, and printed/logged by the CLI)."""
+    regions = regions or DEFAULT_REGIONS
+
+    rows = gather_all_accounts(regions, external_id=external_id)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    html_content = build_html(rows, generated_at)
+    csv_content = build_csv(rows)
+
+    result = {
+        "instance_count": len(rows),
+        "accounts_processed": len(ACCOUNTS),
+        "generated_at": generated_at,
+        "local_html_path": None,
+        "local_csv_path": None,
+        "s3_html_key": None,
+        "s3_csv_key": None,
+        "bucket": bucket,
+    }
+
+    if write_local:
+        # /tmp is the only writable filesystem inside AWS Lambda; it also
+        # works fine for local/CLI runs.
+        local_html = f"{output_dir.rstrip('/')}/ec2_inventory.html"
+        local_csv = f"{output_dir.rstrip('/')}/ec2_inventory.csv"
+        with open(local_html, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        with open(local_csv, "w", encoding="utf-8") as f:
+            f.write(csv_content)
+        log.info("Wrote local report: %s", local_html)
+        log.info("Wrote local csv:    %s", local_csv)
+        result["local_html_path"] = local_html
+        result["local_csv_path"] = local_csv
+
+    if upload:
+        if not bucket:
+            raise ValueError("bucket is required when upload=True")
+        html_key, csv_key = upload_to_s3(bucket, html_content, csv_content)
+        result["s3_html_key"] = html_key
+        result["s3_csv_key"] = csv_key
+
+    log.info("Done. %d total instance(s) across %d account(s).", len(rows), len(ACCOUNTS))
+    return result
+
+
+# --------------------------------------------------------------------------
+# AWS Lambda entry point
+# --------------------------------------------------------------------------
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler. Configure via environment variables:
+        BUCKET_NAME   - S3 bucket to upload the report to (required)
+        REGIONS       - comma-separated region list, or "ALL" (optional)
+        EXTERNAL_ID   - STS ExternalId for assuming spoke roles (optional)
+
+    Or override any of these per-invocation via the event payload, e.g. an
+    EventBridge Scheduler input transformer or a manual test event:
+        {
+          "bucket": "my-inventory-bucket",
+          "regions": "us-east-1,ap-south-1",
+          "external_id": "ec2-inventory-8f3a1c"
+        }
+    """
+    event = event or {}
+
+    bucket = event.get("bucket") or os.environ.get("BUCKET_NAME")
+    if not bucket:
+        raise ValueError(
+            "No S3 bucket configured. Set the BUCKET_NAME environment variable "
+            "or pass {'bucket': '...'} in the invocation event."
+        )
+
+    regions_raw = event.get("regions") or os.environ.get("REGIONS")
+    regions = [r.strip() for r in regions_raw.split(",")] if regions_raw else DEFAULT_REGIONS
+
+    external_id = event.get("external_id") or os.environ.get("EXTERNAL_ID") or EXTERNAL_ID
+
+    # Lambda's filesystem is read-only except /tmp, and there's no reason to
+    # persist a local copy in the execution environment anyway - S3 is the
+    # durable output. write_local=True is harmless (helps for debugging via
+    # CloudWatch-adjacent tooling) but can be turned off if you want the
+    # fastest possible run.
+    result = run_inventory(
+        bucket=bucket,
+        regions=regions,
+        external_id=external_id,
+        output_dir="/tmp",
+        upload=True,
+        write_local=True,
+    )
+
+    return {
+        "statusCode": 200,
+        "body": {
+            "message": "EC2 inventory report generated successfully.",
+            "instance_count": result["instance_count"],
+            "accounts_processed": result["accounts_processed"],
+            "generated_at": result["generated_at"],
+            "s3_html": f"s3://{bucket}/{result['s3_html_key']}",
+            "s3_csv": f"s3://{bucket}/{result['s3_csv_key']}",
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# CLI entry point
 # --------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Multi-account EC2 inventory report generator.")
@@ -597,25 +721,14 @@ def main():
     if not args.no_upload and not args.bucket:
         parser.error("--bucket is required unless --no-upload is set")
 
-    rows = gather_all_accounts(args.regions, external_id=args.external_id)
-
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    html_content = build_html(rows, generated_at)
-    csv_content = build_csv(rows)
-
-    local_html = f"{args.output_dir.rstrip('/')}/ec2_inventory.html"
-    local_csv = f"{args.output_dir.rstrip('/')}/ec2_inventory.csv"
-    with open(local_html, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    with open(local_csv, "w", encoding="utf-8") as f:
-        f.write(csv_content)
-    log.info("Wrote local report: %s", local_html)
-    log.info("Wrote local csv:    %s", local_csv)
-
-    if not args.no_upload:
-        upload_to_s3(args.bucket, html_content, csv_content)
-
-    log.info("Done. %d total instance(s) across %d account(s).", len(rows), len(ACCOUNTS))
+    run_inventory(
+        bucket=args.bucket,
+        regions=args.regions,
+        external_id=args.external_id,
+        output_dir=args.output_dir,
+        upload=not args.no_upload,
+        write_local=True,
+    )
 
 
 if __name__ == "__main__":
