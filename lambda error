@@ -1,7 +1,16 @@
-<Error>
-<Code>InvalidArgument</Code>
-<Message>Requests specifying Server Side Encryption with AWS KMS managed keys require AWS Signature Version 4.</Message>
-<ArgumentName>Authorization</ArgumentName>
-<RequestId>C2SNA77D94NXEN4C</RequestId>
-<HostId>3q/DUx2P4ygqYEiSr88BhwfIuAy+d8UoxV9QNOr40qZcxAVfBUS1mF/ZR8CShSiOKTEhrysLeacjWIB35ZY/QKQAQ7Dg6OyV</HostId>
-</Error>
+Need python script to get below details from the aws servers for the multiple accounts. output should save in the HTML format and with download csv option.
+HTML should have filter account and Oprationg system, let say if i want to filter only Development accout i can filter dev and if i want to filter only Windows it, it should filter only windows because we are using two os platforms windows and Linux.
+if instance have muliple IDS and IP address should have both ips in the same column.
+can you please share least IAM policy and trust role for this activity.
+account id can get using get caller identity but the ENV name (First column) should not get it from the avccount. so will give you the list of account ids with firendly name which we use.
+129185906608 - MGMT
+050752606112 - SPT
+296062549706 - Dev
+324037315235 - SIT
+131844919017 - UAT
+455984641275 - TRN
+487211388026 - PPD
+502361182455 - PRD
+Each Env should be highlighted in the different colur in professional way
+Zone - Get the server availabilty zone
+ENV	 Account ID	Instance Name	Instance ID	Instance Type	IP Address	OS	Zone Status
