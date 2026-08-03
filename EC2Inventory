@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+ec2_inventory.py
+
+Collects EC2 instance inventory across multiple AWS accounts (via cross-account
+role assumption), builds a filterable/searchable HTML report with a client-side
+CSV export button, and uploads the report to S3 under:
+
+    s3://<bucket>/EC2Inventory/<Year>/<Month>/<Date>/<filename>.html
+    s3://<bucket>/EC2Inventory/<Year>/<Month>/<Date>/<filename>.csv   (optional server-side copy)
+
+Usage:
+    python3 ec2_inventory.py --bucket my-inventory-bucket
+    python3 ec2_inventory.py --bucket my-inventory-bucket --regions us-east-1 ap-south-1
+    python3 ec2_inventory.py --bucket my-inventory-bucket --regions ALL
+    python3 ec2_inventory.py --bucket my-inventory-bucket --no-upload   # local file only
+
+Requires: boto3, botocore  (pip install boto3 --break-system-packages)
+"""
+
+import argparse
+import csv
+import html
+import io
+import logging
+import sys
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, BotoCoreError
+
+# --------------------------------------------------------------------------
+# 1. ACCOUNT MAP  -- friendly ENV name is NEVER derived from the account,
+#    it always comes from this static lookup table.
+# --------------------------------------------------------------------------
+ACCOUNTS = {
+    "129185906608": "MGMT",
+    "050752606112": "SPT",
+    "296062549706": "Dev",
+    "324037315235": "SIT",
+    "131844919017": "UAT",
+    "455984641275": "TRN",
+    "487211388026": "PPD",
+    "502361182455": "PRD",
+}
+
+# Name of the read-only role that exists in EVERY spoke (target) account.
+# Create this with iam_spoke_trust_policy.json + iam_spoke_permissions_policy.json
+SPOKE_ROLE_NAME = "EC2InventoryReadOnlyRole"
+
+# Optional STS external id used when assuming the spoke role (must match the
+# condition in the spoke role's trust policy if you set one). Leave as None
+# to disable.
+EXTERNAL_ID = None  # e.g. "ec2-inventory-8f3a1c"
+
+# Regions to scan by default if --regions is not supplied on the CLI.
+DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "ap-south-1"]
+
+# Color palette per ENV - used for the HTML badges (kept muted/professional).
+ENV_COLORS = {
+    "MGMT": "#37474F",  # blue grey
+    "SPT":  "#00695C",  # teal
+    "Dev":  "#2E7D32",  # green
+    "SIT":  "#EF6C00",  # orange
+    "UAT":  "#6A1B9A",  # purple
+    "TRN":  "#795548",  # brown
+    "PPD":  "#F9A825",  # amber
+    "PRD":  "#C62828",  # red - production stands out
+}
+DEFAULT_ENV_COLOR = "#455A64"
+
+STATUS_COLORS = {
+    "running": "#2E7D32",
+    "stopped": "#C62828",
+    "stopping": "#EF6C00",
+    "pending": "#F9A825",
+    "shutting-down": "#EF6C00",
+    "terminated": "#616161",
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("ec2_inventory")
+
+
+# --------------------------------------------------------------------------
+# AWS helpers
+# --------------------------------------------------------------------------
+def assume_spoke_role(sts_client, account_id, role_name, external_id=None):
+    """Assume the read-only inventory role in a spoke account and return a boto3 Session."""
+    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    kwargs = {
+        "RoleArn": role_arn,
+        "RoleSessionName": "ec2-inventory-collector",
+        "DurationSeconds": 3600,
+    }
+    if external_id:
+        kwargs["ExternalId"] = external_id
+
+    resp = sts_client.assume_role(**kwargs)
+    creds = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+
+def get_regions_for_session(session, requested_regions):
+    """Return the list of regions to scan. 'ALL' triggers dynamic discovery."""
+    if len(requested_regions) == 1 and requested_regions[0].upper() == "ALL":
+        ec2 = session.client("ec2", region_name="us-east-1",
+                              config=Config(retries={"max_attempts": 5, "mode": "standard"}))
+        resp = ec2.describe_regions(AllRegions=False)
+        return sorted(r["RegionName"] for r in resp["Regions"])
+    return requested_regions
+
+
+def extract_name_tag(tags):
+    if not tags:
+        return ""
+    for t in tags:
+        if t.get("Key") == "Name":
+            return t.get("Value", "")
+    return ""
+
+
+def extract_ip_addresses(instance):
+    """Collect ALL private + public IPs across ALL network interfaces into one
+    comma-separated string, so multi-NIC / multi-IP instances stay on a single row."""
+    ips = []
+
+    # Primary addresses (covers single-NIC instances even if ENI list is sparse)
+    if instance.get("PrivateIpAddress"):
+        ips.append(instance["PrivateIpAddress"])
+    if instance.get("PublicIpAddress"):
+        ips.append(instance["PublicIpAddress"])
+
+    # All ENIs / all secondary private+public IPs
+    for eni in instance.get("NetworkInterfaces", []):
+        for priv in eni.get("PrivateIpAddresses", []):
+            addr = priv.get("PrivateIpAddress")
+            if addr and addr not in ips:
+                ips.append(addr)
+            assoc = priv.get("Association", {})
+            pub = assoc.get("PublicIp")
+            if pub and pub not in ips:
+                ips.append(pub)
+
+    return ", ".join(ips) if ips else "-"
+
+
+def extract_os(instance):
+    """Best-effort OS detection: PlatformDetails is the most descriptive field
+    boto3/EC2 provides (e.g. 'Windows', 'Linux/UNIX', 'Red Hat Enterprise Linux')."""
+    platform_details = instance.get("PlatformDetails")
+    if platform_details:
+        return platform_details
+    # Fallback for older API responses that only set 'Platform' = 'windows'
+    if instance.get("Platform", "").lower() == "windows":
+        return "Windows"
+    return "Linux/UNIX"
+
+
+def collect_instances_for_account(session, account_id, env_name, regions):
+    rows = []
+    for region in regions:
+        try:
+            ec2 = session.client("ec2", region_name=region,
+                                  config=Config(retries={"max_attempts": 5, "mode": "standard"}))
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for reservation in page.get("Reservations", []):
+                    for inst in reservation.get("Instances", []):
+                        rows.append({
+                            "ENV": env_name,
+                            "AccountId": account_id,
+                            "InstanceName": extract_name_tag(inst.get("Tags")) or "-",
+                            "InstanceId": inst.get("InstanceId", "-"),
+                            "InstanceType": inst.get("InstanceType", "-"),
+                            "IPAddress": extract_ip_addresses(inst),
+                            "OS": extract_os(inst),
+                            "Zone": inst.get("Placement", {}).get("AvailabilityZone", "-"),
+                            "Status": inst.get("State", {}).get("Name", "-"),
+                            "Region": region,
+                        })
+        except ClientError as e:
+            log.warning("  [%s] region %s: %s", env_name, region, e.response["Error"]["Message"])
+        except BotoCoreError as e:
+            log.warning("  [%s] region %s: %s", env_name, region, e)
+    return rows
+
+
+def gather_all_accounts(regions, external_id=None, hub_session=None):
+    hub_session = hub_session or boto3.Session()
+    sts = hub_session.client("sts")
+
+    all_rows = []
+    for account_id, env_name in ACCOUNTS.items():
+        log.info("Processing account %s (%s)...", account_id, env_name)
+        try:
+            spoke_session = assume_spoke_role(sts, account_id, SPOKE_ROLE_NAME, external_id)
+        except (ClientError, BotoCoreError) as e:
+            log.error("  Could not assume role in %s (%s): %s", account_id, env_name, e)
+            continue
+
+        target_regions = get_regions_for_session(spoke_session, regions)
+        rows = collect_instances_for_account(spoke_session, account_id, env_name, target_regions)
+        log.info("  Found %d instance(s) across %d region(s)", len(rows), len(target_regions))
+        all_rows.extend(rows)
+
+    return all_rows
+
+
+# --------------------------------------------------------------------------
+# HTML report generation
+# --------------------------------------------------------------------------
+COLUMNS = [
+    ("ENV", "ENV"),
+    ("AccountId", "Account ID"),
+    ("InstanceName", "Instance Name"),
+    ("InstanceId", "Instance ID"),
+    ("InstanceType", "Instance Type"),
+    ("IPAddress", "IP Address"),
+    ("OS", "OS"),
+    ("Zone", "Zone"),
+    ("Status", "Status"),
+]
+
+
+def esc(v):
+    return html.escape(str(v), quote=True)
+
+
+def build_html(rows, generated_at):
+    envs = sorted(set(r["ENV"] for r in rows)) if rows else list(ACCOUNTS.values())
+    oses = sorted(set(r["OS"] for r in rows)) if rows else []
+
+    env_options = "\n".join(f'<option value="{esc(e)}">{esc(e)}</option>' for e in envs)
+    os_options = "\n".join(f'<option value="{esc(o)}">{esc(o)}</option>' for o in oses)
+
+    env_legend = "\n".join(
+        f'<span class="legend-chip" style="background:{ENV_COLORS.get(e, DEFAULT_ENV_COLOR)}">{esc(e)}</span>'
+        for e in ACCOUNTS.values()
+    )
+
+    header_cells = "\n".join(f"<th>{esc(label)}</th>" for _, label in COLUMNS)
+
+    body_rows = []
+    for r in rows:
+        env_color = ENV_COLORS.get(r["ENV"], DEFAULT_ENV_COLOR)
+        status_color = STATUS_COLORS.get(str(r["Status"]).lower(), "#616161")
+        os_lower = str(r["OS"]).lower()
+        os_class = "windows" if "windows" in os_lower else "linux"
+
+        cells = f"""
+        <td><span class="env-badge" style="background:{env_color}">{esc(r['ENV'])}</span></td>
+        <td>{esc(r['AccountId'])}</td>
+        <td>{esc(r['InstanceName'])}</td>
+        <td class="mono">{esc(r['InstanceId'])}</td>
+        <td>{esc(r['InstanceType'])}</td>
+        <td class="mono ip-cell">{esc(r['IPAddress'])}</td>
+        <td>{esc(r['OS'])}</td>
+        <td>{esc(r['Zone'])}</td>
+        <td><span class="status-badge" style="background:{status_color}">{esc(r['Status'])}</span></td>
+        """
+        body_rows.append(
+            f'<tr data-env="{esc(r["ENV"])}" data-os="{esc(r["OS"])}" data-osclass="{os_class}">{cells}</tr>'
+        )
+
+    body_html = "\n".join(body_rows) if body_rows else (
+        f'<tr><td colspan="{len(COLUMNS)}" class="no-data">No instances found.</td></tr>'
+    )
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>EC2 Inventory Report</title>
+<style>
+  :root {{
+    --bg: #f4f6f8;
+    --card-bg: #ffffff;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #1d4ed8;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }}
+  .container {{ max-width: 1400px; margin: 0 auto; padding: 24px; }}
+  header.app-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 20px;
+  }}
+  header.app-header h1 {{
+    font-size: 22px;
+    margin: 0;
+    font-weight: 600;
+  }}
+  header.app-header .meta {{
+    color: var(--muted);
+    font-size: 13px;
+  }}
+  .legend {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }}
+  .legend-chip {{
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 12px;
+    letter-spacing: .03em;
+  }}
+  .card {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }}
+  .toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: flex-end;
+    margin-bottom: 16px;
+  }}
+  .field {{
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }}
+  .field label {{
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }}
+  select, input[type="text"] {{
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    min-width: 160px;
+    background: #fff;
+  }}
+  .btn {{
+    padding: 9px 16px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .btn-primary {{ background: var(--accent); color: #fff; }}
+  .btn-primary:hover {{ background: #1743b3; }}
+  .btn-secondary {{ background: #eef2ff; color: var(--accent); border: 1px solid #c7d2fe; }}
+  .btn-secondary:hover {{ background: #e0e7ff; }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }}
+  thead th {{
+    text-align: left;
+    padding: 10px 12px;
+    background: #f9fafb;
+    border-bottom: 2px solid var(--border);
+    position: sticky;
+    top: 0;
+    white-space: nowrap;
+  }}
+  tbody td {{
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }}
+  tbody tr:hover {{ background: #f8fafc; }}
+  .mono {{ font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12px; }}
+  .ip-cell {{ max-width: 260px; word-break: break-word; }}
+  .env-badge, .status-badge {{
+    display: inline-block;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 10px;
+    letter-spacing: .03em;
+    white-space: nowrap;
+  }}
+  .table-wrap {{ overflow: auto; max-height: 72vh; border: 1px solid var(--border); border-radius: 8px; }}
+  .no-data {{ text-align: center; color: var(--muted); padding: 24px; }}
+  .count-badge {{
+    font-size: 12px;
+    color: var(--muted);
+    margin-left: 8px;
+  }}
+  footer {{
+    margin-top: 16px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header class="app-header">
+    <div>
+      <h1>EC2 Inventory Report</h1>
+      <div class="meta">Generated: {esc(generated_at)} &nbsp;|&nbsp; Total instances: <span id="totalCount">{len(rows)}</span></div>
+    </div>
+  </header>
+
+  <div class="legend">
+    {env_legend}
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
+      <div class="field">
+        <label for="envFilter">Account (ENV)</label>
+        <select id="envFilter">
+          <option value="">All</option>
+          {env_options}
+        </select>
+      </div>
+      <div class="field">
+        <label for="osFilter">Operating System</label>
+        <select id="osFilter">
+          <option value="">All</option>
+          <option value="windows">Windows only</option>
+          <option value="linux">Linux only</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="searchBox">Search</label>
+        <input type="text" id="searchBox" placeholder="Instance ID, name, IP...">
+      </div>
+      <button class="btn btn-secondary" id="resetBtn">Reset Filters</button>
+      <button class="btn btn-primary" id="downloadCsvBtn">Download CSV</button>
+      <span class="count-badge">Showing <span id="visibleCount">{len(rows)}</span> of {len(rows)}</span>
+    </div>
+
+    <div class="table-wrap">
+      <table id="inventoryTable">
+        <thead>
+          <tr>
+            {header_cells}
+          </tr>
+        </thead>
+        <tbody id="inventoryBody">
+          {body_html}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer>EC2 Inventory Report &mdash; auto-generated. Do not edit manually.</footer>
+</div>
+
+<script>
+  const envFilter = document.getElementById('envFilter');
+  const osFilter = document.getElementById('osFilter');
+  const searchBox = document.getElementById('searchBox');
+  const resetBtn = document.getElementById('resetBtn');
+  const rows = Array.from(document.querySelectorAll('#inventoryBody tr'));
+  const visibleCountEl = document.getElementById('visibleCount');
+
+  function applyFilters() {{
+    const envVal = envFilter.value;
+    const osVal = osFilter.value;
+    const searchVal = searchBox.value.trim().toLowerCase();
+    let visible = 0;
+
+    rows.forEach(row => {{
+      const rowEnv = row.getAttribute('data-env');
+      const rowOsClass = row.getAttribute('data-osclass');
+      const rowText = row.textContent.toLowerCase();
+
+      const envMatch = !envVal || rowEnv === envVal;
+      const osMatch = !osVal || rowOsClass === osVal;
+      const searchMatch = !searchVal || rowText.includes(searchVal);
+
+      const show = envMatch && osMatch && searchMatch;
+      row.style.display = show ? '' : 'none';
+      if (show) visible++;
+    }});
+    visibleCountEl.textContent = visible;
+  }}
+
+  envFilter.addEventListener('change', applyFilters);
+  osFilter.addEventListener('change', applyFilters);
+  searchBox.addEventListener('input', applyFilters);
+  resetBtn.addEventListener('click', () => {{
+    envFilter.value = '';
+    osFilter.value = '';
+    searchBox.value = '';
+    applyFilters();
+  }});
+
+  document.getElementById('downloadCsvBtn').addEventListener('click', () => {{
+    const headerCols = Array.from(document.querySelectorAll('#inventoryTable thead th')).map(th => th.textContent.trim());
+    const csvRows = [headerCols.join(',')];
+
+    rows.forEach(row => {{
+      if (row.style.display === 'none') return;
+      const cells = Array.from(row.querySelectorAll('td')).map(td => {{
+        let val = td.textContent.trim().replace(/\\s+/g, ' ');
+        if (val.includes(',') || val.includes('"')) {{
+          val = '"' + val.replace(/"/g, '""') + '"';
+        }}
+        return val;
+      }});
+      csvRows.push(cells.join(','));
+    }});
+
+    const csvContent = csvRows.join('\\n');
+    const blob = new Blob([csvContent], {{ type: 'text/csv;charset=utf-8;' }});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'ec2_inventory_' + new Date().toISOString().slice(0,10) + '.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }});
+</script>
+</body>
+</html>
+"""
+    return html_doc
+
+
+def build_csv(rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[c[0] for c in COLUMNS])
+    writer.writerow({c[0]: c[1] for c in COLUMNS})
+    for r in rows:
+        writer.writerow({c[0]: r.get(c[0], "") for c in COLUMNS})
+    return buf.getvalue()
+
+
+def upload_to_s3(bucket, html_content, csv_content, prefix="EC2Inventory"):
+    now = datetime.now(timezone.utc)
+    year, month, day = now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
+    stamp = now.strftime("%H%M%S")
+
+    key_prefix = f"{prefix}/{year}/{month}/{day}"
+    html_key = f"{key_prefix}/ec2_inventory_{stamp}.html"
+    csv_key = f"{key_prefix}/ec2_inventory_{stamp}.csv"
+
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=html_key, Body=html_content.encode("utf-8"),
+                   ContentType="text/html")
+    s3.put_object(Bucket=bucket, Key=csv_key, Body=csv_content.encode("utf-8"),
+                   ContentType="text/csv")
+
+    log.info("Uploaded report to s3://%s/%s", bucket, html_key)
+    log.info("Uploaded CSV to    s3://%s/%s", bucket, csv_key)
+    return html_key, csv_key
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Multi-account EC2 inventory report generator.")
+    parser.add_argument("--bucket", help="S3 bucket to upload the report to (required unless --no-upload).")
+    parser.add_argument("--regions", nargs="+", default=DEFAULT_REGIONS,
+                         help="Regions to scan, or 'ALL' to auto-discover enabled regions per account.")
+    parser.add_argument("--external-id", default=EXTERNAL_ID,
+                         help="STS ExternalId to use when assuming spoke roles (optional).")
+    parser.add_argument("--output-dir", default=".", help="Local directory to write the report to.")
+    parser.add_argument("--no-upload", action="store_true", help="Skip S3 upload, write locally only.")
+    args = parser.parse_args()
+
+    if not args.no_upload and not args.bucket:
+        parser.error("--bucket is required unless --no-upload is set")
+
+    rows = gather_all_accounts(args.regions, external_id=args.external_id)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    html_content = build_html(rows, generated_at)
+    csv_content = build_csv(rows)
+
+    local_html = f"{args.output_dir.rstrip('/')}/ec2_inventory.html"
+    local_csv = f"{args.output_dir.rstrip('/')}/ec2_inventory.csv"
+    with open(local_html, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    with open(local_csv, "w", encoding="utf-8") as f:
+        f.write(csv_content)
+    log.info("Wrote local report: %s", local_html)
+    log.info("Wrote local csv:    %s", local_csv)
+
+    if not args.no_upload:
+        upload_to_s3(args.bucket, html_content, csv_content)
+
+    log.info("Done. %d total instance(s) across %d account(s).", len(rows), len(ACCOUNTS))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
