@@ -47,6 +47,15 @@ ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 # Values: 'true' (start/stop every day as normal) or 'nonstop' (never auto-stop)
 EXCEPTION_TAG = 'equip:infra:autoscheduler:exception'
 
+# Optional tag for instances that only run on specific day(s) of the week,
+# with their own start/stop time per day. When present, this REPLACES the
+# plain equip:infratest:autostarttime / autostoptime tags for that instance.
+# Value is a compact JSON object keyed by 3-letter weekday abbreviation:
+#   {"Fri":{"start":"08:00","stop":"20:00"}}
+#   {"Mon":{"start":"07:00","stop":"18:00"},"Wed":{"start":"09:00","stop":"17:00"},"Fri":{"start":"08:00","stop":"20:00"}}
+# A day not listed in the JSON means no start/stop action that day at all.
+WEEKLY_SCHEDULE_TAG = 'equip:infratest:weeklyschedule'
+
 # SSM parameter (StringList) holding public holiday dates as YYYY-MM-DD,
 # e.g. "2026-01-01,2026-01-26,2026-04-13,2026-04-25,2026-12-25,2026-12-26"
 HOLIDAY_PARAM_NAME = '/autoscheduler/Holidays'
@@ -79,6 +88,9 @@ start_failures = []     # (instance_id, name, reason)
 
 # Weekend/holiday skip tracking (reset each invocation)
 skipped_for_holiday = []  # (instance_id, name) — would have started, but skipped
+
+# Weekly-schedule tag validation tracking (reset each invocation)
+malformed_schedule_tags = []  # (instance_id, name, error)
 
 
 # ---------- Helpers ----------
@@ -136,6 +148,43 @@ def get_exception_type(instance):
     return None
 
 
+WEEKDAY_ABBR = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
+def resolve_daily_schedule(instance, today_abbr, plain_autostart, plain_autostop, instance_id, instance_name):
+    """Decides the effective (autostart_flag, autostop_flag) for today.
+
+    If WEEKLY_SCHEDULE_TAG is absent, behaves exactly as before: use the
+    plain per-day-repeating autostarttime/autostoptime tags unchanged.
+
+    If WEEKLY_SCHEDULE_TAG is present, it fully REPLACES the plain tags:
+    only the day(s) listed in the JSON get a start/stop time, every other
+    day of the week gets none at all (no action for this instance today).
+    On a malformed JSON value, logs and falls back to "no action today"
+    for safety rather than guessing, and flags it for the report.
+    """
+    raw = get_tag_value(instance, WEEKLY_SCHEDULE_TAG)
+    if not raw:
+        return plain_autostart, plain_autostop
+
+    try:
+        schedule = json.loads(raw)
+        # normalize keys to 'Mon'/'Tue'/... regardless of case supplied
+        schedule = {k.strip()[:3].capitalize(): v for k, v in schedule.items()}
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        logger.error(f"Malformed {WEEKLY_SCHEDULE_TAG} tag on {instance_id} ({instance_name}): {e}. "
+                      f"Skipping start/stop for this instance today.")
+        malformed_schedule_tags.append((instance_id, instance_name, str(e)))
+        return '', ''
+
+    day_entry = schedule.get(today_abbr)
+    if not day_entry:
+        # Instance is only scheduled on specific days, and today isn't one of them.
+        return '', ''
+
+    return day_entry.get('start', ''), day_entry.get('stop', '')
+
+
 def send_sns_notification(message, topic_arn, subject='EC2 Scheduler Notification'):
     try:
         response = sns_client.publish(TopicArn=topic_arn, Message=message, Subject=subject)
@@ -181,6 +230,17 @@ def is_capacity_error(client_error):
     return code in ('InsufficientInstanceCapacity', 'InsufficientHostCapacity', 'InsufficientCapacityOnHost')
 
 
+def is_invalid_type_error(client_error):
+    """True when AWS rejected the instance type itself because it doesn't
+    exist for that family/region (as opposed to existing but being out of
+    capacity). This happens because not every family offers every size on
+    the SIZE_ORDER ladder (e.g. many r6id sizes skip 18xlarge)."""
+    error = client_error.response.get('Error', {})
+    code = error.get('Code', '')
+    message = error.get('Message', '')
+    return code == 'InvalidParameterValue' and 'do not exist' in message.lower()
+
+
 def start_instance_with_capacity_fallback(instance_id):
     instance = ec2_resource.Instance(instance_id)
     name = instance_names.get(instance_id, get_instance_name(instance))
@@ -210,6 +270,10 @@ def start_instance_with_capacity_fallback(instance_id):
             return True
 
         except ClientError as e:
+            if is_invalid_type_error(e):
+                logger.info(f"{attempt_type} does not exist for this instance family "
+                            f"(instance {instance_id} / {name}) — skipping to next smaller size")
+                continue
             if is_capacity_error(e):
                 logger.warning(f"Capacity issue starting {instance_id} ({name}) as {attempt_type}, "
                                 f"trying next smaller type")
@@ -254,11 +318,13 @@ def lambda_handler(event, context):
     downgrade_events.clear()
     start_failures.clear()
     skipped_for_holiday.clear()
+    malformed_schedule_tags.clear()
 
     sydney_now = datetime.now(ZoneInfo("Australia/Sydney"))
     ct_sec = sydney_now.hour * 3600 + sydney_now.minute * 60
     timestamp = sydney_now.strftime("%Y-%m-%d %H:%M %Z")
     today_str = sydney_now.strftime("%Y-%m-%d")
+    today_abbr = WEEKDAY_ABBR[sydney_now.weekday()]
 
     public_holidays = get_public_holidays()
     weekend_today = is_weekend(sydney_now)
@@ -297,6 +363,9 @@ def lambda_handler(event, context):
 
         if scheduler_flag == 'enabled':
             exception_type = get_exception_type(instance)  # None, 'true', or 'nonstop'
+            autostart_flag, autostop_flag = resolve_daily_schedule(
+                instance, today_abbr, autostart_flag, autostop_flag, instance_id, instance_name
+            )
 
             try:
                 if autostart_flag and ':' in autostart_flag:
@@ -343,6 +412,13 @@ def lambda_handler(event, context):
         message_lines.append(
             f"\n⏭️ Skipped Auto-Start ({reason}, no '{EXCEPTION_TAG} = true' tag):\n"
             + get_event_table(skipped_for_holiday, ["Instance ID", "Name"])
+        )
+
+    if malformed_schedule_tags:
+        notify_start = True
+        message_lines.append(
+            f"\n⚠️ Malformed '{WEEKLY_SCHEDULE_TAG}' Tag (no action taken today for these):\n"
+            + get_event_table(malformed_schedule_tags, ["Instance ID", "Name", "Error"])
         )
 
     # Start actions (per-instance, with capacity fallback)
