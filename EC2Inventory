@@ -141,6 +141,21 @@ def extract_name_tag(tags):
     return ""
 
 
+# Tag key holding the per-instance "Role" value shown right after Instance Name.
+ROLE_TAG_KEY = "equip:server:role"
+
+
+def extract_tag_value(tags, key):
+    """Return the value of a specific tag key, or '-' if the instance doesn't have it."""
+    if not tags:
+        return "-"
+    for t in tags:
+        if t.get("Key") == key:
+            val = t.get("Value", "")
+            return val if val else "-"
+    return "-"
+
+
 def extract_ip_addresses(instance):
     """Collect ALL private + public IPs across ALL network interfaces into one
     comma-separated string, so multi-NIC / multi-IP instances stay on a single row."""
@@ -192,6 +207,7 @@ def collect_instances_for_account(session, account_id, env_name, regions):
                             "ENV": env_name,
                             "AccountId": account_id,
                             "InstanceName": extract_name_tag(inst.get("Tags")) or "-",
+                            "Role": extract_tag_value(inst.get("Tags"), ROLE_TAG_KEY),
                             "InstanceId": inst.get("InstanceId", "-"),
                             "InstanceType": inst.get("InstanceType", "-"),
                             "IPAddress": extract_ip_addresses(inst),
@@ -235,6 +251,7 @@ COLUMNS = [
     ("ENV", "ENV"),
     ("AccountId", "Account ID"),
     ("InstanceName", "Instance Name"),
+    ("Role", "Role"),
     ("InstanceId", "Instance ID"),
     ("InstanceType", "Instance Type"),
     ("IPAddress", "IP Address"),
@@ -273,6 +290,7 @@ def build_html(rows, generated_at):
         <td><span class="env-badge" style="background:{env_color}">{esc(r['ENV'])}</span></td>
         <td>{esc(r['AccountId'])}</td>
         <td>{esc(r['InstanceName'])}</td>
+        <td>{esc(r.get('Role', '-'))}</td>
         <td class="mono">{esc(r['InstanceId'])}</td>
         <td>{esc(r['InstanceType'])}</td>
         <td class="mono ip-cell">{esc(r['IPAddress'])}</td>
