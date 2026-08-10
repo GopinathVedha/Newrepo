@@ -1,0 +1,456 @@
+"""
+EFS - Monthly Audit / Capacity & Performance Report (MULTI-ACCOUNT)
+----------------------------------------------------------------------
+Runs in a CENTRAL account. Triggered by EventBridge on the 1st of each
+month. For each member account in MEMBER_ACCOUNT_IDS, assumes a
+cross-account role, pulls every EFS file system's daily (day 1 -> last
+day) storage/throughput data for the PREVIOUS month, and combines
+everything into ONE HTML report with an Account column, uploads it to
+S3 in the central account, signs a 7-day presigned URL, and emails it
+via SNS.
+
+ENV VARS REQUIRED:
+  REPORT_BUCKET          - S3 bucket (in the central account) to store the report
+  SNS_TOPIC_ARN           - SNS topic (in the central account) to notify
+  SIGNING_SECRET_ID       - Secrets Manager secret with long-term IAM
+                             user keys used ONLY to sign the 7-day URL
+  KMS_KEY_ID              - CMK ARN/ID if REPORT_BUCKET enforces SSE-KMS
+  MEMBER_ACCOUNT_IDS      - comma-separated list of account IDs to
+                             report on, e.g. "111111111111,222222222222,
+                             333333333333,444444444444,555555555555,
+                             666666666666". Include the central account's
+                             own ID here too if it also hosts EFS file
+                             systems you want reported - the role is
+                             assumed the same way in every account,
+                             including the central one, for one
+                             consistent code path.
+  CROSS_ACCOUNT_ROLE_NAME - name of the IAM role (must exist in every
+                             member account) this Lambda assumes,
+                             default "EFSMonthlyReportRole"
+  ACCOUNT_NAMES            - optional JSON object mapping account ID to
+                             a friendly name, e.g.
+                             '{"111111111111":"Prod","222222222222":"Dev"}'
+                             Accounts not listed show their ID only.
+  WARN_THRESHOLD_PCT      - optional, default "75"
+  BAD_THRESHOLD_PCT       - optional, default "90"
+
+CROSS-ACCOUNT SETUP REQUIRED (see README + the two new IAM JSON files):
+  1. In EACH member account, create a role named CROSS_ACCOUNT_ROLE_NAME
+     with a trust policy that trusts this Lambda's execution role
+     (efs-cross-account-role-trust-policy.json), and a permissions
+     policy granting elasticfilesystem:Describe* / cloudwatch:GetMetricData
+     (efs-cross-account-role-permissions-policy.json).
+  2. In the CENTRAL account, this Lambda's own execution role needs
+     sts:AssumeRole on all 6 role ARNs (iam-policy-efs-report.json has
+     been updated accordingly - it no longer needs direct EFS/CloudWatch
+     permissions since all data collection now happens via the assumed
+     role in each member account).
+
+IF AN ACCOUNT FAILS (bad role, no permissions, account suspended, etc.):
+  That account is SKIPPED, not silently dropped - the report includes an
+  "Account Collection Status" table showing every account and whether it
+  succeeded, so failures are visible for audit rather than just missing.
+
+NOTES ON METRICS:
+  StorageBytes is published by EFS with a "StorageClass" dimension of
+  Total / Standard / IA (and Archive, if enabled), once per day.
+  Throughput/connections metrics (PermittedThroughput, MeteredIOBytes,
+  ClientConnections, BurstCreditBalance, PercentIOLimit) are pulled as
+  daily AVERAGE for trending and daily MAXIMUM for burst-credit / peak
+  connection callouts.
+"""
+
+import os
+import json
+import datetime
+import boto3
+
+from report_common import (
+    get_previous_month_range, daterange_days, get_daily_metric,
+    upload_html_to_s3, generate_presigned_url, publish_sns,
+    BASE_CSS, CSV_EXPORT_JS, util_class, fmt_bytes, html_escape,
+)
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+BUCKET = os.environ["REPORT_BUCKET"]
+TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+SIGNING_SECRET_ID = os.environ["SIGNING_SECRET_ID"]
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+MEMBER_ACCOUNT_IDS = [a.strip() for a in os.environ["MEMBER_ACCOUNT_IDS"].split(",") if a.strip()]
+CROSS_ACCOUNT_ROLE_NAME = os.environ.get("CROSS_ACCOUNT_ROLE_NAME", "EFSMonthlyReportRole")
+ACCOUNT_NAMES = json.loads(os.environ.get("ACCOUNT_NAMES", "{}"))
+WARN_PCT = float(os.environ.get("WARN_THRESHOLD_PCT", "75"))
+BAD_PCT = float(os.environ.get("BAD_THRESHOLD_PCT", "90"))
+
+s3 = boto3.client("s3", region_name=REGION)
+sns = boto3.client("sns", region_name=REGION)
+sts = boto3.client("sts", region_name=REGION)
+
+
+def account_label(account_id):
+    name = ACCOUNT_NAMES.get(account_id)
+    return f"{name} ({account_id})" if name else account_id
+
+
+# ---------------------------------------------------------------------------
+# Cross-account session handling
+# ---------------------------------------------------------------------------
+
+def assume_member_session(account_id):
+    role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
+    resp = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName="efs-monthly-report",
+        ExternalId="efs-monthly-report",  # must match the Condition in
+                                           # efs-cross-account-role-trust-policy.json
+        DurationSeconds=900,  # only needs to live for this one account's collection
+    )
+    creds = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=REGION,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inventory (all functions take explicit clients - no module-level globals -
+# since each account uses a different assumed-role session)
+# ---------------------------------------------------------------------------
+
+def get_tag_name(tags):
+    for t in tags or []:
+        if t.get("Key") == "Name":
+            return t.get("Value")
+    return ""
+
+
+def list_file_systems(efs_client):
+    fs_list = []
+    paginator = efs_client.get_paginator("describe_file_systems")
+    for page in paginator.paginate():
+        fs_list.extend(page["FileSystems"])
+    return fs_list
+
+
+def get_lifecycle_policy(efs_client, fs_id):
+    try:
+        resp = efs_client.describe_lifecycle_configuration(FileSystemId=fs_id)
+        policies = resp.get("LifecyclePolicies", [])
+        ia_days = next((p["TransitionToIA"] for p in policies if "TransitionToIA" in p), None)
+        back_to_std = next((p["TransitionToPrimaryStorageClass"] for p in policies if "TransitionToPrimaryStorageClass" in p), None)
+        archive_days = next((p["TransitionToArchive"] for p in policies if "TransitionToArchive" in p), None)
+        return {"to_ia": ia_days, "back_to_standard": back_to_std, "to_archive": archive_days}
+    except Exception as e:
+        print(f"lifecycle lookup failed for {fs_id}: {e}")
+        return {"to_ia": None, "back_to_standard": None, "to_archive": None}
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def get_series(cw_client, fs_id, metric_name, start_date, end_date, stat="Average", storage_class=None):
+    dims = [{"Name": "FileSystemId", "Value": fs_id}]
+    if storage_class:
+        dims.append({"Name": "StorageClass", "Value": storage_class})
+    return get_daily_metric(cw_client, "AWS/EFS", metric_name, dims, start_date, end_date, stat=stat)
+
+
+def build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date):
+    fs_id = fs["FileSystemId"]
+    name = get_tag_name(fs.get("Tags")) or fs_id
+    performance_mode = fs.get("PerformanceMode", "N/A")
+    throughput_mode = fs.get("ThroughputMode", "N/A")
+    lifecycle = get_lifecycle_policy(efs_client, fs_id)
+
+    total_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Total")
+    std_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Standard")
+    ia_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="InfrequentAccess")
+    archive_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Archive")
+
+    permitted_tp = get_series(cw_client, fs_id, "PermittedThroughput", start_date, end_date, stat="Average")
+    metered_io = get_series(cw_client, fs_id, "MeteredIOBytes", start_date, end_date, stat="Sum")
+    client_conn_avg = get_series(cw_client, fs_id, "ClientConnections", start_date, end_date, stat="Average")
+    client_conn_max = get_series(cw_client, fs_id, "ClientConnections", start_date, end_date, stat="Maximum")
+    burst_credit = get_series(cw_client, fs_id, "BurstCreditBalance", start_date, end_date, stat="Minimum")
+    pct_io_limit = get_series(cw_client, fs_id, "PercentIOLimit", start_date, end_date, stat="Maximum")
+
+    daily_rows = []
+    for d in daterange_days(start_date, end_date):
+        daily_rows.append({
+            "date": d,
+            "total": total_series.get(d),
+            "standard": std_series.get(d),
+            "ia": ia_series.get(d),
+            "archive": archive_series.get(d),
+            "permitted_throughput": permitted_tp.get(d),
+            "metered_io_bytes": metered_io.get(d),
+            "client_conn_avg": client_conn_avg.get(d),
+            "client_conn_max": client_conn_max.get(d),
+            "burst_credit_min": burst_credit.get(d),
+            "pct_io_limit_max": pct_io_limit.get(d),
+        })
+
+    latest = daily_rows[-1]
+    first_with_total = next((r for r in daily_rows if r["total"] is not None), None)
+    growth_bytes = None
+    if first_with_total and latest["total"] is not None:
+        growth_bytes = latest["total"] - first_with_total["total"]
+
+    max_conn = max((r["client_conn_max"] for r in daily_rows if r["client_conn_max"] is not None), default=None)
+    avg_conn = _avg([r["client_conn_avg"] for r in daily_rows])
+    max_pct_io = max((r["pct_io_limit_max"] for r in daily_rows if r["pct_io_limit_max"] is not None), default=None)
+    min_burst = min((r["burst_credit_min"] for r in daily_rows if r["burst_credit_min"] is not None), default=None)
+
+    recommendations = build_recommendations(
+        throughput_mode, lifecycle, max_pct_io, min_burst, avg_conn, latest
+    )
+
+    return {
+        "account_id": account_id,
+        "account_label": account_label(account_id),
+        "id": fs_id, "name": name, "performance_mode": performance_mode,
+        "throughput_mode": throughput_mode, "lifecycle": lifecycle,
+        "daily": daily_rows, "latest": latest, "growth_bytes": growth_bytes,
+        "max_conn": max_conn, "avg_conn": avg_conn, "max_pct_io": max_pct_io,
+        "min_burst": min_burst, "recommendations": recommendations,
+    }
+
+
+def _avg(values):
+    vals = [v for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def build_recommendations(throughput_mode, lifecycle, max_pct_io, min_burst, avg_conn, latest):
+    recs = []
+    if lifecycle["to_ia"] is None:
+        recs.append("No lifecycle (IA transition) policy configured - consider enabling to reduce storage cost for cold data.")
+    if lifecycle["back_to_standard"] is None and lifecycle["to_ia"] is not None:
+        recs.append("IA transition is enabled but no transition-back-to-Standard policy is set - review access patterns to avoid repeated retrieval cost.")
+    if throughput_mode == "bursting" and min_burst is not None and min_burst < 1_000_000_000:
+        recs.append("Burst credit balance dropped low this month - sustained throughput may be exceeding baseline; consider Elastic or Provisioned throughput mode.")
+    if throughput_mode == "bursting" and max_pct_io is not None and max_pct_io >= 90:
+        recs.append("PercentIOLimit hit >= 90% on Bursting mode - file system is I/O constrained; consider Elastic throughput mode.")
+    if avg_conn is not None and avg_conn < 1 and (latest["total"] or 0) > 0:
+        recs.append("Very low average client connections with nonzero storage - file system may be idle; candidate for lifecycle review or decommission.")
+    if lifecycle["to_ia"] is not None and latest["ia"] and latest["standard"] and latest["ia"] > latest["standard"]:
+        recs.append("Majority of data has moved to IA storage - lifecycle policy is working as intended, contributing to cost savings.")
+    if not recs:
+        recs.append("No action items - configuration and utilization look healthy for this period.")
+    return recs
+
+
+# ---------------------------------------------------------------------------
+# Cross-account collection
+# ---------------------------------------------------------------------------
+
+def collect_account_reports(account_id, start_date, end_date):
+    """Returns (reports_list, error_message_or_None) for one account."""
+    try:
+        session = assume_member_session(account_id)
+        efs_client = session.client("efs")
+        cw_client = session.client("cloudwatch")
+        file_systems = list_file_systems(efs_client)
+        reports = [
+            build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date)
+            for fs in file_systems
+        ]
+        return reports, None
+    except Exception as e:
+        print(f"Failed to collect account {account_id}: {e}")
+        return [], str(e)
+
+
+# ---------------------------------------------------------------------------
+# HTML rendering
+# ---------------------------------------------------------------------------
+
+def render_html(reports, account_status, start_date, end_date, generated_at):
+    ranked = sorted(
+        [r for r in reports if r["max_pct_io"] is not None],
+        key=lambda r: r["max_pct_io"], reverse=True
+    )
+    unranked = [r for r in reports if r["max_pct_io"] is None]
+
+    total_size = sum((r["latest"]["total"] or 0) for r in reports)
+    total_std = sum((r["latest"]["standard"] or 0) for r in reports)
+    total_ia = sum((r["latest"]["ia"] or 0) for r in reports)
+    total_archive = sum((r["latest"]["archive"] or 0) for r in reports)
+    no_lifecycle = [r for r in reports if r["lifecycle"]["to_ia"] is None]
+    accounts_ok = [a for a, s in account_status.items() if s["ok"]]
+    accounts_failed = [a for a, s in account_status.items() if not s["ok"]]
+
+    html = [f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>EFS Capacity &amp; Performance Report - {start_date.strftime('%B %Y')}</title>
+<style>{BASE_CSS}</style></head><body><div class="wrap">
+
+<div class="header">
+  <div>
+    <h1>Amazon EFS &mdash; Monthly Capacity &amp; Performance Report</h1>
+    <div class="sub">{len(accounts_ok)} account(s) reported &middot; {len(reports)} file system(s) &middot; audit / capacity-planning record</div>
+  </div>
+  <div class="period">
+    Period: {start_date.isoformat()} &rarr; {end_date.isoformat()}<br>
+    Generated: {generated_at}<br>
+    Region: {REGION}
+  </div>
+</div>
+
+<div class="section">
+  <h2>Executive Summary</h2>
+  <div class="summary-grid">
+    <div class="stat-card"><div class="label">Accounts Reported</div><div class="value">{len(accounts_ok)} / {len(account_status)}</div></div>
+    <div class="stat-card"><div class="label">Total File Systems</div><div class="value">{len(reports)}</div></div>
+    <div class="stat-card"><div class="label">Total Size</div><div class="value small">{fmt_bytes(total_size)}</div></div>
+    <div class="stat-card"><div class="label">Standard Class</div><div class="value small">{fmt_bytes(total_std)}</div></div>
+    <div class="stat-card"><div class="label">IA Class</div><div class="value small">{fmt_bytes(total_ia)}</div></div>
+    <div class="stat-card"><div class="label">Archive Class</div><div class="value small">{fmt_bytes(total_archive)}</div></div>
+    <div class="stat-card" style="border-left-color:var(--warn)"><div class="label">No Lifecycle Policy</div><div class="value" style="color:var(--warn)">{len(no_lifecycle)}</div></div>
+    <div class="stat-card" style="border-left-color:{'var(--bad)' if accounts_failed else 'var(--good)'}"><div class="label">Accounts With Errors</div><div class="value" style="color:{'var(--bad)' if accounts_failed else 'var(--good)'}">{len(accounts_failed)}</div></div>
+  </div>
+"""]
+
+    if accounts_failed:
+        html.append('<p class="note" style="color:var(--bad)">One or more accounts could not be collected this month - see Account Collection Status below for details. All other accounts still reported normally.</p>')
+
+    html.append("""
+  <p class="note">File systems below are ranked by peak I/O utilization this month (PercentIOLimit, highest first), across all accounts combined, to surface the busiest systems for capacity review.</p>
+  <div class="table-scroll">
+  <table id="summary-table" class="striped">
+    <tr><th>Rank</th><th>Account</th><th>File System</th><th>Total Size</th><th>Standard</th><th>IA</th><th>Peak IO Util %</th><th>Avg Connections</th><th>Month Growth</th><th>Status</th></tr>
+""")
+    for i, r in enumerate(ranked + unranked, 1):
+        cls, tier = util_class(r["max_pct_io"])
+        util_disp = f'{r["max_pct_io"]:.1f}%' if r["max_pct_io"] is not None else "N/A"
+        badge = f'<span class="badge {tier}">{tier}</span>'
+        growth = fmt_bytes(r["growth_bytes"]) if r["growth_bytes"] is not None else "N/A"
+        conn_disp = f'{r["avg_conn"]:.1f}' if r["avg_conn"] is not None else "N/A"
+        html.append(
+            f'<tr><td>{i}</td><td class="text">{html_escape(r["account_label"])}</td>'
+            f'<td class="text">{html_escape(r["name"])} ({r["id"]})</td>'
+            f'<td>{fmt_bytes(r["latest"]["total"])}</td><td>{fmt_bytes(r["latest"]["standard"])}</td>'
+            f'<td>{fmt_bytes(r["latest"]["ia"])}</td><td class="pill-util {cls}">{util_disp}</td>'
+            f'<td>{conn_disp}</td><td>{growth}</td><td>{badge}</td></tr>'
+        )
+    html.append("""</table></div>
+  <button class="csv-btn" onclick="tableToCSV('summary-table','efs_summary.csv')">Download CSV</button>
+</div>
+""")
+
+    # Account collection status - visible audit trail of which accounts
+    # succeeded/failed this run, not just a silent skip.
+    html.append('<div class="section"><h2>Account Collection Status</h2><div class="table-scroll"><table id="account-status-table" class="striped">')
+    html.append("<tr><th>Account ID</th><th>Account Name</th><th>File Systems Found</th><th>Status</th><th>Detail</th></tr>")
+    for account_id, status in account_status.items():
+        badge = '<span class="badge ok">ok</span>' if status["ok"] else '<span class="badge bad">error</span>'
+        detail = html_escape(status["error"]) if status["error"] else "-"
+        html.append(
+            f'<tr><td>{account_id}</td><td class="text">{html_escape(ACCOUNT_NAMES.get(account_id, "-"))}</td>'
+            f'<td>{status["fs_count"]}</td><td>{badge}</td><td class="text">{detail}</td></tr>'
+        )
+    html.append('</table></div><button class="csv-btn" onclick="tableToCSV(\'account-status-table\',\'efs_account_status.csv\')">Download CSV</button></div>')
+
+    # Inventory + config table
+    html.append('<div class="section"><h2>File System Inventory &amp; Configuration</h2><div class="table-scroll"><table id="inventory-table" class="striped">')
+    html.append("<tr><th>Account</th><th>FS ID</th><th>Name</th><th>Performance Mode</th><th>Throughput Mode</th><th>IA Transition (days)</th><th>Back-to-Standard</th><th>Archive Transition (days)</th></tr>")
+    for r in reports:
+        lc = r["lifecycle"]
+        html.append(
+            f'<tr><td class="text">{html_escape(r["account_label"])}</td><td>{r["id"]}</td><td class="text">{html_escape(r["name"])}</td><td>{r["performance_mode"]}</td>'
+            f'<td>{r["throughput_mode"]}</td><td>{lc["to_ia"] or "Not set"}</td>'
+            f'<td>{lc["back_to_standard"] or "Not set"}</td><td>{lc["to_archive"] or "Not set"}</td></tr>'
+        )
+    html.append('</table></div><button class="csv-btn" onclick="tableToCSV(\'inventory-table\',\'efs_inventory.csv\')">Download CSV</button></div>')
+
+    # Recommendations section
+    html.append('<div class="section"><h2>Recommendations</h2>')
+    for r in reports:
+        html.append(f'<p><strong>{html_escape(r["account_label"])} &mdash; {html_escape(r["name"])} ({r["id"]})</strong></p><ul>')
+        for rec in r["recommendations"]:
+            html.append(f"<li>{html_escape(rec)}</li>")
+        html.append("</ul>")
+    html.append("</div>")
+
+    # Per-file-system daily detail
+    for r in reports:
+        tbl_id = f"daily_{r['account_id']}_{r['id']}"
+        html.append(f"""<div class="section">
+  <h2>{html_escape(r['account_label'])} / {html_escape(r['name'])} ({r['id']}) &mdash; Daily Detail</h2>
+  <div class="table-scroll"><table id="{tbl_id}" class="striped">
+    <tr><th>Date</th><th>Total</th><th>Standard</th><th>IA</th><th>Archive</th>
+    <th>Permitted Throughput (avg)</th><th>Metered IO (sum)</th><th>Clients (avg/max)</th>
+    <th>Burst Credit (min)</th><th>IO Limit % (max)</th></tr>
+""")
+        for row in r["daily"]:
+            cls, _ = util_class(row["pct_io_limit_max"])
+            io_disp = f'<span class="pill-util {cls}">{row["pct_io_limit_max"]:.1f}%</span>' if row["pct_io_limit_max"] is not None else "N/A"
+            conn_disp = f'{row["client_conn_avg"]:.1f} / {row["client_conn_max"]:.0f}' if row["client_conn_avg"] is not None and row["client_conn_max"] is not None else "N/A"
+            html.append(
+                f'<tr><td>{row["date"].isoformat()}</td><td>{fmt_bytes(row["total"])}</td>'
+                f'<td>{fmt_bytes(row["standard"])}</td><td>{fmt_bytes(row["ia"])}</td><td>{fmt_bytes(row["archive"])}</td>'
+                f'<td>{fmt_bytes(row["permitted_throughput"], "B/s") if row["permitted_throughput"] is not None else "N/A"}</td>'
+                f'<td>{fmt_bytes(row["metered_io_bytes"])}</td><td>{conn_disp}</td>'
+                f'<td>{fmt_bytes(row["burst_credit_min"])}</td><td>{io_disp}</td></tr>'
+            )
+        html.append(f'</table></div><button class="csv-btn" onclick="tableToCSV(\'{tbl_id}\',\'efs_{r["account_id"]}_{r["id"]}_daily.csv\')">Download CSV</button></div>')
+
+    html.append(f"""
+<div class="footer">
+  <span>EFS Monthly Report &middot; multi-account &middot; auto-generated &middot; for audit / capacity-planning use</span>
+  <span>Report period {start_date.isoformat()} to {end_date.isoformat()}</span>
+</div>
+</div>
+<script>{CSV_EXPORT_JS}</script>
+</body></html>""")
+
+    return "".join(html)
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
+
+def lambda_handler(event, context):
+    start_date, end_date = get_previous_month_range()
+    generated_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    all_reports = []
+    account_status = {}
+    for account_id in MEMBER_ACCOUNT_IDS:
+        reports, error = collect_account_reports(account_id, start_date, end_date)
+        account_status[account_id] = {
+            "ok": error is None,
+            "error": error,
+            "fs_count": len(reports),
+        }
+        all_reports.extend(reports)
+
+    html_report = render_html(all_reports, account_status, start_date, end_date, generated_at)
+
+    key = f"efs-report/{start_date.strftime('%Y')}/{start_date.strftime('%m')}/efs-report-{start_date.strftime('%Y-%m')}.html"
+    s3_uri = upload_html_to_s3(s3, BUCKET, key, html_report, kms_key_id=KMS_KEY_ID)
+
+    url = generate_presigned_url(BUCKET, key, REGION, SIGNING_SECRET_ID)
+
+    accounts_ok = sum(1 for s in account_status.values() if s["ok"])
+    accounts_failed = [a for a, s in account_status.items() if not s["ok"]]
+    subject = f"EFS Monthly Report - {start_date.strftime('%B %Y')}"
+    message_lines = [
+        f"The EFS monthly capacity & performance report for {start_date.strftime('%B %Y')} is ready.",
+        f"Accounts reported: {accounts_ok} / {len(MEMBER_ACCOUNT_IDS)}",
+    ]
+    if accounts_failed:
+        message_lines.append(f"Accounts with collection errors (see report for details): {', '.join(accounts_failed)}")
+    message_lines += [
+        "",
+        f"Report link (valid 7 days):\n{url}",
+        "",
+        f"S3 location: {s3_uri}",
+    ]
+    publish_sns(sns, TOPIC_ARN, subject, "\n".join(message_lines))
+
+    return {"statusCode": 200, "body": f"Report uploaded to {s3_uri} and notification sent."}
