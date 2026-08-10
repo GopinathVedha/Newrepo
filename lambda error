@@ -1,1 +1,7 @@
-i-0289cbccac3ef5def | awsgldrbe301 | An error occurred (InvalidParameterValue) when calling the ModifyInstanceAttribute operation: The following supplied instance types do not exist: [r6id.18xlarge]
+SELECT key, COUNT(*) AS retrieval_count, SUM(bytes_sent) AS total_bytes
+FROM access_logs
+WHERE operation = 'REST.GET.OBJECT'
+  AND bucket = 'corporateit-equipprd-prod'
+  AND date BETWEEN '2026-07-01' AND '2026-07-31'
+GROUP BY key
+ORDER BY retrieval_count DESC
