@@ -1,0 +1,119 @@
+{
+  "_comment": "Deploy this as the PERMISSIONS policy attached to the role named CROSS_ACCOUNT_ROLE_NAME (default 'EFSMonthlyReportRole') in EACH of the 6 member accounts. Read-only - this role cannot modify anything.",
+
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EFSReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeLifecycleConfiguration",
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:DescribeTags",
+        "elasticfilesystem:ListTagsForResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+
+################
+
+Trust:
+{
+  "_comment": "Deploy this as the TRUST policy for the role named CROSS_ACCOUNT_ROLE_NAME (default 'EFSMonthlyReportRole') in EACH of the 6 member accounts. Replace CENTRAL_ACCOUNT_ID and CENTRAL_LAMBDA_ROLE_NAME with the central account's ID and the EFS Lambda's execution role name.",
+
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::CENTRAL_ACCOUNT_ID:role/CENTRAL_LAMBDA_ROLE_NAME"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "efs-monthly-report"
+        }
+      }
+    }
+  ]
+}
+
+#############
+
+Lambda :
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:REGION:CENTRAL_ACCOUNT_ID:log-group:/aws/lambda/efs-monthly-report:*"
+    },
+    {
+      "Sid": "AssumeRoleInMemberAccounts",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_1:role/EFSMonthlyReportRole",
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_2:role/EFSMonthlyReportRole",
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_3:role/EFSMonthlyReportRole",
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_4:role/EFSMonthlyReportRole",
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_5:role/EFSMonthlyReportRole",
+        "arn:aws:iam::MEMBER_ACCOUNT_ID_6:role/EFSMonthlyReportRole"
+      ]
+    },
+    {
+      "Sid": "S3WriteReport",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::REPORT_BUCKET/efs-report/*"
+    },
+    {
+      "Sid": "SNSPublish",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "arn:aws:sns:REGION:CENTRAL_ACCOUNT_ID:TOPIC_NAME"
+    },
+    {
+      "Sid": "ReadSigningSecret",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:REGION:CENTRAL_ACCOUNT_ID:secret:SIGNING_SECRET_NAME-*"
+    },
+    {
+      "Sid": "KMSForSSEUpload",
+      "Effect": "Allow",
+      "Action": [
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:REGION:CENTRAL_ACCOUNT_ID:key/KMS_KEY_ID"
+    }
+  ]
+}
