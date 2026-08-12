@@ -12,8 +12,6 @@ via SNS.
 ENV VARS REQUIRED:
   REPORT_BUCKET          - S3 bucket (in the central account) to store the report
   SNS_TOPIC_ARN           - SNS topic (in the central account) to notify
-  SIGNING_SECRET_ID       - Secrets Manager secret with long-term IAM
-                             user keys used ONLY to sign the 7-day URL
   KMS_KEY_ID              - CMK ARN/ID if REPORT_BUCKET enforces SSE-KMS
   MEMBER_ACCOUNT_IDS      - comma-separated list of account IDs to
                              report on, e.g. "111111111111,222222222222,
@@ -31,8 +29,28 @@ ENV VARS REQUIRED:
                              a friendly name, e.g.
                              '{"111111111111":"Prod","222222222222":"Dev"}'
                              Accounts not listed show their ID only.
+  PRESIGNED_URL_EXPIRY_SECONDS - optional, default "900" (15 minutes).
+                             The link is signed with THIS Lambda's own
+                             execution role - see the note below on why
+                             that means keeping this short.
   WARN_THRESHOLD_PCT      - optional, default "75"
   BAD_THRESHOLD_PCT       - optional, default "90"
+
+PRESIGNED URL - ROLE-BASED, SHORT-LIVED (no Secrets Manager needed):
+  Unlike the FSx report (which uses a long-term IAM user's keys stored
+  in Secrets Manager to sign a guaranteed 7-day link), this report signs
+  its presigned URL with the Lambda's OWN execution role credentials.
+  That's simpler to set up - no secret to create/rotate in the central
+  account - but the trade-off is real: Lambda periodically rotates its
+  execution role's underlying temporary credentials on a schedule AWS
+  doesn't publish a fixed guarantee for. Once that happens, a URL signed
+  with the old credentials stops working immediately, regardless of the
+  ExpiresIn value. PRESIGNED_URL_EXPIRY_SECONDS defaults to 900 (15
+  minutes), which is safe in virtually all cases - don't push this much
+  past an hour. If you need a guaranteed multi-day link for EFS the way
+  FSx has, set up the same Secrets Manager signing-user pattern here
+  too (see FSx's SIGNING_SECRET_ID / generate_presigned_url in
+  report_common.py) - just ask and I'll wire it in.
 
 CROSS-ACCOUNT SETUP REQUIRED (see README + the two new IAM JSON files):
   1. In EACH member account, create a role named CROSS_ACCOUNT_ROLE_NAME
@@ -61,21 +79,419 @@ NOTES ON METRICS:
 """
 
 import os
+import io
+import csv
 import json
+import calendar
 import datetime
 import boto3
+from botocore.exceptions import ClientError
+from botocore.client import Config
 
-from report_common import (
-    get_previous_month_range, daterange_days, get_daily_metric,
-    upload_html_to_s3, generate_presigned_url, publish_sns,
-    BASE_CSS, CSV_EXPORT_JS, util_class, fmt_bytes, html_escape,
-)
+# =============================================================================
+# Shared helper code (normally in report_common.py) - inlined here so
+# this single file can be pasted directly into the Lambda console.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Date range helper
+# ---------------------------------------------------------------------------
+
+def get_previous_month_range(today=None):
+    """
+    Returns (start_date, end_date) as datetime.date objects covering the
+    FULL previous calendar month (day 1 -> last day), regardless of which
+    day the Lambda actually runs on. Intended to be triggered on the 1st,
+    but is safe to re-run any day of the month.
+    """
+    today = today or datetime.date.today()
+    first_of_this_month = today.replace(day=1)
+    last_day_prev_month = first_of_this_month - datetime.timedelta(days=1)
+    start_date = last_day_prev_month.replace(day=1)
+    end_date = last_day_prev_month
+    return start_date, end_date
+
+
+def daterange_days(start_date, end_date):
+    """Yield every date from start_date to end_date inclusive."""
+    for n in range((end_date - start_date).days + 1):
+        yield start_date + datetime.timedelta(days=n)
+
+
+# ---------------------------------------------------------------------------
+# CloudWatch helper
+# ---------------------------------------------------------------------------
+
+def get_daily_metric(cw_client, namespace, metric_name, dimensions,
+                      start_date, end_date, stat="Average", unit=None):
+    """
+    Fetch one daily datapoint (period=86400s) per day for a metric across
+    a date range using GetMetricData. Returns a dict {date: value_or_None}.
+
+    dimensions: list of {"Name": ..., "Value": ...}
+    """
+    start_dt = datetime.datetime.combine(start_date, datetime.time.min)
+    end_dt = datetime.datetime.combine(end_date, datetime.time.max)
+
+    metric_query = {
+        "Id": "m1",
+        "MetricStat": {
+            "Metric": {
+                "Namespace": namespace,
+                "MetricName": metric_name,
+                "Dimensions": dimensions,
+            },
+            "Period": 86400,  # 1 day
+            "Stat": stat,
+        },
+        "ReturnData": True,
+    }
+    if unit:
+        metric_query["MetricStat"]["Unit"] = unit
+
+    results = {}
+    next_token = None
+    try:
+        while True:
+            kwargs = dict(
+                MetricDataQueries=[metric_query],
+                StartTime=start_dt,
+                EndTime=end_dt,
+                ScanBy="TimestampAscending",
+            )
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = cw_client.get_metric_data(**kwargs)
+            for mdr in resp.get("MetricDataResults", []):
+                for ts, val in zip(mdr["Timestamps"], mdr["Values"]):
+                    results[ts.date()] = val
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+    except ClientError as e:
+        print(f"CloudWatch error for {metric_name} {dimensions}: {e}")
+
+    # Fill missing days with None so the report shows gaps explicitly
+    return {d: results.get(d) for d in daterange_days(start_date, end_date)}
+
+
+# ---------------------------------------------------------------------------
+# S3 upload
+# ---------------------------------------------------------------------------
+
+def upload_html_to_s3(s3_client, bucket, key, html_body, kms_key_id=None):
+    """
+    kms_key_id: ARN or key ID of the customer managed KMS key the bucket
+    requires. If the bucket enforces SSE-KMS with a specific CMK (a
+    common bucket-policy requirement), this MUST be passed - PutObject
+    will be denied otherwise, or may be encrypted with the wrong key if
+    the caller has access to more than one CMK.
+    """
+    put_kwargs = dict(
+        Bucket=bucket,
+        Key=key,
+        Body=html_body.encode("utf-8"),
+        ContentType="text/html",
+    )
+    if kms_key_id:
+        put_kwargs["ServerSideEncryption"] = "aws:kms"
+        put_kwargs["SSEKMSKeyId"] = kms_key_id
+    else:
+        put_kwargs["ServerSideEncryption"] = "AES256"
+
+    s3_client.put_object(**put_kwargs)
+    return f"s3://{bucket}/{key}"
+
+
+# ---------------------------------------------------------------------------
+# Presigned URL - MUST use long-term IAM user credentials.
+#
+# IMPORTANT: A Lambda's execution-role credentials are temporary (STS) and
+# expire well before 7 days. A presigned URL signed with temporary
+# credentials becomes invalid the moment those credentials expire -
+# regardless of the Expires value you pass. To get a real 7-day link you
+# need to sign with a long-term access key belonging to an IAM user that
+# has s3:GetObject on the bucket. Store that key pair in Secrets Manager
+# and only use it for signing (never for anything else).
+#
+# SSE-KMS WITH A CUSTOMER MANAGED KEY - SECOND REQUIREMENT:
+# If the bucket enforces SSE-KMS with a customer managed key (CMK), an
+# IAM policy granting s3:GetObject is NOT enough. When someone clicks the
+# presigned link, S3 calls KMS to decrypt the object using the identity
+# that SIGNED the URL (the signing IAM user here) - not the anonymous
+# clicker. That means the signing user needs BOTH:
+#   1. An IAM policy statement allowing kms:Decrypt on the CMK, AND
+#   2. A statement in the CMK's own key policy (resource policy)
+#      granting that same principal kms:Decrypt - IAM policy alone does
+#      not satisfy this unless the key policy has a statement enabling
+#      IAM policies to take effect for that principal.
+# Without both, the presigned link returns a 403/KMS AccessDenied to
+# whoever clicks it, even though the S3 permission looks correct.
+# See iam-policy-presign-signing-user.json and kms-key-policy-snippet.json.
+# ---------------------------------------------------------------------------
+
+def get_signing_credentials(secrets_client, secret_id):
+    resp = secrets_client.get_secret_value(SecretId=secret_id)
+    secret = json.loads(resp["SecretString"])
+
+    # Accept the documented snake_case shape, the raw shape you get if
+    # you paste `aws iam create-access-key` output directly into the
+    # secret (PascalCase: AccessKeyId / SecretAccessKey), and a simple
+    # ACCESS_KEY / SECRET_KEY shape some teams use by convention.
+    access_key = (
+        secret.get("aws_access_key_id")
+        or secret.get("AccessKeyId")
+        or secret.get("ACCESS_KEY")
+    )
+    secret_key = (
+        secret.get("aws_secret_access_key")
+        or secret.get("SecretAccessKey")
+        or secret.get("SECRET_KEY")
+    )
+
+    if not access_key or not secret_key:
+        raise KeyError(
+            "Secret '%s' does not contain recognized credential keys. "
+            "Expected one of: aws_access_key_id/aws_secret_access_key, "
+            "AccessKeyId/SecretAccessKey, or ACCESS_KEY/SECRET_KEY. "
+            "Found keys: %s"
+            % (secret_id, list(secret.keys()))
+        )
+    return access_key, secret_key
+
+
+def generate_presigned_url_via_role(bucket, key, region, expires_seconds=900):
+    """
+    Sign a presigned URL using the Lambda's OWN execution role credentials
+    - no long-term IAM user / Secrets Manager needed. Simpler to set up,
+    but with a real trade-off: AWS periodically rotates a Lambda's
+    underlying execution-role credentials (this happens automatically,
+    on a schedule AWS doesn't publish a fixed guarantee for). Once that
+    rotation happens, a URL signed with the OLD credentials stops
+    working immediately - even if its ExpiresIn window hasn't elapsed
+    yet. There is no way to know in advance exactly when that will
+    happen.
+
+    Practical guidance: keep expires_seconds short. 15 minutes (the
+    default here) is safe in virtually all cases. Don't rely on this for
+    anything beyond roughly an hour - for a guaranteed multi-day link,
+    use generate_presigned_url() with long-term signing credentials from
+    Secrets Manager instead (see the FSx report for that pattern).
+
+    The Lambda's execution role needs s3:GetObject (not just PutObject)
+    on the report bucket/prefix for this to work, plus kms:Decrypt on
+    the CMK if the bucket uses SSE-KMS.
+    """
+    signing_s3 = boto3.client(
+        "s3",
+        region_name=region,
+        config=Config(signature_version="s3v4"),
+    )
+    return signing_s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
+
+
+def generate_presigned_url(bucket, key, region, secret_id, expires_seconds=7 * 24 * 60 * 60):
+    secrets_client = boto3.client("secretsmanager", region_name=region)
+    access_key, secret_key = get_signing_credentials(secrets_client, secret_id)
+
+    # signature_version MUST be s3v4 here. Presigned URLs for objects
+    # encrypted with SSE-KMS are rejected ("Requests specifying Server
+    # Side Encryption with AWS KMS managed keys require AWS Signature
+    # Version 4") unless the client is explicitly forced to SigV4 - some
+    # boto3/region combinations don't default to it for presigning.
+    signing_s3 = boto3.client(
+        "s3",
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+    )
+    url = signing_s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
+    return url
+
+
+# ---------------------------------------------------------------------------
+# SNS
+# ---------------------------------------------------------------------------
+
+def publish_sns(sns_client, topic_arn, subject, message):
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Subject=subject[:100],
+        Message=message,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTML shell / CSS - shared corporate look for both reports
+# ---------------------------------------------------------------------------
+
+BASE_CSS = """
+:root{
+  --ink:#152238;
+  --ink-soft:#4a5670;
+  --line:#dde3ee;
+  --bg:#f6f8fb;
+  --panel:#ffffff;
+  --accent:#0f5fa6;
+  --accent-soft:#e6f0fa;
+  --good:#1c8a5c;
+  --warn:#c07a10;
+  --bad:#c0392b;
+  --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size:14px; line-height:1.5;
+}
+.wrap{max-width:1180px; margin:0 auto; padding:32px 24px 80px;}
+.header{
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:3px solid var(--ink); padding-bottom:18px; margin-bottom:28px;
+}
+.header h1{font-size:22px; margin:0 0 4px; letter-spacing:.2px;}
+.header .sub{color:var(--ink-soft); font-size:13px;}
+.header .period{
+  text-align:right; font-family:var(--mono); font-size:12px; color:var(--ink-soft);
+}
+.badge{
+  display:inline-block; padding:2px 8px; border-radius:3px; font-size:11px;
+  font-weight:600; letter-spacing:.3px; text-transform:uppercase;
+}
+.badge.ok{background:#e5f4ec; color:var(--good);}
+.badge.warn{background:#fbf0dd; color:var(--warn);}
+.badge.bad{background:#fbe7e4; color:var(--bad);}
+
+.summary-grid{
+  display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr));
+  gap:14px; margin-bottom:30px;
+}
+.stat-card{
+  background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--accent);
+  border-radius:4px; padding:14px 16px;
+}
+.stat-card .label{font-size:11px; text-transform:uppercase; letter-spacing:.4px; color:var(--ink-soft); margin-bottom:6px;}
+.stat-card .value{font-size:22px; font-weight:700; font-family:var(--mono);}
+.stat-card .value.small{font-size:15px; font-weight:600;}
+
+.section{margin-bottom:34px;}
+.section h2{
+  font-size:15px; text-transform:uppercase; letter-spacing:.5px;
+  border-bottom:1px solid var(--line); padding-bottom:8px; margin-bottom:14px;
+  color:var(--ink); display:flex; justify-content:space-between; align-items:center;
+}
+.section p.note{color:var(--ink-soft); font-size:12.5px; margin-top:-6px; margin-bottom:14px;}
+
+table{width:100%; border-collapse:collapse; background:var(--panel); font-size:12.5px;}
+table.striped tr:nth-child(even) td{background:#fafbfd;}
+th{
+  text-align:left; background:var(--ink); color:#fff; padding:9px 10px;
+  font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.3px;
+  position:sticky; top:0;
+}
+td{padding:8px 10px; border-bottom:1px solid var(--line); font-family:var(--mono);}
+td.text{font-family:inherit;}
+tr:hover td{background:var(--accent-soft);}
+.table-scroll{max-height:520px; overflow:auto; border:1px solid var(--line); border-radius:4px;}
+
+.csv-btn{
+  background:var(--accent); color:#fff; border:none; padding:6px 12px;
+  border-radius:3px; font-size:11.5px; font-weight:600; cursor:pointer; letter-spacing:.2px;
+}
+.csv-btn:hover{background:#0c4d87;}
+
+.pill-util{display:inline-block; min-width:46px; text-align:right; font-weight:700;}
+.pill-util.ok{color:var(--good);}
+.pill-util.warn{color:var(--warn);}
+.pill-util.bad{color:var(--bad);}
+
+.footer{
+  margin-top:40px; padding-top:16px; border-top:1px solid var(--line);
+  color:var(--ink-soft); font-size:11.5px; display:flex; justify-content:space-between;
+}
+@media print{
+  .csv-btn{display:none;}
+  body{background:#fff;}
+}
+"""
+
+CSV_EXPORT_JS = """
+function tableToCSV(tableId, filename){
+  const table = document.getElementById(tableId);
+  if(!table) return;
+  const rows = table.querySelectorAll('tr');
+  let csv = [];
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('th,td');
+    const line = Array.from(cells).map(c => {
+      let t = c.innerText.replace(/"/g,'""');
+      return '"' + t + '"';
+    }).join(',');
+    csv.push(line);
+  });
+  const blob = new Blob([csv.join('\\n')], {type:'text/csv;charset=utf-8;'});
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+"""
+
+
+def util_class(pct):
+    """Return CSS class + badge tier for a utilization percentage."""
+    if pct is None:
+        return "", "n/a"
+    if pct >= 90:
+        return "bad", "bad"
+    if pct >= 75:
+        return "warn", "warn"
+    return "ok", "ok"
+
+
+def fmt_bytes(n, suffix="B"):
+    if n is None:
+        return "N/A"
+    n = float(n)
+    for unit in ["", "K", "M", "G", "T", "P"]:
+        if abs(n) < 1024.0:
+            return f"{n:3.1f} {unit}{suffix}"
+        n /= 1024.0
+    return f"{n:.1f} E{suffix}"
+
+
+def html_escape(s):
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+# =============================================================================
+# Handler code
+# =============================================================================
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 BUCKET = os.environ["REPORT_BUCKET"]
 TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-SIGNING_SECRET_ID = os.environ["SIGNING_SECRET_ID"]
 KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get("PRESIGNED_URL_EXPIRY_SECONDS", "900"))
 MEMBER_ACCOUNT_IDS = [a.strip() for a in os.environ["MEMBER_ACCOUNT_IDS"].split(",") if a.strip()]
 CROSS_ACCOUNT_ROLE_NAME = os.environ.get("CROSS_ACCOUNT_ROLE_NAME", "EFSMonthlyReportRole")
 ACCOUNT_NAMES = json.loads(os.environ.get("ACCOUNT_NAMES", "{}"))
@@ -434,10 +850,11 @@ def lambda_handler(event, context):
     key = f"efs-report/{start_date.strftime('%Y')}/{start_date.strftime('%m')}/efs-report-{start_date.strftime('%Y-%m')}.html"
     s3_uri = upload_html_to_s3(s3, BUCKET, key, html_report, kms_key_id=KMS_KEY_ID)
 
-    url = generate_presigned_url(BUCKET, key, REGION, SIGNING_SECRET_ID)
+    url = generate_presigned_url_via_role(BUCKET, key, REGION, expires_seconds=PRESIGNED_URL_EXPIRY_SECONDS)
 
     accounts_ok = sum(1 for s in account_status.values() if s["ok"])
     accounts_failed = [a for a, s in account_status.items() if not s["ok"]]
+    expiry_minutes = PRESIGNED_URL_EXPIRY_SECONDS // 60
     subject = f"EFS Monthly Report - {start_date.strftime('%B %Y')}"
     message_lines = [
         f"The EFS monthly capacity & performance report for {start_date.strftime('%B %Y')} is ready.",
@@ -447,9 +864,11 @@ def lambda_handler(event, context):
         message_lines.append(f"Accounts with collection errors (see report for details): {', '.join(accounts_failed)}")
     message_lines += [
         "",
-        f"Report link (valid 7 days):\n{url}",
+        f"Report link (valid ~{expiry_minutes} minutes - click soon after receiving this email):\n{url}",
         "",
-        f"S3 location: {s3_uri}",
+        f"If the link has expired, the report is still saved at: {s3_uri} - "
+        f"re-run the report Lambda to get a fresh link, or download the "
+        f"object directly from the S3 console.",
     ]
     publish_sns(sns, TOPIC_ARN, subject, "\n".join(message_lines))
 
