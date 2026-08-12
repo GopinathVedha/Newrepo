@@ -1,32 +1,17 @@
-🚀 EC2 Autoscheduler Report
-
-📅 Timestamp: 2026-08-11 06:30 AEST
-
-
-==============================
-🔄 Instance Start Actions
-==============================
-
-Started Database Servers:
-Account ID     | Server Name     | Action
--------------- | --------------- | -------
-XXXXXXXXXXX   | awstldbbe401    | Started
-XXXXXXXXXXX   | awstldbbe301    | Started
-XXXXXXXXXXX   | awstldbbe201    | Started
-XXXXXXXXXXX   | awstwdbse301    | Started
-XXXXXXXXXXX   | awstwdbse101    | Started
-XXXXXXXXXXX   | awstwdbse201    | Started
-XXXXXXXXXXX   | awstldbbe101    | Started
-
-Started Application Servers:
-Account ID     | Server Name     | Action
--------------- | --------------- | -------
-XXXXXXXXXXX   | awstlapbee01    | Started
-
-⚠️ Capacity Downgrades (will auto-restore to original type on next stop):
-Instance ID | Name | Original Type | Started As
------------ | ---- | ------------- | ---------- i-0289cbccac3ef5abc | awstldbbe301 | r6id.24xlarge | r6id.16xlarge
-
---
-If you wish to stop receiving notifications from this topic, please click or visit the link below to unsubscribe:
-https://aus01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fsns.ap-southeast-2.amazonaws.com%2Funsubscribe.html%3FSubscriptionArn%3Darn%3Aaws%3Asns%3Aap-southeast-2%3AXXXXXXXXXXX%3AAutoscheduler_start%3Ace815355-284a-4937-84fb-cb7f3ab6a021%26Endpoint%3DCGRUNINFRA%40transport.nsw.gov.au&data=05%7C02%7CGopinath.Vedachalam%40transport.nsw.gov.au%7Cc930d25cbac14323809908def71e39c0%7Ccb356782ad9a47fb878b7ebceb85b86c%7C0%7C0%7C639219906506461785%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=OlZRb3VOfOfdB0lEtlhKfjDtNPGO8oM0A4kvhhnfBDU%3D&reserved=0
+{
+  "errorMessage": "Extra data: line 1 column 13 (char 12)",
+  "errorType": "JSONDecodeError",
+  "requestId": "",
+  "stackTrace": [
+    "  File \"/var/lang/lib/python3.14/importlib/__init__.py\", line 88, in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n",
+    "  File \"<frozen importlib._bootstrap>\", line 1406, in _gcd_import\n",
+    "  File \"<frozen importlib._bootstrap>\", line 1371, in _find_and_load\n",
+    "  File \"<frozen importlib._bootstrap>\", line 1342, in _find_and_load_unlocked\n",
+    "  File \"<frozen importlib._bootstrap>\", line 938, in _load_unlocked\n",
+    "  File \"<frozen importlib._bootstrap_external>\", line 759, in exec_module\n",
+    "  File \"<frozen importlib._bootstrap>\", line 491, in _call_with_frames_removed\n",
+    "  File \"/var/task/lambda_function.py\", line 497, in <module>\n    ACCOUNT_NAMES = json.loads(os.environ.get(\"ACCOUNT_NAMES\", \"{}\"))\n",
+    "  File \"/var/lang/lib/python3.14/json/__init__.py\", line 352, in loads\n    return _default_decoder.decode(s)\n",
+    "  File \"/var/lang/lib/python3.14/json/decoder.py\", line 348, in decode\n    raise JSONDecodeError(\"Extra data\", s, end)\n"
+  ]
+}
