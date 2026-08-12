@@ -1,5 +1,6 @@
 import boto3
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,10 +10,18 @@ from botocore.exceptions import ClientError
 # LAMBDA 1 of 2 — "Action" function
 # Triggered on your existing schedule (EventBridge rule, cron, etc).
 # Evaluates instances, starts/stops them (with capacity fallback),
-# then schedules Lambda 2 ("Status") to run ~3 minutes later via
-# EventBridge Scheduler and exits immediately. No time.sleep(), so
-# no idle billed compute.
+# sends an IMMEDIATE SNS report of what it did, then schedules
+# Lambda 2 ("Status") to run ~3 minutes later via EventBridge
+# Scheduler for the delayed health check + instance-type restore.
+#
+# IMPORTANT: the action report (this function) and the final health
+# check / restore report (Lambda 2) are two SEPARATE emails now.
+# This means you'll always get a notification for start/stop actions
+# even if Lambda 2 or the EventBridge schedule fails for any reason.
 # ============================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # AWS region
 region = 'ap-southeast-2'
@@ -21,6 +30,9 @@ region = 'ap-southeast-2'
 sns_topic_start_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start'
 sns_topic_stop_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop'
 sns_topic_capacity_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
+# Note: the post-start health-check report now goes to its own topic,
+# Autoscheduler_health_check — that's only published to by Lambda 2 (the
+# status function), not this one. Listed here for reference only.
 
 # ARN of Lambda 2 ("status/health-check" function) that this function schedules
 STATUS_LAMBDA_ARN = 'arn:aws:lambda:ap-southeast-2:050557606111:function:ec2_autoscheduler_status'
@@ -37,6 +49,15 @@ ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 # Tag used to opt an instance out of the weekend/public-holiday skip logic.
 # Values: 'true' (start/stop every day as normal) or 'nonstop' (never auto-stop)
 EXCEPTION_TAG = 'equip:infra:autoscheduler:exception'
+
+# Optional tag for instances that only run on specific day(s) of the week,
+# with their own start/stop time per day. When present, this REPLACES the
+# plain equip:infratest:autostarttime / autostoptime tags for that instance.
+# Value is a compact JSON object keyed by 3-letter weekday abbreviation:
+#   {"Fri":{"start":"08:00","stop":"20:00"}}
+#   {"Mon":{"start":"07:00","stop":"18:00"},"Wed":{"start":"09:00","stop":"17:00"},"Fri":{"start":"08:00","stop":"20:00"}}
+# A day not listed in the JSON means no start/stop action that day at all.
+WEEKLY_SCHEDULE_TAG = 'equip:infratest:weeklyschedule'
 
 # SSM parameter (StringList) holding public holiday dates as YYYY-MM-DD,
 # e.g. "2026-01-01,2026-01-26,2026-04-13,2026-04-25,2026-12-25,2026-12-26"
@@ -70,6 +91,9 @@ start_failures = []     # (instance_id, name, reason)
 
 # Weekend/holiday skip tracking (reset each invocation)
 skipped_for_holiday = []  # (instance_id, name) — would have started, but skipped
+
+# Weekly-schedule tag validation tracking (reset each invocation)
+malformed_schedule_tags = []  # (instance_id, name, error)
 
 
 # ---------- Helpers ----------
@@ -111,10 +135,11 @@ def get_public_holidays():
         response = ssm_client.get_parameter(Name=HOLIDAY_PARAM_NAME)
         raw_value = response['Parameter']['Value']
         dates = {d.strip() for d in raw_value.split(',') if d.strip()}
+        logger.info(f"Loaded {len(dates)} holiday date(s) from SSM parameter {HOLIDAY_PARAM_NAME}")
         return dates
     except ClientError as e:
-        print(f"WARNING: could not read holiday list from SSM ({HOLIDAY_PARAM_NAME}): {e}. "
-              f"Proceeding as if no holidays are configured for today.")
+        logger.warning(f"Could not read holiday list from SSM ({HOLIDAY_PARAM_NAME}): {e}. "
+                        f"Proceeding as if no holidays are configured for today.")
         return set()
 
 
@@ -126,11 +151,49 @@ def get_exception_type(instance):
     return None
 
 
-def send_sns_notification(message, topic_arn):
+WEEKDAY_ABBR = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
+def resolve_daily_schedule(instance, today_abbr, plain_autostart, plain_autostop, instance_id, instance_name):
+    """Decides the effective (autostart_flag, autostop_flag) for today.
+
+    If WEEKLY_SCHEDULE_TAG is absent, behaves exactly as before: use the
+    plain per-day-repeating autostarttime/autostoptime tags unchanged.
+
+    If WEEKLY_SCHEDULE_TAG is present, it fully REPLACES the plain tags:
+    only the day(s) listed in the JSON get a start/stop time, every other
+    day of the week gets none at all (no action for this instance today).
+    On a malformed JSON value, logs and falls back to "no action today"
+    for safety rather than guessing, and flags it for the report.
+    """
+    raw = get_tag_value(instance, WEEKLY_SCHEDULE_TAG)
+    if not raw:
+        return plain_autostart, plain_autostop
+
     try:
-        sns_client.publish(TopicArn=topic_arn, Message=message, Subject='EC2 Scheduler Notification')
+        schedule = json.loads(raw)
+        # normalize keys to 'Mon'/'Tue'/... regardless of case supplied
+        schedule = {k.strip()[:3].capitalize(): v for k, v in schedule.items()}
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        logger.error(f"Malformed {WEEKLY_SCHEDULE_TAG} tag on {instance_id} ({instance_name}): {e}. "
+                      f"Skipping start/stop for this instance today.")
+        malformed_schedule_tags.append((instance_id, instance_name, str(e)))
+        return '', ''
+
+    day_entry = schedule.get(today_abbr)
+    if not day_entry:
+        # Instance is only scheduled on specific days, and today isn't one of them.
+        return '', ''
+
+    return day_entry.get('start', ''), day_entry.get('stop', '')
+
+
+def send_sns_notification(message, topic_arn, subject='EC2 Scheduler Notification'):
+    try:
+        response = sns_client.publish(TopicArn=topic_arn, Message=message, Subject=subject)
+        logger.info(f"SNS notification sent to {topic_arn} (MessageId: {response.get('MessageId')})")
     except Exception as e:
-        print(f"Failed to send SNS notification: {e}")
+        logger.error(f"Failed to send SNS notification to {topic_arn}: {e}")
 
 
 def get_action_status_table(instance_ids, action_type):
@@ -170,6 +233,17 @@ def is_capacity_error(client_error):
     return code in ('InsufficientInstanceCapacity', 'InsufficientHostCapacity', 'InsufficientCapacityOnHost')
 
 
+def is_invalid_type_error(client_error):
+    """True when AWS rejected the instance type itself because it doesn't
+    exist for that family/region (as opposed to existing but being out of
+    capacity). This happens because not every family offers every size on
+    the SIZE_ORDER ladder (e.g. many r6id sizes skip 18xlarge)."""
+    error = client_error.response.get('Error', {})
+    code = error.get('Code', '')
+    message = error.get('Message', '')
+    return code == 'InvalidParameterValue' and 'do not exist' in message.lower()
+
+
 def start_instance_with_capacity_fallback(instance_id):
     instance = ec2_resource.Instance(instance_id)
     name = instance_names.get(instance_id, get_instance_name(instance))
@@ -188,6 +262,7 @@ def start_instance_with_capacity_fallback(instance_id):
                     InstanceId=instance_id, InstanceType={'Value': attempt_type}
                 )
             ec2_client.start_instances(InstanceIds=[instance_id])
+            logger.info(f"Started instance {instance_id} ({name}) as {attempt_type}")
 
             if attempt_type != original_type:
                 ec2_client.create_tags(
@@ -198,14 +273,20 @@ def start_instance_with_capacity_fallback(instance_id):
             return True
 
         except ClientError as e:
-            if is_capacity_error(e):
-                print(f"Capacity issue starting {instance_id} ({name}) as {attempt_type}, trying next smaller type")
+            if is_invalid_type_error(e):
+                logger.info(f"{attempt_type} does not exist for this instance family "
+                            f"(instance {instance_id} / {name}) — skipping to next smaller size")
                 continue
-            print(f"Error starting instance {instance_id} ({name}): {e}")
+            if is_capacity_error(e):
+                logger.warning(f"Capacity issue starting {instance_id} ({name}) as {attempt_type}, "
+                                f"trying next smaller type")
+                continue
+            logger.error(f"Error starting instance {instance_id} ({name}): {e}")
             start_failures.append((instance_id, name, str(e)))
             return False
 
     start_failures.append((instance_id, name, "No capacity available for original type or any smaller type in the family"))
+    logger.error(f"Instance {instance_id} ({name}) could not be started at any size — capacity exhausted")
     return False
 
 
@@ -226,22 +307,27 @@ def schedule_status_check(payload, delay_seconds=STATUS_CHECK_DELAY_SECONDS):
         },
         ActionAfterCompletion='DELETE'  # auto-cleanup after it fires, no leftover schedules
     )
-    print(f"Scheduled status-check Lambda as '{schedule_name}' for {run_at} UTC")
+    logger.info(f"Scheduled status-check Lambda as '{schedule_name}' for {run_at} UTC "
+                f"(target={STATUS_LAMBDA_ARN})")
 
 
 # ---------- Main handler ----------
 
 def lambda_handler(event, context):
+    logger.info(f"Lambda 1 (action) invoked. Event: {json.dumps(event)}")
+
     trigger_type = event.get("trigger", "all")  # "db", "app", or "all"
 
     downgrade_events.clear()
     start_failures.clear()
     skipped_for_holiday.clear()
+    malformed_schedule_tags.clear()
 
     sydney_now = datetime.now(ZoneInfo("Australia/Sydney"))
     ct_sec = sydney_now.hour * 3600 + sydney_now.minute * 60
     timestamp = sydney_now.strftime("%Y-%m-%d %H:%M %Z")
     today_str = sydney_now.strftime("%Y-%m-%d")
+    today_abbr = WEEKDAY_ABBR[sydney_now.weekday()]
 
     public_holidays = get_public_holidays()
     weekend_today = is_weekend(sydney_now)
@@ -250,8 +336,8 @@ def lambda_handler(event, context):
 
     if is_skip_day:
         reason = "Public Holiday" if holiday_today else "Weekend"
-        print(f"Today ({today_str}) is a {reason}. Only instances tagged "
-              f"'{EXCEPTION_TAG} = true' will be started.")
+        logger.info(f"Today ({today_str}) is a {reason}. Only instances tagged "
+                    f"'{EXCEPTION_TAG} = true' will be started.")
 
     message_lines = [f"🚀 EC2 Autoscheduler Report\n\n📅 Timestamp: {timestamp}\n"]
     if is_skip_day:
@@ -280,6 +366,9 @@ def lambda_handler(event, context):
 
         if scheduler_flag == 'enabled':
             exception_type = get_exception_type(instance)  # None, 'true', or 'nonstop'
+            autostart_flag, autostop_flag = resolve_daily_schedule(
+                instance, today_abbr, autostart_flag, autostop_flag, instance_id, instance_name
+            )
 
             try:
                 if autostart_flag and ':' in autostart_flag:
@@ -290,6 +379,8 @@ def lambda_handler(event, context):
                         # tagged as an exception ('true') are allowed to start.
                         if is_skip_day and exception_type != 'true':
                             skipped_for_holiday.append((instance_id, instance_name))
+                            logger.info(f"Skipping start for {instance_id} ({instance_name}) — "
+                                        f"weekend/holiday, no exception tag")
                         else:
                             role = get_instance_role(instance)
                             if trigger_type == 'db' and role == 'db':
@@ -309,11 +400,11 @@ def lambda_handler(event, context):
                     if 0 <= (ct_sec - sto_sec) < 300 and instance.state['Name'] == 'running':
                         # 'nonstop' instances are never auto-stopped, any day of the week.
                         if exception_type == 'nonstop':
-                            print(f"Skipping stop for {instance_id} ({instance_name}) — tagged nonstop")
+                            logger.info(f"Skipping stop for {instance_id} ({instance_name}) — tagged nonstop")
                         else:
                             autostop_instance_ids.append(instance_id)
             except Exception as e:
-                print(f"Error parsing time for instance {instance_id}: {e}")
+                logger.error(f"Error parsing time for instance {instance_id}: {e}")
 
     notify_start = False
     notify_stop = False
@@ -324,6 +415,13 @@ def lambda_handler(event, context):
         message_lines.append(
             f"\n⏭️ Skipped Auto-Start ({reason}, no '{EXCEPTION_TAG} = true' tag):\n"
             + get_event_table(skipped_for_holiday, ["Instance ID", "Name"])
+        )
+
+    if malformed_schedule_tags:
+        notify_start = True
+        message_lines.append(
+            f"\n⚠️ Malformed '{WEEKLY_SCHEDULE_TAG}' Tag (no action taken today for these):\n"
+            + get_event_table(malformed_schedule_tags, ["Instance ID", "Name", "Error"])
         )
 
     # Start actions (per-instance, with capacity fallback)
@@ -365,39 +463,70 @@ def lambda_handler(event, context):
                     "\nInstances that FAILED to start:\n"
                     + get_event_table(start_failures, ["Instance ID", "Name", "Reason"])
                 )
-            send_sns_notification("\n".join(capacity_lines), sns_topic_capacity_arn)
+            send_sns_notification(
+                "\n".join(capacity_lines), sns_topic_capacity_arn,
+                subject='EC2 Scheduler - Capacity Fallback Alert'
+            )
 
     # Stop actions
     if autostop_instance_ids:
         notify_stop = True
         try:
             ec2_client.stop_instances(InstanceIds=autostop_instance_ids)
+            logger.info(f"Stop requested for instances: {autostop_instance_ids}")
             message_lines.append("\n==============================\n🔻 Instance Stop Actions\n==============================")
             message_lines.append("\nStopped Instances:\n" + get_action_status_table(autostop_instance_ids, "Stopped"))
         except Exception as e:
-            print(f"Error stopping instances: {e}")
+            logger.error(f"Error stopping instances: {e}")
+
+    # ------------------------------------------------------------------
+    # Send the IMMEDIATE action report now, regardless of whether Lambda 2
+    # ends up running successfully later. This is the fix for "I didn't
+    # get an email even though the server started" — that no longer
+    # depends on the delayed Lambda 2 / EventBridge Scheduler hop at all.
+    # ------------------------------------------------------------------
+    full_action_report = "\n".join(message_lines)
+    logger.info(full_action_report)
+
+    if notify_start:
+        send_sns_notification(full_action_report, sns_topic_start_arn,
+                               subject='EC2 Scheduler - Start Action Report')
+    if notify_stop:
+        send_sns_notification(full_action_report, sns_topic_stop_arn,
+                               subject='EC2 Scheduler - Stop Action Report')
 
     # Nothing to check later? Don't bother scheduling Lambda 2.
     if not autostart_instance_ids and not autostop_instance_ids:
-        if skipped_for_holiday:
-            # No real action happened, so there's nothing for Lambda 2 to check —
-            # send the holiday-skip notice directly instead of scheduling a delay.
-            send_sns_notification("\n".join(message_lines), sns_topic_start_arn)
-        print("No start/stop actions this cycle; skipping status-check scheduling.")
+        logger.info("No start/stop actions this cycle; skipping status-check scheduling.")
         return
 
-    # Hand off to Lambda 2 for the delayed health check + final report,
-    # instead of sleeping in this function.
+    # Hand off to Lambda 2 for the delayed health check + instance-type
+    # restore, instead of sleeping in this function. This is now purely a
+    # supplementary follow-up report — if it fails, the action report above
+    # has already been sent, so nothing is silently lost.
     payload = {
         "trigger": trigger_type,
         "timestamp": timestamp,
-        "report_header": "\n".join(message_lines),
         "autostop_instance_ids": autostop_instance_ids,
         "instance_names": instance_names,
-        "notify_start": notify_start,
-        "notify_stop": notify_stop,
+        "had_starts": bool(autostart_instance_ids),
     }
-    schedule_status_check(payload)
+    try:
+        schedule_status_check(payload)
+    except Exception as e:
+        logger.error(f"Failed to schedule the Lambda 2 status-check: {e}")
+        send_sns_notification(
+            f"⚠️ EC2 Autoscheduler: start/stop actions completed and the report above was sent, "
+            f"but the follow-up health-check / instance-type-restore step (Lambda 2) could NOT "
+            f"be scheduled.\n\nError: {e}\n\n"
+            f"Check that STATUS_LAMBDA_ARN and SCHEDULER_EXECUTION_ROLE_ARN in Lambda 1 are correct, "
+            f"and that Lambda 1's execution role has scheduler:CreateSchedule and iam:PassRole "
+            f"permissions for the scheduler role.\n\n"
+            f"Any capacity-downgraded instances will NOT be restored to their original type "
+            f"until this is fixed.",
+            sns_topic_capacity_arn,
+            subject='EC2 Scheduler - Status Check Scheduling FAILED'
+        )
 
     # Clear lists for this invocation (execution environment may be reused)
     autostart_instance_ids.clear()
