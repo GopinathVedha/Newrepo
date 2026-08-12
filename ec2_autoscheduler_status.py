@@ -1,4 +1,6 @@
 import boto3
+import json
+import logging
 from botocore.exceptions import ClientError
 
 # ============================================================
@@ -7,14 +9,26 @@ from botocore.exceptions import ClientError
 # EventBridge schedule that Lambda 1 created (and that
 # self-deletes after firing). Restores any capacity-downgraded
 # instances back to their original type, builds the final EC2
-# status/health table, and sends the combined report over SNS.
+# health-check table, and sends its OWN report via SNS.
+#
+# NOTE: this is now a standalone follow-up report — Lambda 1
+# already sent an immediate email for the start/stop actions
+# themselves. This function only covers what happens ~3 minutes
+# later (restore + health check), so it does not resend Lambda 1's
+# action report.
 # ============================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 region = 'ap-southeast-2'
 
 sns_topic_start_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start'
 sns_topic_stop_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop'
 sns_topic_capacity_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
+# Dedicated topic for the post-start health-check report (separate from the
+# immediate start/stop action reports, so people can subscribe independently).
+sns_topic_health_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_health_check'
 
 ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 
@@ -42,11 +56,12 @@ def get_tag_value(instance, key):
     return None
 
 
-def send_sns_notification(message, topic_arn):
+def send_sns_notification(message, topic_arn, subject='EC2 Scheduler Notification'):
     try:
-        sns_client.publish(TopicArn=topic_arn, Message=message, Subject='EC2 Scheduler Notification')
+        response = sns_client.publish(TopicArn=topic_arn, Message=message, Subject=subject)
+        logger.info(f"SNS notification sent to {topic_arn} (MessageId: {response.get('MessageId')})")
     except Exception as e:
-        print(f"Failed to send SNS notification: {e}")
+        logger.error(f"Failed to send SNS notification to {topic_arn}: {e}")
 
 
 def get_event_table(events, columns):
@@ -94,79 +109,102 @@ def restore_original_type(instance_id, instance_names, restore_events, restore_f
 
     try:
         ec2_client.modify_instance_attribute(InstanceId=instance_id, InstanceType={'Value': original_type})
+        logger.info(f"Restored {instance_id} ({name}) from {instance.instance_type} back to {original_type}")
         restore_events.append((instance_id, name, instance.instance_type, original_type))
         ec2_client.delete_tags(Resources=[instance_id], Tags=[{'Key': ORIGINAL_TYPE_TAG}])
     except ClientError as e:
-        print(f"Failed to restore instance type for {instance_id} ({name}): {e}")
+        logger.error(f"Failed to restore instance type for {instance_id} ({name}): {e}")
         restore_failures.append((instance_id, name, str(e)))
 
 
 # ---------- Main handler ----------
 
 def lambda_handler(event, context):
-    # event is the payload Lambda 1 passed into the EventBridge schedule
-    timestamp = event.get("timestamp", "")
-    report_header = event.get("report_header", "")
-    autostop_instance_ids = event.get("autostop_instance_ids", [])
-    instance_names = event.get("instance_names", {})
-    notify_start = event.get("notify_start", False)
-    notify_stop = event.get("notify_stop", False)
+    # Log the raw incoming event FIRST, before anything else can fail —
+    # this alone proves Lambda 2 was actually invoked, which is the
+    # first thing to check in CloudWatch if you're not seeing logs.
+    logger.info(f"Lambda 2 (status) invoked. Event: {json.dumps(event)}")
 
-    message_lines = [report_header] if report_header else []
+    try:
+        timestamp = event.get("timestamp", "")
+        autostop_instance_ids = event.get("autostop_instance_ids", [])
+        instance_names = event.get("instance_names", {})
+        had_starts = event.get("had_starts", False)
 
-    restore_events = []
-    restore_failures = []
+        message_lines = [f"♻️ EC2 Autoscheduler — Follow-up Health Check\n\n📅 Timestamp: {timestamp}\n"]
 
-    # Restore any capacity-downgraded instances now that they've had time to stop
-    for instance_id in autostop_instance_ids:
-        try:
-            instance = ec2_resource.Instance(instance_id)
-            instance.reload()
-            if instance.state['Name'] == 'stopped':
-                restore_original_type(instance_id, instance_names, restore_events, restore_failures)
-            else:
-                original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
-                if original_type:
-                    print(f"Instance {instance_id} not yet stopped (state={instance.state['Name']}); "
-                          f"will retry restore on a future stop cycle")
-        except Exception as e:
-            print(f"Error checking/restoring instance {instance_id}: {e}")
+        restore_events = []
+        restore_failures = []
 
-    if restore_events:
-        message_lines.append(
-            "\n♻️ Restored to Original Instance Type:\n"
-            + get_event_table(restore_events, ["Instance ID", "Name", "Ran As", "Restored To"])
-        )
-    if restore_failures:
-        message_lines.append(
-            "\n❌ Failed to Restore Original Type:\n"
-            + get_event_table(restore_failures, ["Instance ID", "Name", "Reason"])
-        )
+        # Restore any capacity-downgraded instances now that they've had time to stop
+        for instance_id in autostop_instance_ids:
+            try:
+                instance = ec2_resource.Instance(instance_id)
+                instance.reload()
+                if instance.state['Name'] == 'stopped':
+                    restore_original_type(instance_id, instance_names, restore_events, restore_failures)
+                else:
+                    original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
+                    if original_type:
+                        logger.info(f"Instance {instance_id} not yet stopped (state={instance.state['Name']}); "
+                                    f"will retry restore on a future stop cycle")
+            except Exception as e:
+                logger.error(f"Error checking/restoring instance {instance_id}: {e}")
 
-    if restore_events or restore_failures:
-        capacity_lines = [f"♻️ EC2 Instance Type Restore Report\n\n📅 Timestamp: {timestamp}\n"]
         if restore_events:
-            capacity_lines.append(
-                "Instances restored back to their original instance type:\n"
+            message_lines.append(
+                "\n♻️ Restored to Original Instance Type:\n"
                 + get_event_table(restore_events, ["Instance ID", "Name", "Ran As", "Restored To"])
             )
         if restore_failures:
-            capacity_lines.append(
-                "\nInstances that FAILED to restore to their original type "
-                "(will retry on next stop cycle if tag is still present):\n"
+            message_lines.append(
+                "\n❌ Failed to Restore Original Type:\n"
                 + get_event_table(restore_failures, ["Instance ID", "Name", "Reason"])
             )
-        send_sns_notification("\n".join(capacity_lines), sns_topic_capacity_arn)
 
-    # Final status table
-    total_instances, status_table = get_instance_status_table()
-    message_lines.append("\n==============================\n📊 All EC2 Instance Status\n==============================")
-    message_lines.append(f"Total EC2 Instances: {total_instances}\n\n{status_table}")
+        if restore_events or restore_failures:
+            capacity_lines = [f"♻️ EC2 Instance Type Restore Report\n\n📅 Timestamp: {timestamp}\n"]
+            if restore_events:
+                capacity_lines.append(
+                    "Instances restored back to their original instance type:\n"
+                    + get_event_table(restore_events, ["Instance ID", "Name", "Ran As", "Restored To"])
+                )
+            if restore_failures:
+                capacity_lines.append(
+                    "\nInstances that FAILED to restore to their original type "
+                    "(will retry on next stop cycle if tag is still present):\n"
+                    + get_event_table(restore_failures, ["Instance ID", "Name", "Reason"])
+                )
+            send_sns_notification("\n".join(capacity_lines), sns_topic_capacity_arn,
+                                   subject='EC2 Scheduler - Instance Type Restore Report')
 
-    full_message = "\n".join(message_lines)
-    print(full_message)
+        # A health check is only a meaningful concept for instances that were
+        # just started — a stopped instance has no health status to report,
+        # so skip this email entirely on stop-only cycles. The restore report
+        # above (if applicable) already covers what matters for a stop cycle.
+        if had_starts:
+            total_instances, status_table = get_instance_status_table()
+            message_lines.append("\n==============================\n📊 All EC2 Instance Status\n==============================")
+            message_lines.append(f"Total EC2 Instances: {total_instances}\n\n{status_table}")
 
-    if notify_start:
-        send_sns_notification(full_message, sns_topic_start_arn)
-    if notify_stop:
-        send_sns_notification(full_message, sns_topic_stop_arn)
+            full_message = "\n".join(message_lines)
+            logger.info(full_message)
+
+            send_sns_notification(full_message, sns_topic_health_arn,
+                                   subject='EC2 Scheduler - Follow-up Health Check')
+        else:
+            logger.info("No start actions this cycle — skipping the health-check email "
+                        "(nothing meaningful to health-check on a stop-only cycle).")
+
+    except Exception as e:
+        # Last-resort safety net: if anything above throws, make sure at
+        # least ONE signal reaches SNS instead of failing completely silent.
+        logger.exception(f"Unhandled error in Lambda 2 status-check handler: {e}")
+        send_sns_notification(
+            f"❌ EC2 Autoscheduler Lambda 2 (status/restore) hit an unhandled error and "
+            f"did not complete its health-check/restore report.\n\nError: {e}\n\n"
+            f"Check CloudWatch Logs for this function for the full traceback.",
+            sns_topic_capacity_arn,
+            subject='EC2 Scheduler - Status Lambda FAILED'
+        )
+        raise
