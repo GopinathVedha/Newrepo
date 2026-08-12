@@ -603,18 +603,41 @@ def build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date)
 
     total_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Total")
     std_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Standard")
-    ia_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="InfrequentAccess")
+    ia_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="IA")
     archive_series = get_series(cw_client, fs_id, "StorageBytes", start_date, end_date, storage_class="Archive")
 
     permitted_tp = get_series(cw_client, fs_id, "PermittedThroughput", start_date, end_date, stat="Average")
     metered_io = get_series(cw_client, fs_id, "MeteredIOBytes", start_date, end_date, stat="Sum")
-    client_conn_avg = get_series(cw_client, fs_id, "ClientConnections", start_date, end_date, stat="Average")
-    client_conn_max = get_series(cw_client, fs_id, "ClientConnections", start_date, end_date, stat="Maximum")
+
+    # ACTUAL observed throughput, as distinct from the PermittedThroughput
+    # ceiling above. TotalIOBytes is the real number of bytes processed
+    # (Sum), which we divide by seconds-in-day to get bytes/sec - this
+    # answers "how much throughput is the file system actually using",
+    # not just "how much is it allowed to use".
+    total_io_bytes = get_series(cw_client, fs_id, "TotalIOBytes", start_date, end_date, stat="Sum")
+    read_io_bytes = get_series(cw_client, fs_id, "DataReadIOBytes", start_date, end_date, stat="Sum")
+    write_io_bytes = get_series(cw_client, fs_id, "DataWriteIOBytes", start_date, end_date, stat="Sum")
+
+    # ClientConnections officially only supports the Sum statistic per
+    # AWS docs (docs.aws.amazon.com/efs/latest/ug/efs-metrics.html) -
+    # Average/Maximum are not guaranteed and produced inconsistent gaps
+    # in an earlier version of this report. Sum over a day = total
+    # connection-minutes; dividing by minutes-in-day gives an honest
+    # average concurrent connection count.
+    client_conn_sum = get_series(cw_client, fs_id, "ClientConnections", start_date, end_date, stat="Sum")
+
     burst_credit = get_series(cw_client, fs_id, "BurstCreditBalance", start_date, end_date, stat="Minimum")
     pct_io_limit = get_series(cw_client, fs_id, "PercentIOLimit", start_date, end_date, stat="Maximum")
 
+    SECONDS_PER_DAY = 86400
+    MINUTES_PER_DAY = 1440
+
     daily_rows = []
     for d in daterange_days(start_date, end_date):
+        total_io = total_io_bytes.get(d)
+        read_io = read_io_bytes.get(d)
+        write_io = write_io_bytes.get(d)
+        conn_sum = client_conn_sum.get(d)
         daily_rows.append({
             "date": d,
             "total": total_series.get(d),
@@ -623,8 +646,10 @@ def build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date)
             "archive": archive_series.get(d),
             "permitted_throughput": permitted_tp.get(d),
             "metered_io_bytes": metered_io.get(d),
-            "client_conn_avg": client_conn_avg.get(d),
-            "client_conn_max": client_conn_max.get(d),
+            "avg_throughput_bps": (total_io / SECONDS_PER_DAY) if total_io is not None else None,
+            "avg_read_throughput_bps": (read_io / SECONDS_PER_DAY) if read_io is not None else None,
+            "avg_write_throughput_bps": (write_io / SECONDS_PER_DAY) if write_io is not None else None,
+            "avg_connections": (conn_sum / MINUTES_PER_DAY) if conn_sum is not None else None,
             "burst_credit_min": burst_credit.get(d),
             "pct_io_limit_max": pct_io_limit.get(d),
         })
@@ -635,8 +660,8 @@ def build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date)
     if first_with_total and latest["total"] is not None:
         growth_bytes = latest["total"] - first_with_total["total"]
 
-    max_conn = max((r["client_conn_max"] for r in daily_rows if r["client_conn_max"] is not None), default=None)
-    avg_conn = _avg([r["client_conn_avg"] for r in daily_rows])
+    avg_conn = _avg([r["avg_connections"] for r in daily_rows])
+    avg_throughput_bps = _avg([r["avg_throughput_bps"] for r in daily_rows])
     max_pct_io = max((r["pct_io_limit_max"] for r in daily_rows if r["pct_io_limit_max"] is not None), default=None)
     min_burst = min((r["burst_credit_min"] for r in daily_rows if r["burst_credit_min"] is not None), default=None)
 
@@ -650,8 +675,9 @@ def build_fs_report(efs_client, cw_client, fs, account_id, start_date, end_date)
         "id": fs_id, "name": name, "performance_mode": performance_mode,
         "throughput_mode": throughput_mode, "lifecycle": lifecycle,
         "daily": daily_rows, "latest": latest, "growth_bytes": growth_bytes,
-        "max_conn": max_conn, "avg_conn": avg_conn, "max_pct_io": max_pct_io,
-        "min_burst": min_burst, "recommendations": recommendations,
+        "avg_conn": avg_conn, "avg_throughput_bps": avg_throughput_bps,
+        "max_pct_io": max_pct_io, "min_burst": min_burst,
+        "recommendations": recommendations,
     }
 
 
@@ -757,7 +783,7 @@ def render_html(reports, account_status, start_date, end_date, generated_at):
   <p class="note">File systems below are ranked by peak I/O utilization this month (PercentIOLimit, highest first), across all accounts combined, to surface the busiest systems for capacity review.</p>
   <div class="table-scroll">
   <table id="summary-table" class="striped">
-    <tr><th>Rank</th><th>Account</th><th>File System</th><th>Total Size</th><th>Standard</th><th>IA</th><th>Peak IO Util %</th><th>Avg Connections</th><th>Month Growth</th><th>Status</th></tr>
+    <tr><th>Rank</th><th>Account</th><th>File System</th><th>Total Size</th><th>Standard</th><th>IA</th><th>Peak IO Util %</th><th>Avg Throughput Used</th><th>Avg Connections</th><th>Month Growth</th><th>Status</th></tr>
 """)
     for i, r in enumerate(ranked + unranked, 1):
         cls, tier = util_class(r["max_pct_io"])
@@ -765,12 +791,13 @@ def render_html(reports, account_status, start_date, end_date, generated_at):
         badge = f'<span class="badge {tier}">{tier}</span>'
         growth = fmt_bytes(r["growth_bytes"]) if r["growth_bytes"] is not None else "N/A"
         conn_disp = f'{r["avg_conn"]:.1f}' if r["avg_conn"] is not None else "N/A"
+        tput_disp = fmt_bytes(r["avg_throughput_bps"], "B/s") if r["avg_throughput_bps"] is not None else "N/A"
         html.append(
             f'<tr><td>{i}</td><td class="text">{html_escape(r["account_label"])}</td>'
             f'<td class="text">{html_escape(r["name"])} ({r["id"]})</td>'
             f'<td>{fmt_bytes(r["latest"]["total"])}</td><td>{fmt_bytes(r["latest"]["standard"])}</td>'
             f'<td>{fmt_bytes(r["latest"]["ia"])}</td><td class="pill-util {cls}">{util_disp}</td>'
-            f'<td>{conn_disp}</td><td>{growth}</td><td>{badge}</td></tr>'
+            f'<td>{tput_disp}</td><td>{conn_disp}</td><td>{growth}</td><td>{badge}</td></tr>'
         )
     html.append("""</table></div>
   <button class="csv-btn" onclick="tableToCSV('summary-table','efs_summary.csv')">Download CSV</button>
@@ -814,25 +841,50 @@ def render_html(reports, account_status, start_date, end_date, generated_at):
     # Per-file-system daily detail
     for r in reports:
         tbl_id = f"daily_{r['account_id']}_{r['id']}"
+        avg_tput_disp = fmt_bytes(r["avg_throughput_bps"], "B/s") if r["avg_throughput_bps"] is not None else "N/A"
+        avg_conn_disp = f'{r["avg_conn"]:.1f}' if r["avg_conn"] is not None else "N/A"
         html.append(f"""<div class="section">
   <h2>{html_escape(r['account_label'])} / {html_escape(r['name'])} ({r['id']}) &mdash; Daily Detail</h2>
+  <p class="note">This month's average actual throughput used: <strong>{avg_tput_disp}</strong> &middot;
+  average concurrent client connections: <strong>{avg_conn_disp}</strong>.
+  See "What These Metrics Mean" at the end of this report for plain-language definitions of every column below.</p>
   <div class="table-scroll"><table id="{tbl_id}" class="striped">
     <tr><th>Date</th><th>Total</th><th>Standard</th><th>IA</th><th>Archive</th>
-    <th>Permitted Throughput (avg)</th><th>Metered IO (sum)</th><th>Clients (avg/max)</th>
+    <th>Permitted Throughput (ceiling, avg)</th><th>Actual Throughput Used (avg)</th>
+    <th>Metered IO (sum)</th><th>Avg Connections</th>
     <th>Burst Credit (min)</th><th>IO Limit % (max)</th></tr>
 """)
         for row in r["daily"]:
             cls, _ = util_class(row["pct_io_limit_max"])
             io_disp = f'<span class="pill-util {cls}">{row["pct_io_limit_max"]:.1f}%</span>' if row["pct_io_limit_max"] is not None else "N/A"
-            conn_disp = f'{row["client_conn_avg"]:.1f} / {row["client_conn_max"]:.0f}' if row["client_conn_avg"] is not None and row["client_conn_max"] is not None else "N/A"
+            conn_disp = f'{row["avg_connections"]:.1f}' if row["avg_connections"] is not None else "N/A"
+            actual_tput_disp = fmt_bytes(row["avg_throughput_bps"], "B/s") if row["avg_throughput_bps"] is not None else "N/A"
             html.append(
                 f'<tr><td>{row["date"].isoformat()}</td><td>{fmt_bytes(row["total"])}</td>'
                 f'<td>{fmt_bytes(row["standard"])}</td><td>{fmt_bytes(row["ia"])}</td><td>{fmt_bytes(row["archive"])}</td>'
                 f'<td>{fmt_bytes(row["permitted_throughput"], "B/s") if row["permitted_throughput"] is not None else "N/A"}</td>'
+                f'<td>{actual_tput_disp}</td>'
                 f'<td>{fmt_bytes(row["metered_io_bytes"])}</td><td>{conn_disp}</td>'
                 f'<td>{fmt_bytes(row["burst_credit_min"])}</td><td>{io_disp}</td></tr>'
             )
         html.append(f'</table></div><button class="csv-btn" onclick="tableToCSV(\'{tbl_id}\',\'efs_{r["account_id"]}_{r["id"]}_daily.csv\')">Download CSV</button></div>')
+
+    # Plain-language glossary for auditors / non-technical readers.
+    html.append("""
+<div class="section">
+  <h2>What These Metrics Mean</h2>
+  <p class="note">Written for reviewers who may not work with AWS day-to-day. Technical column names are in <em>italics</em>.</p>
+  <ul style="line-height:1.9; font-size:13px;">
+    <li><strong>Total / Standard / IA / Archive</strong> (<em>StorageBytes</em>) &mdash; how much data is stored, broken down by storage tier. <strong>Standard</strong> is the normal, most expensive tier for actively-used files. <strong>IA</strong> (Infrequent Access) and <strong>Archive</strong> are cheaper tiers AWS automatically moves older, rarely-touched files into, if a lifecycle policy is configured. <strong>Total</strong> is all tiers added together.</li>
+    <li><strong>Permitted Throughput (ceiling)</strong> (<em>PermittedThroughput</em>) &mdash; the maximum data transfer speed AWS currently allows this file system to run at. This is a limit, not a measurement of actual use - it goes up and down based on file system size and available burst credits (see below).</li>
+    <li><strong>Actual Throughput Used</strong> (<em>TotalIOBytes</em>, converted to a rate) &mdash; the real, measured data transfer speed the file system was driving that day. Comparing this to the Permitted Throughput ceiling shows how close to the limit the system is running - a wide gap means plenty of headroom; the two numbers being close means the file system is close to being constrained.</li>
+    <li><strong>Metered IO</strong> (<em>MeteredIOBytes</em>) &mdash; the total amount of data AWS counted for billing/throughput-limit purposes that day, combining reads, writes, and file-management operations. Reads count for less than writes in this figure, per AWS's metering rules.</li>
+    <li><strong>Avg Connections</strong> (<em>ClientConnections</em>) &mdash; the average number of servers/computers connected to this file system at the same time throughout the day. A number near 0 suggests the file system had little or no active use that day.</li>
+    <li><strong>Burst Credit (min)</strong> (<em>BurstCreditBalance</em>) &mdash; a reserve of "extra speed" the file system can draw on when it needs to run faster than its normal baseline rate, similar to a savings account for speed. AWS caps this reserve at 2.1 TiB for smaller file systems (scaling up for larger ones). <strong>A constant, unchanging value near this cap is normal and healthy</strong> - it simply means the file system rarely needed to dip into its reserve that day. A number that is falling toward zero is the one worth investigating, since it means the file system is close to being throttled back to its baseline speed.</li>
+    <li><strong>IO Limit %</strong> (<em>PercentIOLimit</em>) &mdash; how close the file system came to its overall operations ceiling that day (separate from the throughput/speed limit above). Values consistently near 100% indicate the file system is a candidate for a different performance mode.</li>
+  </ul>
+</div>
+""")
 
     html.append(f"""
 <div class="footer">
