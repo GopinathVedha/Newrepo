@@ -1,17 +1,73 @@
-{
-  "errorMessage": "Extra data: line 1 column 13 (char 12)",
-  "errorType": "JSONDecodeError",
-  "requestId": "",
-  "stackTrace": [
-    "  File \"/var/lang/lib/python3.14/importlib/__init__.py\", line 88, in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n",
-    "  File \"<frozen importlib._bootstrap>\", line 1406, in _gcd_import\n",
-    "  File \"<frozen importlib._bootstrap>\", line 1371, in _find_and_load\n",
-    "  File \"<frozen importlib._bootstrap>\", line 1342, in _find_and_load_unlocked\n",
-    "  File \"<frozen importlib._bootstrap>\", line 938, in _load_unlocked\n",
-    "  File \"<frozen importlib._bootstrap_external>\", line 759, in exec_module\n",
-    "  File \"<frozen importlib._bootstrap>\", line 491, in _call_with_frames_removed\n",
-    "  File \"/var/task/lambda_function.py\", line 497, in <module>\n    ACCOUNT_NAMES = json.loads(os.environ.get(\"ACCOUNT_NAMES\", \"{}\"))\n",
-    "  File \"/var/lang/lib/python3.14/json/__init__.py\", line 352, in loads\n    return _default_decoder.decode(s)\n",
-    "  File \"/var/lang/lib/python3.14/json/decoder.py\", line 348, in decode\n    raise JSONDecodeError(\"Extra data\", s, end)\n"
-  ]
-}
+Amazon EFS — Monthly Capacity & Performance Report
+1 account(s) reported · 1 file system(s) · audit / capacity-planning record
+Period: 2026-07-01 → 2026-07-31
+Generated: 2026-08-12 09:44 UTC
+Region: ap-southeast-2
+Executive Summary
+Accounts Reported
+1 / 1
+Total File Systems
+1
+Total Size
+101.2 GB
+Standard Class
+236.0 MB
+IA Class
+0.0 B
+Archive Class
+0.0 B
+No Lifecycle Policy
+0
+Accounts With Errors
+0
+File systems below are ranked by peak I/O utilization this month (PercentIOLimit, highest first), across all accounts combined, to surface the busiest systems for capacity review.
+
+Rank	Account	File System	Total Size	Standard	IA	Peak IO Util %	Avg Connections	Month Growth	Status
+1	595062549705	sftp (fs-0737fa939ef76530f)	101.2 GB	236.0 MB	N/A0.2%	1.0	194.8 MB	ok
+Download CSV
+Account Collection Status
+Account ID	Account Name	File Systems Found	Status	Detail
+595062549705	-	1	ok	-
+Download CSV
+File System Inventory & Configuration
+Account	FS ID	Name	Performance Mode	Throughput Mode	IA Transition (days)	Back-to-Standard	Archive Transition (days)
+595062549705	fs-0737fa939ef76530f	sftp	generalPurpose	bursting	AFTER_30_DAYS	Not set	Not set
+Download CSV
+Recommendations
+595062549705 — sftp (fs-0737fa939ef76530f)
+
+IA transition is enabled but no transition-back-to-Standard policy is set - review access patterns to avoid repeated retrieval cost.
+595062549705 / sftp (fs-0737fa939ef76530f) — Daily Detail
+Date	Total	Standard	IA	Archive	Permitted Throughput (avg)	Metered IO (sum)	Clients (avg/max)	Burst Credit (min)	IO Limit % (max)
+2026-07-01	101.1 GB	213.5 MB	N/A	0.0 B	100.0 MB/s	92.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-02	101.1 GB	215.2 MB	N/A	0.0 B	100.0 MB/s	79.1 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-03	101.1 GB	215.2 MB	N/A	0.0 B	100.0 MB/s	96.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-04	101.1 GB	212.4 MB	N/A	0.0 B	100.0 MB/s	41.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-05	101.1 GB	212.4 MB	N/A	0.0 B	100.0 MB/s	55.5 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-06	101.1 GB	212.5 MB	N/A	0.0 B	100.0 MB/s	112.6 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-07	101.1 GB	212.5 MB	N/A	0.0 B	100.0 MB/s	113.6 MB	1.0 / 1	2.1 TB	0.1%
+2026-07-08	101.1 GB	212.5 MB	N/A	0.0 B	100.0 MB/s	112.6 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-09	101.1 GB	212.5 MB	N/A	0.0 B	100.0 MB/s	113.8 MB	1.0 / 1	2.1 TB	0.1%
+2026-07-10	101.1 GB	186.6 MB	N/A	0.0 B	100.0 MB/s	108.5 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-11	101.1 GB	171.5 MB	N/A	0.0 B	100.0 MB/s	83.4 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-12	101.1 GB	153.4 MB	N/A	0.0 B	100.0 MB/s	80.0 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-13	101.1 GB	152.6 MB	N/A	0.0 B	100.0 MB/s	78.7 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-14	101.1 GB	152.6 MB	N/A	0.0 B	100.0 MB/s	80.7 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-15	101.1 GB	152.6 MB	N/A	0.0 B	100.0 MB/s	74.4 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-16	101.1 GB	129.2 MB	N/A	0.0 B	100.0 MB/s	74.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-17	101.1 GB	80.2 MB	N/A	0.0 B	100.0 MB/s	61.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-18	101.1 GB	76.8 MB	N/A	0.0 B	100.0 MB/s	N/A	N/A	2.1 TB	0.0%
+2026-07-19	101.1 GB	76.8 MB	N/A	0.0 B	100.0 MB/s	13.0 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-20	101.1 GB	76.8 MB	N/A	0.0 B	100.0 MB/s	77.6 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-21	101.1 GB	76.8 MB	N/A	0.0 B	100.0 MB/s	75.6 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-22	101.1 GB	76.8 MB	N/A	0.0 B	100.0 MB/s	74.8 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-23	101.1 GB	65.1 MB	N/A	0.0 B	100.0 MB/s	92.6 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-24	101.1 GB	51.5 MB	N/A	0.0 B	100.0 MB/s	61.8 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-25	101.1 GB	51.5 MB	N/A	0.0 B	100.0 MB/s	N/A	N/A	2.1 TB	0.0%
+2026-07-26	101.1 GB	51.5 MB	N/A	0.0 B	100.0 MB/s	13.1 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-27	101.2 GB	213.0 MB	N/A	0.0 B	100.0 MB/s	329.5 MB	1.0 / 1	2.1 TB	0.1%
+2026-07-28	101.2 GB	236.1 MB	N/A	0.0 B	100.0 MB/s	74.4 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-29	101.2 GB	230.3 MB	N/A	0.0 B	100.0 MB/s	74.3 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-30	101.2 GB	228.9 MB	N/A	0.0 B	100.0 MB/s	74.4 MB	1.0 / 1	2.1 TB	0.0%
+2026-07-31	101.2 GB	236.0 MB	N/A	0.0 B	100.0 MB/s	148.2 MB	1.0 / 1	2.1 TB	0.2%
+Download CSV
