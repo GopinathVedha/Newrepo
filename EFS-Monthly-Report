@@ -494,7 +494,27 @@ KMS_KEY_ID = os.environ["KMS_KEY_ID"]
 PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get("PRESIGNED_URL_EXPIRY_SECONDS", "900"))
 MEMBER_ACCOUNT_IDS = [a.strip() for a in os.environ["MEMBER_ACCOUNT_IDS"].split(",") if a.strip()]
 CROSS_ACCOUNT_ROLE_NAME = os.environ.get("CROSS_ACCOUNT_ROLE_NAME", "EFSMonthlyReportRole")
-ACCOUNT_NAMES = json.loads(os.environ.get("ACCOUNT_NAMES", "{}"))
+def _parse_account_names():
+    raw = os.environ.get("ACCOUNT_NAMES", "{}").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            print(f"ACCOUNT_NAMES env var is valid JSON but not an object - ignoring. Got: {raw!r}")
+            return {}
+        return {str(k): str(v) for k, v in parsed.items()}
+    except json.JSONDecodeError as e:
+        # ACCOUNT_NAMES is cosmetic (friendly labels only) - a malformed
+        # value here should never take down report generation. Common
+        # causes: literal single quotes instead of double quotes,
+        # trailing characters pasted from the console, or an accidental
+        # extra closing brace/quote.
+        print(f"ACCOUNT_NAMES env var is not valid JSON ({e}) - falling back to account IDs only. Raw value: {raw!r}")
+        return {}
+
+
+ACCOUNT_NAMES = _parse_account_names()
 WARN_PCT = float(os.environ.get("WARN_THRESHOLD_PCT", "75"))
 BAD_PCT = float(os.environ.get("BAD_THRESHOLD_PCT", "90"))
 
