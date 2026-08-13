@@ -1,0 +1,200 @@
+pip install boto3 openpyxl pandas --user   # boto3 is preinstalled, others usually need this
+
+python3 fsx_ontap_capacity_report.py --svm-id svm-0123456789abcdef0 --region ap-southeast-2
+#!/usr/bin/env python3
+"""
+fsx_ontap_capacity_report.py
+
+Fetches daily capacity growth / utilization for all NON-ROOT volumes of a given
+FSx for NetApp ONTAP SVM over the last N months (default 15), and writes the
+result to an Excel workbook.
+
+Run from AWS CloudShell (or anywhere with boto3 + valid AWS credentials):
+
+    pip install boto3 openpyxl pandas --user
+    python3 fsx_ontap_capacity_report.py --svm-id svm-0123456789abcdef0
+
+Optional:
+    --file-system-id fs-0123456789abcdef0   (only needed if you want to be extra
+                                              specific / SVM id lookup ambiguous)
+    --months 15
+    --region ap-south-1
+    --output fsx_capacity_report.xlsx
+"""
+
+import argparse
+import sys
+from datetime import datetime, timedelta, timezone
+
+import boto3
+import pandas as pd
+
+METRICS = [
+    # (CloudWatch metric name, stat, output column, divide by 1e9 -> GB)
+    ("StorageCapacity", "Maximum", "Provisioned_Capacity_GB", True),
+    ("StorageUsed", "Average", "Used_Capacity_GB", True),
+    ("StorageCapacityUtilization", "Average", "Utilization_Percent", False),
+]
+
+PERIOD_SECONDS = 86400  # 1 day
+CW_MAX_DAYS_PER_CALL = 100  # keep comfortably under GetMetricData datapoint limits
+
+
+def get_non_root_volumes(fsx, svm_id, file_system_id=None):
+    """Return list of dicts: {VolumeId, VolumeName, FileSystemId} excluding root volumes."""
+    filters = [{"Name": "storage-virtual-machine-id", "Values": [svm_id]}]
+    paginator = fsx.get_paginator("describe_volumes")
+    volumes = []
+    for page in paginator.paginate(Filters=filters):
+        for vol in page["Volumes"]:
+            ontap_cfg = vol.get("OntapConfiguration", {})
+            if ontap_cfg.get("StorageVirtualMachineRoot", False):
+                continue  # skip root volume
+            if file_system_id and vol.get("FileSystemId") != file_system_id:
+                continue
+            volumes.append(
+                {
+                    "VolumeId": vol["VolumeId"],
+                    "VolumeName": vol.get("Name", vol["VolumeId"]),
+                    "FileSystemId": vol["FileSystemId"],
+                }
+            )
+    return volumes
+
+
+def fetch_metric_series(cw, file_system_id, volume_id, metric_name, stat, start, end):
+    """Fetch a single metric time series in daily datapoints, paginated by time window."""
+    datapoints = {}
+    window_start = start
+    while window_start < end:
+        window_end = min(window_start + timedelta(days=CW_MAX_DAYS_PER_CALL), end)
+        next_token = None
+        while True:
+            kwargs = dict(
+                MetricDataQueries=[
+                    {
+                        "Id": "m1",
+                        "MetricStat": {
+                            "Metric": {
+                                "Namespace": "AWS/FSx",
+                                "MetricName": metric_name,
+                                "Dimensions": [
+                                    {"Name": "FileSystemId", "Value": file_system_id},
+                                    {"Name": "VolumeId", "Value": volume_id},
+                                ],
+                            },
+                            "Period": PERIOD_SECONDS,
+                            "Stat": stat,
+                        },
+                        "ReturnData": True,
+                    }
+                ],
+                StartTime=window_start,
+                EndTime=window_end,
+                ScanBy="TimestampAscending",
+            )
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = cw.get_metric_data(**kwargs)
+            result = resp["MetricDataResults"][0]
+            for ts, val in zip(result["Timestamps"], result["Values"]):
+                datapoints[ts.date()] = val
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+        window_start = window_end
+    return datapoints
+
+
+def build_report(fsx, cw, svm_id, file_system_id, months, progress=True):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(months * 30.44))
+
+    volumes = get_non_root_volumes(fsx, svm_id, file_system_id)
+    if not volumes:
+        print("No non-root volumes found for this SVM.", file=sys.stderr)
+        return {}
+
+    sheets = {}
+    for i, vol in enumerate(volumes, 1):
+        if progress:
+            print(f"[{i}/{len(volumes)}] Fetching metrics for volume "
+                  f"{vol['VolumeName']} ({vol['VolumeId']}) ...")
+
+        series_by_metric = {}
+        for metric_name, stat, col_name, to_gb in METRICS:
+            series = fetch_metric_series(
+                cw, vol["FileSystemId"], vol["VolumeId"], metric_name, stat, start, end
+            )
+            series_by_metric[col_name] = (series, to_gb)
+
+        all_dates = sorted(
+            set().union(*[s.keys() for s, _ in series_by_metric.values()])
+        )
+        rows = []
+        for d in all_dates:
+            row = {"Date": d}
+            for col_name, (series, to_gb) in series_by_metric.items():
+                val = series.get(d)
+                if val is not None and to_gb:
+                    val = round(val / (1024 ** 3), 3)  # bytes -> GiB
+                elif val is not None:
+                    val = round(val, 2)
+                row[col_name] = val
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        # Sheet names limited to 31 chars in Excel
+        sheet_name = vol["VolumeName"][:31] if vol["VolumeName"] else vol["VolumeId"][:31]
+        sheets[sheet_name] = df
+
+    return sheets
+
+
+def write_excel(sheets, output_path):
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        # Summary sheet: latest values per volume
+        summary_rows = []
+        for name, df in sheets.items():
+            if df.empty:
+                continue
+            last = df.sort_values("Date").iloc[-1]
+            summary_rows.append(
+                {
+                    "Volume": name,
+                    "Latest_Date": last["Date"],
+                    "Provisioned_Capacity_GB": last.get("Provisioned_Capacity_GB"),
+                    "Used_Capacity_GB": last.get("Used_Capacity_GB"),
+                    "Utilization_Percent": last.get("Utilization_Percent"),
+                }
+            )
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--svm-id", required=True, help="Storage Virtual Machine ID, e.g. svm-0123456789abcdef0")
+    parser.add_argument("--file-system-id", default=None, help="Optional: restrict to this FileSystemId")
+    parser.add_argument("--months", type=float, default=15, help="How many months back (default 15)")
+    parser.add_argument("--region", default=None, help="AWS region (defaults to CloudShell/session default)")
+    parser.add_argument("--output", default="fsx_capacity_report.xlsx", help="Output Excel file path")
+    args = parser.parse_args()
+
+    session = boto3.Session(region_name=args.region)
+    fsx = session.client("fsx")
+    cw = session.client("cloudwatch")
+
+    sheets = build_report(fsx, cw, args.svm_id, args.file_system_id, args.months)
+    if not sheets:
+        sys.exit(1)
+
+    write_excel(sheets, args.output)
+    print(f"\nDone. Report written to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
