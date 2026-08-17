@@ -1,108 +1,162 @@
-import boto3
-import csv
-from datetime import datetime
+"""
+Export AWS Support cases (including full communications/recommendations)
+to an Excel (.xlsx) file.
 
-support = boto3.client('support', region_name='ap-southeast-2')
+IMPORTANT: The AWS Support API is only available in the us-east-1 region.
+You must create the 'support' client with region_name='us-east-1' even if
+your account's resources live elsewhere. This was the main reason
+comments/recommendations were coming back empty in the original script.
+"""
+
+import boto3
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+
+# --- Clients -----------------------------------------------------------
+# Support API only exists in us-east-1 - this is a hard AWS requirement,
+# not related to which region your account's resources are in.
+support = boto3.client('support', region_name='us-east-1')
 sts = boto3.client('sts')
 
 account_id = sts.get_caller_identity()['Account']
+output_file = f"aws_support_cases_{account_id}.xlsx"
 
-output_file = f"aws_support_cases_{account_id}.csv"
 
-rows = []
+def get_all_communications(case_id):
+    """Fetch ALL communications for a case, following pagination."""
+    all_comms = []
+    next_token = None
+    while True:
+        kwargs = {"caseId": case_id}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = support.describe_communications(**kwargs)
+        all_comms.extend(resp.get('communications', []))
+        next_token = resp.get('nextToken')
+        if not next_token:
+            break
+    # API returns newest-first; reverse so it reads chronologically
+    all_comms.reverse()
+    return all_comms
 
-# Get all cases
-response = support.describe_cases(
-    includeResolvedCases=True,
-    language='en'
-)
 
-cases = response['cases']
+def get_all_cases():
+    """Fetch ALL support cases, following pagination."""
+    all_cases = []
+    next_token = None
+    while True:
+        kwargs = {"includeResolvedCases": True, "language": "en"}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = support.describe_cases(**kwargs)
+        all_cases.extend(resp.get('cases', []))
+        next_token = resp.get('nextToken')
+        if not next_token:
+            break
+    return all_cases
 
-while True:
-    for case in cases:
 
+def is_aws_responder(submitted_by):
+    """Heuristic: AWS agents typically show up with '@amazon.com' or
+    a display name containing 'AWS Support'. Adjust if your account
+    shows agents differently (check a sample row first)."""
+    s = submitted_by.lower()
+    return "amazon.com" in s or "aws support" in s or s.strip() == "aws"
+
+
+def main():
+    rows = []
+    errors = []
+
+    cases = get_all_cases()
+    print(f"Found {len(cases)} cases. Fetching communications...")
+
+    for i, case in enumerate(cases, 1):
         case_id = case.get('caseId', '')
         case_no = case.get('displayId', '')
         subject = case.get('subject', '')
         open_date = case.get('timeCreated', '')
         status = case.get('status', '')
-
         closed_date = ""
-        aws_recommendation = ""
-        comments = []
+        aws_recommendation_lines = []
+        comment_lines = []
 
-        # Get full communications
         try:
-            comms = support.describe_communications(
-                caseId=case_id
-            )
+            comms = get_all_communications(case_id)
 
-            for comm in comms.get('communications', []):
-
+            for comm in comms:
                 body = comm.get('body', '')
                 submitted_by = comm.get('submittedBy', '')
                 time_created = comm.get('timeCreated', '')
+                comment_lines.append(f"[{time_created}] {submitted_by}: {body}")
 
-                comments.append(
-                    f"[{time_created}] {submitted_by}: {body}"
-                )
+                if is_aws_responder(submitted_by):
+                    aws_recommendation_lines.append(f"[{time_created}] {body}")
 
-                # Capture AWS responses as recommendations
-                if "amazon web services" in submitted_by.lower() \
-                   or "aws" in submitted_by.lower():
-
-                    aws_recommendation += (
-                        f"\n[{time_created}] {body}"
-                    )
-
-            # Infer closed date
-            if status.lower() == "resolved":
-                if comms.get('communications'):
-                    closed_date = comms['communications'][-1].get(
-                        'timeCreated', ''
-                    )
+            if status.lower() == "resolved" and comms:
+                closed_date = comms[-1].get('timeCreated', '')
 
         except Exception as e:
-            print(f"Error processing case {case_no}: {e}")
+            errors.append(f"Case {case_no}: {e}")
+            comment_lines.append(f"[ERROR fetching communications: {e}]")
 
         rows.append({
             "Account ID": account_id,
             "Case No": case_no,
             "Open Date": open_date,
             "Issue Description": subject,
-            "Reason / Comments": "\n".join(comments),
+            "Reason / Comments": "\n".join(comment_lines),
             "Closed Date": closed_date,
-            "AWS Recommendation": aws_recommendation.strip()
+            "AWS Recommendation": "\n".join(aws_recommendation_lines).strip(),
         })
 
-    next_token = response.get('nextToken')
+        if i % 10 == 0:
+            print(f"  processed {i}/{len(cases)} cases...")
 
-    if not next_token:
-        break
+    if errors:
+        print(f"\n{len(errors)} case(s) had errors fetching communications:")
+        for e in errors:
+            print(f"  - {e}")
 
-    response = support.describe_cases(
-        includeResolvedCases=True,
-        language='en',
-        nextToken=next_token
-    )
+    # --- Write Excel ----------------------------------------------------
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "AWS Support Cases"
 
-    cases = response['cases']
-
-# Write CSV
-with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
-    fieldnames = [
-        "Account ID",
-        "Case No",
-        "Open Date",
-        "Issue Description",
-        "Reason / Comments",
-        "Closed Date",
-        "AWS Recommendation"
+    headers = [
+        "Account ID", "Case No", "Open Date", "Issue Description",
+        "Reason / Comments", "Closed Date", "AWS Recommendation",
     ]
+    ws.append(headers)
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
+    for row in rows:
+        ws.append([row[h] for h in headers])
 
-print(f"CSV generated: {output_file}")
+    # Wrap text for the long text columns, set reasonable widths
+    wrap_cols = {"Reason / Comments", "AWS Recommendation", "Issue Description"}
+    col_widths = {
+        "Account ID": 14, "Case No": 14, "Open Date": 20,
+        "Issue Description": 35, "Reason / Comments": 60,
+        "Closed Date": 20, "AWS Recommendation": 50,
+    }
+    for col_idx, header in enumerate(headers, 1):
+        letter = get_column_letter(col_idx)
+        ws.column_dimensions[letter].width = col_widths.get(header, 20)
+        if header in wrap_cols:
+            for row_idx in range(2, len(rows) + 2):
+                ws.cell(row=row_idx, column=col_idx).alignment = Alignment(
+                    wrap_text=True, vertical="top"
+                )
+
+    ws.freeze_panes = "A2"
+    wb.save(output_file)
+    print(f"\nExcel file generated: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
