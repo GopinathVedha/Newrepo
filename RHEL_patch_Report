@@ -1,0 +1,286 @@
+import boto3
+import datetime
+import time
+from botocore.config import Config
+
+# ======================
+# CONFIGURATION
+# ======================
+REGIONS = ["ap-southeast-2"]
+S3_BUCKET = "sandpit-s3-pspt-perfomance-reports"
+SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:050752606125:Sandpit-SPT-EC2-RHEL-Patch-Report"
+KMS_KEY_ID = "arn:aws:kms:ap-southeast-2:050752606125:key/156c1250-f91f-4147-a3ea-d7b11e2b8e3d"
+
+
+# ======================
+# SSM COMMAND
+# ======================
+def run_ssm_command(ssm, instance_id, command):
+    try:
+        response = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [command]}
+        )
+
+        command_id = response["Command"]["CommandId"]
+        time.sleep(6)
+
+        output = ssm.list_command_invocations(
+            CommandId=command_id,
+            Details=True
+        )
+
+        return output["CommandInvocations"][0]["CommandPlugins"][0]["Output"]
+
+    except Exception as e:
+        print(f"SSM failed for {instance_id}: {e}")
+        return ""
+
+
+# ======================
+# GET INSTANCES
+# ======================
+def get_instances(ec2):
+    instances = []
+
+    response = ec2.describe_instances(
+        Filters=[{"Name": "platform-details", "Values": ["Red Hat Enterprise Linux"]}]
+    )
+
+    for res in response["Reservations"]:
+        for inst in res["Instances"]:
+            name = next(
+                (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"),
+                "N/A"
+            )
+
+            instances.append({
+                "InstanceId": inst["InstanceId"],
+                "Name": name
+            })
+
+    return instances
+
+
+# ======================
+# PARSE PATCHES (FIXED & IMPROVED)
+# ======================
+def parse_patches(output):
+    now = datetime.datetime.now()
+
+    # Current month
+    current_month = now.month
+    current_year = now.year
+
+    # ✅ Correct previous month logic
+    first_day_current = now.replace(day=1)
+    prev_date = first_day_current - datetime.timedelta(days=1)
+
+    prev_month = prev_date.month
+    prev_year = prev_date.year
+
+    current_list = []
+    previous_list = []
+    all_dates = []
+
+    for line in output.splitlines():
+        parts = line.split()
+
+        if len(parts) < 6:
+            continue
+
+        pkg = parts[0]
+        date_str = " ".join(parts[1:6])
+
+        for fmt in ["%a %b %d %H:%M:%S %Y", "%a %d %b %Y %H:%M:%S"]:
+            try:
+                patch_date = datetime.datetime.strptime(date_str, fmt)
+
+                formatted = patch_date.strftime("%d %b %Y %H:%M:%S")
+                age = (now - patch_date).days
+
+                entry = (pkg, formatted, age)
+                all_dates.append(patch_date)
+
+                if patch_date.month == current_month and patch_date.year == current_year:
+                    current_list.append(entry)
+
+                elif patch_date.month == prev_month and patch_date.year == prev_year:
+                    previous_list.append(entry)
+
+                break
+
+            except:
+                continue
+
+    latest_patch_age = min([(now - d).days for d in all_dates], default=999)
+
+    return current_list, previous_list, latest_patch_age
+
+
+# ======================
+# LAMBDA HANDLER
+# ======================
+def lambda_handler(event, context):
+
+    session = boto3.Session()
+    now = datetime.datetime.now()
+
+    current_month = now.strftime("%B_%Y")
+    timestamp = now.strftime("%Y%m%d_%H%M")
+
+    s3_key = f"Patch-Report/RHEL/{now.year}/{current_month}/spt_rhel_patch_{timestamp}.html"
+
+    total_instances = 0
+    compliant = 0
+    non_compliant = 0
+
+    html = f"""
+    <html>
+    <head>
+    <style>
+    body {{ font-family: Arial; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom:20px; }}
+    th, td {{ border: 1px solid black; padding: 6px; }}
+    th {{ background-color: #0073e6; color: white; }}
+    .current {{ background-color: #d4edda; }}
+    .previous {{ background-color: #fff3cd; }}
+    .compliant {{ color: green; font-weight: bold; }}
+    .noncompliant {{ color: red; font-weight: bold; }}
+    </style>
+    </head>
+    <body>
+
+    <h2>RHEL Patch Audit Report - {current_month}</h2>
+    """
+
+    for region in REGIONS:
+        ec2 = session.client("ec2", region_name=region)
+        ssm = session.client("ssm", region_name=region)
+
+        instances = get_instances(ec2)
+
+        for inst in instances:
+            total_instances += 1
+
+            instance_id = inst["InstanceId"]
+            name = inst["Name"]
+
+            os_version = run_ssm_command(
+                ssm, instance_id, "cat /etc/redhat-release"
+            ).strip()
+
+            patch_output = run_ssm_command(
+                ssm, instance_id, "rpm -qa --last"
+            )
+
+            if not patch_output:
+                non_compliant += 1
+                continue
+
+            current, previous, patch_age = parse_patches(patch_output)
+
+            # ✅ FIXED LOGIC
+            if current:
+                compliant += 1
+                status = "COMPLIANT"
+                css = "compliant"
+            else:
+                non_compliant += 1
+                status = "NON-COMPLIANT"
+                css = "noncompliant"
+
+            html += f"""
+            <h3>{instance_id} ({name})</h3>
+            <p><b>OS:</b> {os_version}</p>
+            <p><b>Status:</b> <span class="{css}">{status}</span></p>
+            <p><b>Current:</b> {len(current)} | <b>Previous:</b> {len(previous)}</p>
+            <p><b>Latest Patch Age:</b> {patch_age} days</p>
+
+            <table>
+            <tr><th>Package</th><th>Date</th><th>Type</th><th>Age (Days)</th></tr>
+            """
+
+            for pkg, date, age in current:
+                html += f"<tr class='current'><td>{pkg}</td><td>{date}</td><td>Current</td><td>{age}</td></tr>"
+
+            for pkg, date, age in previous:
+                html += f"<tr class='previous'><td>{pkg}</td><td>{date}</td><td>Previous</td><td>{age}</td></tr>"
+
+            html += "</table>"
+
+    # ======================
+    # SUMMARY
+    # ======================
+    html = f"""
+    <h2>Summary</h2>
+    <p>Total Instances: {total_instances}</p>
+    <p>Compliant: {compliant}</p>
+    <p>Non-Compliant: {non_compliant}</p>
+    <hr>
+    """ + html
+
+    html += "</body></html>"
+
+    # ======================
+    # SAVE FILE
+    # ======================
+    file_path = "/tmp/report.html"
+    with open(file_path, "w") as f:
+        f.write(html)
+
+    # ======================
+    # S3 UPLOAD
+    # ======================
+    s3 = boto3.client(
+        "s3",
+        region_name="ap-southeast-2",
+        config=Config(signature_version="s3v4")
+    )
+
+    s3.upload_file(
+        file_path,
+        S3_BUCKET,
+        s3_key,
+        ExtraArgs={
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": KMS_KEY_ID
+        }
+    )
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=604800
+    )
+
+    # ======================
+    # SNS
+    # ======================
+    sns = boto3.client("sns")
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=f"RHEL Patch Report SPT - {current_month}",
+        Message=f"""
+RHEL Patch Audit Report Generated
+
+Month: {current_month}
+
+Summary:
+Total Instances: {total_instances}
+Compliant: {compliant}
+Non-Compliant: {non_compliant}
+
+Download Report:
+{url}
+
+(Link valid for 7 days)
+"""
+    )
+
+    return {
+        "statusCode": 200,
+        "message": "✅ RHEL report generated and sent"
+    }
