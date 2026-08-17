@@ -1,0 +1,108 @@
+import boto3
+import csv
+from datetime import datetime
+
+support = boto3.client('support', region_name='ap-southeast-2')
+sts = boto3.client('sts')
+
+account_id = sts.get_caller_identity()['Account']
+
+output_file = f"aws_support_cases_{account_id}.csv"
+
+rows = []
+
+# Get all cases
+response = support.describe_cases(
+    includeResolvedCases=True,
+    language='en'
+)
+
+cases = response['cases']
+
+while True:
+    for case in cases:
+
+        case_id = case.get('caseId', '')
+        case_no = case.get('displayId', '')
+        subject = case.get('subject', '')
+        open_date = case.get('timeCreated', '')
+        status = case.get('status', '')
+
+        closed_date = ""
+        aws_recommendation = ""
+        comments = []
+
+        # Get full communications
+        try:
+            comms = support.describe_communications(
+                caseId=case_id
+            )
+
+            for comm in comms.get('communications', []):
+
+                body = comm.get('body', '')
+                submitted_by = comm.get('submittedBy', '')
+                time_created = comm.get('timeCreated', '')
+
+                comments.append(
+                    f"[{time_created}] {submitted_by}: {body}"
+                )
+
+                # Capture AWS responses as recommendations
+                if "amazon web services" in submitted_by.lower() \
+                   or "aws" in submitted_by.lower():
+
+                    aws_recommendation += (
+                        f"\n[{time_created}] {body}"
+                    )
+
+            # Infer closed date
+            if status.lower() == "resolved":
+                if comms.get('communications'):
+                    closed_date = comms['communications'][-1].get(
+                        'timeCreated', ''
+                    )
+
+        except Exception as e:
+            print(f"Error processing case {case_no}: {e}")
+
+        rows.append({
+            "Account ID": account_id,
+            "Case No": case_no,
+            "Open Date": open_date,
+            "Issue Description": subject,
+            "Reason / Comments": "\n".join(comments),
+            "Closed Date": closed_date,
+            "AWS Recommendation": aws_recommendation.strip()
+        })
+
+    next_token = response.get('nextToken')
+
+    if not next_token:
+        break
+
+    response = support.describe_cases(
+        includeResolvedCases=True,
+        language='en',
+        nextToken=next_token
+    )
+
+    cases = response['cases']
+
+# Write CSV
+with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
+    fieldnames = [
+        "Account ID",
+        "Case No",
+        "Open Date",
+        "Issue Description",
+        "Reason / Comments",
+        "Closed Date",
+        "AWS Recommendation"
+    ]
+
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"CSV generated: {output_file}")
