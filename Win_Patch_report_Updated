@@ -1,0 +1,367 @@
+import boto3
+import datetime
+import html
+from botocore.config import Config
+
+# ======================
+# CONFIGURATION
+# ======================
+REGIONS = ["ap-southeast-2"]
+REPORT_REGION = REGIONS[0]  # used for S3 presign + SNS client (avoids relying on a leftover loop variable)
+
+S3_BUCKET = "equip-s3-pspt-perfomance-reports"
+SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:050752606125:Equip-SPT-EC2-Windows-Patch-Report"
+KMS_KEY_ID = "arn:aws:kms:ap-southeast-2:050752606125:key/156c2580-f91f-4147-a3ea-d7b11e2b8e3d"
+
+# AWS hard limit for describe_instance_patch_states is 50 instance IDs per call
+PATCH_STATE_BATCH_SIZE = 50
+
+# How many non-compliant instance IDs to list inline in the SNS email body
+SNS_INLINE_LIMIT = 15
+
+
+# ======================
+# GET WINDOWS INSTANCES (paginated)
+# ======================
+def get_windows_instances(ec2):
+    instances = []
+    paginator = ec2.get_paginator("describe_instances")
+
+    for page in paginator.paginate(
+        Filters=[
+            {"Name": "platform", "Values": ["windows"]},
+            {"Name": "instance-state-name", "Values": ["running"]},
+        ]
+    ):
+        for res in page["Reservations"]:
+            for inst in res["Instances"]:
+                name = next(
+                    (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"),
+                    "N/A",
+                )
+                instances.append({"InstanceId": inst["InstanceId"], "Name": name})
+
+    return instances
+
+
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+# ======================
+# PATCH COMPLIANCE STATE (AWS Systems Manager Patch Manager)
+# ======================
+def get_patch_states(ssm, instance_ids):
+    """
+    Returns { instance_id: state_dict } using the real patch compliance
+    data collected by the SSM Patch Manager scan (AWS-RunPatchBaseline /
+    AWS-ApplyPatchBaseline) -- NOT a guess based on "was anything
+    installed on this box this month". Instances with no Patch Manager
+    scan history simply won't appear here; that's treated separately
+    below as "Not Scanned", not silently counted as compliant.
+    """
+    states = {}
+
+    for batch in chunked(instance_ids, PATCH_STATE_BATCH_SIZE):
+        if not batch:
+            continue
+        try:
+            response = ssm.describe_instance_patch_states(InstanceIds=batch)
+            for state in response.get("InstancePatchStates", []):
+                states[state["InstanceId"]] = state
+        except Exception as e:
+            print(f"describe_instance_patch_states failed for batch {batch}: {e}")
+
+    return states
+
+
+# ======================
+# MISSING PATCH DETAIL
+# ======================
+def get_missing_patches(ssm, instance_id):
+    """
+    Returns the actual list of missing KBs for an instance, straight from
+    Patch Manager. This is the data the original report never captured --
+    it only ever looked at what WAS installed, never at what SHOULD be.
+    """
+    missing = []
+    next_token = None
+
+    try:
+        while True:
+            kwargs = {
+                "InstanceId": instance_id,
+                "Filters": [{"Key": "State", "Values": ["Missing"]}],
+                "MaxResults": 50,
+            }
+            if next_token:
+                kwargs["NextToken"] = next_token
+
+            resp = ssm.describe_instance_patches(**kwargs)
+
+            for p in resp.get("Patches", []):
+                missing.append(
+                    {
+                        "KB": p.get("KBId") or "N/A",
+                        "Title": p.get("Title", "Unknown"),
+                        "Classification": p.get("Classification", "N/A"),
+                        "Severity": p.get("Severity", "N/A"),
+                    }
+                )
+
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+
+    except Exception as e:
+        print(f"describe_instance_patches failed for {instance_id}: {e}")
+
+    return missing
+
+
+# ======================
+# LAMBDA HANDLER
+# ======================
+def lambda_handler(event, context):
+
+    now = datetime.datetime.now()
+    session = boto3.Session()
+
+    current_month = now.strftime("%B_%Y")
+    timestamp = now.strftime("%Y%m%d_%H%M")
+    generated_at = now.strftime("%d %b %Y %H:%M:%S")
+
+    s3_key = f"Patch-Report/windows/{now.year}/{current_month}/spt_windows_patch_{timestamp}.html"
+
+    total_instances = 0
+    compliant = 0
+    non_compliant = 0
+    not_scanned = 0
+
+    non_compliant_rows = []
+    not_scanned_rows = []
+    detail_sections = []
+
+    for region in REGIONS:
+        ec2 = session.client("ec2", region_name=region)
+        ssm = session.client("ssm", region_name=region)
+
+        instances = get_windows_instances(ec2)
+        instance_ids = [i["InstanceId"] for i in instances]
+        patch_states = get_patch_states(ssm, instance_ids)
+
+        for inst in instances:
+            total_instances += 1
+            instance_id = inst["InstanceId"]
+            name = inst["Name"]
+            safe_name = html.escape(name)
+
+            state = patch_states.get(instance_id)
+
+            if state is None:
+                # No Patch Manager compliance data at all -- an audit gap
+                # in its own right, distinct from "patches are missing".
+                not_scanned += 1
+                not_scanned_rows.append(
+                    {
+                        "id": instance_id,
+                        "name": safe_name,
+                        "region": region,
+                    }
+                )
+                detail_sections.append(f"""
+                <h3 id="{instance_id}">{instance_id} ({safe_name})</h3>
+                <p><b>Region:</b> {region}</p>
+                <p><b>Status:</b> <span class="unknown">NOT SCANNED</span></p>
+                <p>No AWS Systems Manager Patch Manager compliance data was found for
+                this instance. Confirm the SSM Agent is online and the instance is
+                associated with a patch baseline / patch group.</p>
+                """)
+                continue
+
+            missing_count = state.get("MissingCount", 0)
+            critical_missing = state.get("CriticalNonCompliantCount", 0)
+            security_missing = state.get("SecurityNonCompliantCount", 0)
+            installed_count = state.get("InstalledCount", 0)
+            pending_reboot = state.get("InstalledPendingRebootCount", 0)
+            last_scan = state.get("OperationEndTime")
+            last_scan_str = last_scan.strftime("%d %b %Y %H:%M:%S") if last_scan else "N/A"
+
+            if missing_count == 0:
+                compliant += 1
+                status, css_class = "COMPLIANT", "compliant"
+                missing_patches = []
+            else:
+                non_compliant += 1
+                status, css_class = "NON-COMPLIANT", "noncompliant"
+                missing_patches = get_missing_patches(ssm, instance_id)
+
+                non_compliant_rows.append({
+                    "id": instance_id,
+                    "name": safe_name,
+                    "region": region,
+                    "missing": missing_count,
+                    "critical": critical_missing,
+                    "security": security_missing,
+                    "kbs": ", ".join(p["KB"] for p in missing_patches) or "See detail section",
+                })
+
+            detail = f"""
+            <h3 id="{instance_id}">{instance_id} ({safe_name})</h3>
+            <p><b>Region:</b> {region}</p>
+            <p><b>Status:</b> <span class="{css_class}">{status}</span></p>
+            <p><b>Last Patch Manager Scan:</b> {last_scan_str}</p>
+            <p><b>Installed:</b> {installed_count} &nbsp;|&nbsp;
+               <b>Missing:</b> {missing_count} &nbsp;|&nbsp;
+               <b>Critical Missing:</b> {critical_missing} &nbsp;|&nbsp;
+               <b>Security Missing:</b> {security_missing} &nbsp;|&nbsp;
+               <b>Pending Reboot:</b> {pending_reboot}</p>
+            """
+
+            if missing_patches:
+                detail += """
+                <table>
+                <tr><th>KB</th><th>Title</th><th>Classification</th><th>Severity</th></tr>
+                """
+                for p in missing_patches:
+                    detail += (
+                        f"<tr class='noncompliant-row'><td>{html.escape(p['KB'])}</td>"
+                        f"<td>{html.escape(p['Title'])}</td>"
+                        f"<td>{html.escape(p['Classification'])}</td>"
+                        f"<td>{html.escape(p['Severity'])}</td></tr>"
+                    )
+                detail += "</table>"
+
+            detail_sections.append(detail)
+
+    # Prioritise the worst offenders at the top of the summary table
+    non_compliant_rows.sort(key=lambda r: (r["critical"], r["security"], r["missing"]), reverse=True)
+
+    compliance_pct = round((compliant / total_instances) * 100, 1) if total_instances else 0
+
+    # ======================
+    # BUILD HTML
+    # ======================
+    html_report = f"""
+    <html>
+    <head>
+    <style>
+    body {{ font-family: Arial; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom:20px; }}
+    th, td {{ border: 1px solid black; padding: 6px; }}
+    th {{ background-color: #0073e6; color: white; }}
+    .compliant {{ color: green; font-weight: bold; }}
+    .noncompliant {{ color: red; font-weight: bold; }}
+    .unknown {{ color: #b8860b; font-weight: bold; }}
+    .noncompliant-row {{ background-color: #f8d7da; }}
+    a {{ text-decoration: none; color: #0073e6; }}
+    </style>
+    </head>
+    <body>
+
+    <h2>Windows Patch Audit Report - {current_month}</h2>
+    <p><b>Report generated:</b> {generated_at} &nbsp;|&nbsp; <b>Region(s):</b> {", ".join(REGIONS)}</p>
+
+    <h2>Summary</h2>
+    <p>Total Instances: {total_instances}</p>
+    <p>Compliant: {compliant} ({compliance_pct}%)</p>
+    <p>Non-Compliant: {non_compliant}</p>
+    <p>Not Scanned / No Data: {not_scanned}</p>
+    <hr>
+    """
+
+    if non_compliant_rows:
+        html_report += "<h3>Non-Compliant Servers</h3><table>"
+        html_report += ("<tr><th>Instance ID</th><th>Name</th><th>Region</th><th>Missing</th>"
+                         "<th>Critical</th><th>Security</th><th>Missing KBs</th></tr>")
+        for row in non_compliant_rows:
+            html_report += (
+                f"<tr class='noncompliant-row'>"
+                f"<td><a href='#{row['id']}'>{row['id']}</a></td>"
+                f"<td>{row['name']}</td><td>{row['region']}</td>"
+                f"<td>{row['missing']}</td><td>{row['critical']}</td><td>{row['security']}</td>"
+                f"<td>{html.escape(row['kbs'])}</td></tr>"
+            )
+        html_report += "</table>"
+
+    if not_scanned_rows:
+        html_report += "<h3>Instances With No Patch Compliance Data (Audit Gap)</h3><table>"
+        html_report += "<tr><th>Instance ID</th><th>Name</th><th>Region</th></tr>"
+        for row in not_scanned_rows:
+            html_report += (
+                f"<tr><td><a href='#{row['id']}'>{row['id']}</a></td>"
+                f"<td>{row['name']}</td><td>{row['region']}</td></tr>"
+            )
+        html_report += "</table>"
+
+    html_report += "<hr><h2>Instance Detail</h2>"
+    html_report += "".join(detail_sections)
+    html_report += "</body></html>"
+
+    # ======================
+    # SAVE FILE
+    # ======================
+    file_path = "/tmp/windows_report.html"
+    with open(file_path, "w") as f:
+        f.write(html_report)
+
+    # ======================
+    # S3 UPLOAD
+    # ======================
+    s3 = boto3.client("s3", region_name=REPORT_REGION, config=Config(signature_version="s3v4"))
+
+    s3.upload_file(
+        file_path,
+        S3_BUCKET,
+        s3_key,
+        ExtraArgs={"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID},
+    )
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=604800,
+    )
+
+    # ======================
+    # SNS NOTIFICATION
+    # ======================
+    sns = boto3.client("sns", region_name=REPORT_REGION)
+
+    if non_compliant_rows:
+        inline = non_compliant_rows[:SNS_INLINE_LIMIT]
+        lines = [f"  - {r['id']} ({r['name']}): {r['missing']} missing "
+                 f"({r['critical']} critical, {r['security']} security)" for r in inline]
+        non_compliant_block = "\nNon-Compliant Servers:\n" + "\n".join(lines)
+        if len(non_compliant_rows) > SNS_INLINE_LIMIT:
+            non_compliant_block += f"\n  ... and {len(non_compliant_rows) - SNS_INLINE_LIMIT} more (see report)"
+    else:
+        non_compliant_block = ""
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=f"Windows Patch Report SPT - {current_month}",
+        Message=f"""Windows Patch Audit Report Generated
+
+Month: {current_month}
+Generated: {generated_at}
+
+Summary:
+Total Instances: {total_instances}
+Compliant: {compliant} ({compliance_pct}%)
+Non-Compliant: {non_compliant}
+Not Scanned / No Data: {not_scanned}
+{non_compliant_block}
+
+Download Report:
+{url}
+
+(Link valid for 7 days)
+""",
+    )
+
+    return {
+        "statusCode": 200,
+        "message": "Windows patch report generated and sent",
+    }
