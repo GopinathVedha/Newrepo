@@ -141,7 +141,7 @@ def lambda_handler(event, context):
 
     non_compliant_rows = []
     not_scanned_rows = []
-    detail_sections = []
+    all_rows = []  # one row per instance, used for the consolidated Instance Detail table
 
     for region in REGIONS:
         ec2 = session.client("ec2", region_name=region)
@@ -170,14 +170,14 @@ def lambda_handler(event, context):
                         "region": region,
                     }
                 )
-                detail_sections.append(f"""
-                <h3 id="{instance_id}">{instance_id} ({safe_name})</h3>
-                <p><b>Region:</b> {region}</p>
-                <p><b>Status:</b> <span class="unknown">NOT SCANNED</span></p>
-                <p>No AWS Systems Manager Patch Manager compliance data was found for
-                this instance. Confirm the SSM Agent is online and the instance is
-                associated with a patch baseline / patch group.</p>
-                """)
+                all_rows.append({
+                    "status": "NOT SCANNED", "css": "unknown-row", "status_rank": 1,
+                    "id": instance_id, "name": safe_name, "region": region,
+                    "installed": "-", "missing": "-", "critical": "-", "security": "-",
+                    "pending_reboot": "-", "last_scan": "-",
+                    "kbs": "No Patch Manager scan data -- check SSM Agent / patch baseline association",
+                    "sort_critical": 0, "sort_security": 0, "sort_missing": 0,
+                })
                 continue
 
             missing_count = state.get("MissingCount", 0)
@@ -190,11 +190,12 @@ def lambda_handler(event, context):
 
             if missing_count == 0:
                 compliant += 1
-                status, css_class = "COMPLIANT", "compliant"
+                status, css_row, status_rank = "COMPLIANT", "compliant-row", 2
                 missing_patches = []
+                kb_cell = "-"
             else:
                 non_compliant += 1
-                status, css_class = "NON-COMPLIANT", "noncompliant"
+                status, css_row, status_rank = "NON-COMPLIANT", "noncompliant-row", 0
                 missing_patches = get_missing_patches(ssm, instance_id)
 
                 non_compliant_rows.append({
@@ -204,39 +205,29 @@ def lambda_handler(event, context):
                     "missing": missing_count,
                     "critical": critical_missing,
                     "security": security_missing,
-                    "kbs": ", ".join(p["KB"] for p in missing_patches) or "See detail section",
+                    "kbs": ", ".join(p["KB"] for p in missing_patches) or "See detail table",
                 })
+                kb_cell = "<br>".join(
+                    f"{html.escape(p['KB'])} - {html.escape(p['Title'])} ({html.escape(p['Severity'])})"
+                    for p in missing_patches
+                ) or "See summary counts"
 
-            detail = f"""
-            <h3 id="{instance_id}">{instance_id} ({safe_name})</h3>
-            <p><b>Region:</b> {region}</p>
-            <p><b>Status:</b> <span class="{css_class}">{status}</span></p>
-            <p><b>Last Patch Manager Scan:</b> {last_scan_str}</p>
-            <p><b>Installed:</b> {installed_count} &nbsp;|&nbsp;
-               <b>Missing:</b> {missing_count} &nbsp;|&nbsp;
-               <b>Critical Missing:</b> {critical_missing} &nbsp;|&nbsp;
-               <b>Security Missing:</b> {security_missing} &nbsp;|&nbsp;
-               <b>Pending Reboot:</b> {pending_reboot}</p>
-            """
-
-            if missing_patches:
-                detail += """
-                <table>
-                <tr><th>KB</th><th>Title</th><th>Classification</th><th>Severity</th></tr>
-                """
-                for p in missing_patches:
-                    detail += (
-                        f"<tr class='noncompliant-row'><td>{html.escape(p['KB'])}</td>"
-                        f"<td>{html.escape(p['Title'])}</td>"
-                        f"<td>{html.escape(p['Classification'])}</td>"
-                        f"<td>{html.escape(p['Severity'])}</td></tr>"
-                    )
-                detail += "</table>"
-
-            detail_sections.append(detail)
+            all_rows.append({
+                "status": status, "css": css_row, "status_rank": status_rank,
+                "id": instance_id, "name": safe_name, "region": region,
+                "installed": installed_count, "missing": missing_count,
+                "critical": critical_missing, "security": security_missing,
+                "pending_reboot": pending_reboot, "last_scan": last_scan_str,
+                "kbs": kb_cell,
+                "sort_critical": critical_missing, "sort_security": security_missing,
+                "sort_missing": missing_count,
+            })
 
     # Prioritise the worst offenders at the top of the summary table
     non_compliant_rows.sort(key=lambda r: (r["critical"], r["security"], r["missing"]), reverse=True)
+
+    # Instance Detail table: non-compliant first (worst first), then not-scanned, then compliant
+    all_rows.sort(key=lambda r: (r["status_rank"], -r["sort_critical"], -r["sort_security"], -r["sort_missing"]))
 
     compliance_pct = round((compliant / total_instances) * 100, 1) if total_instances else 0
 
@@ -255,6 +246,9 @@ def lambda_handler(event, context):
     .noncompliant {{ color: red; font-weight: bold; }}
     .unknown {{ color: #b8860b; font-weight: bold; }}
     .noncompliant-row {{ background-color: #f8d7da; }}
+    .compliant-row {{ background-color: #d4edda; }}
+    .unknown-row {{ background-color: #fff3cd; }}
+    td {{ vertical-align: top; }}
     a {{ text-decoration: none; color: #0073e6; }}
     </style>
     </head>
@@ -296,7 +290,21 @@ def lambda_handler(event, context):
         html_report += "</table>"
 
     html_report += "<hr><h2>Instance Detail</h2>"
-    html_report += "".join(detail_sections)
+    html_report += "<table>"
+    html_report += ("<tr><th>Status</th><th>Instance ID</th><th>Name</th><th>Region</th>"
+                     "<th>Installed</th><th>Missing</th><th>Critical</th><th>Security</th>"
+                     "<th>Pending Reboot</th><th>Last Scan</th><th>Missing KBs</th></tr>")
+    for row in all_rows:
+        html_report += (
+            f"<tr id='{row['id']}' class='{row['css']}'>"
+            f"<td>{row['status']}</td>"
+            f"<td>{row['id']}</td><td>{row['name']}</td><td>{row['region']}</td>"
+            f"<td>{row['installed']}</td><td>{row['missing']}</td>"
+            f"<td>{row['critical']}</td><td>{row['security']}</td>"
+            f"<td>{row['pending_reboot']}</td><td>{row['last_scan']}</td>"
+            f"<td>{row['kbs']}</td></tr>"
+        )
+    html_report += "</table>"
     html_report += "</body></html>"
 
     # ======================
