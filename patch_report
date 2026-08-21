@@ -1,0 +1,110 @@
+RHEL Patch Audit Report - August_2026
+Report generated: 19 Aug 2026 12:45:38  |  Region(s): ap-southeast-2
+
+Summary
+Total Instances: 16
+
+Compliant: 5 (31.2%)
+
+Non-Compliant: 11
+
+Not Scanned / No Data: 0
+
+Non-Compliant Servers
+Instance ID	Name	Region	Missing	Critical	Security	Missing Packages
+i-0f4b1ee21412fccf9	awsslapbto01	ap-southeast-2	18	0	18	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, gstreamer1-plugins-bad-free.x86_64:0:1.22.12-5.el9_6.6, gstreamer1-plugins-bad-free-libs.x86_64:0:1.22.12-5.el9_6.6, pipewire.x86_64:0:1.0.1-1.el9_6.1, pipewire-alsa.x86_64:0:1.0.1-1.el9_6.1, pipewire-gstreamer.x86_64:0:1.0.1-1.el9_6.1, pipewire-jack-audio-connection-kit.x86_64:0:1.0.1-1.el9_6.1, pipewire-jack-audio-connection-kit-libs.x86_64:0:1.0.1-1.el9_6.1, pipewire-libs.x86_64:0:1.0.1-1.el9_6.1, pipewire-pulseaudio.x86_64:0:1.0.1-1.el9_6.1, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3.x86_64:0:2.52.5-1.el9_6, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6, yelp.x86_64:2:40.3-2.el9_6.2, yelp-libs.x86_64:2:40.3-2.el9_6.2
+i-01502b02d7aaac48d	awspsldbpt101	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-0edb67d0fd861e796	awspslapptg01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-0ed62e60692f9ba77	awspslseptk01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-04b76dd4b8f3cfe12	awspslappte01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-088534212d4193491	awspslappty01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-07aa73a504175d809	awspslseptw01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-0c37ca41dfe2a24e7	awspslapptb01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-00830c216503363e6	awspslapptj01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-0017ea5f700aa4886	awspslappto01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+i-0e2afaf1a510a2062	awspslappts01	ap-southeast-2	6	0	6	bind-libs.x86_64:32:9.16.23-31.el9_6.4, bind-license.noarch:32:9.16.23-31.el9_6.4, bind-utils.x86_64:32:9.16.23-31.el9_6.4, python3-bind.noarch:32:9.16.23-31.el9_6.4, rhc.x86_64:1:0.2.7-1.el9_6.5, webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6
+Instance Detail
+Status	Instance ID	Name	Region	OS	Installed	Missing	Critical	Security	Last Scan	Missing Packages
+NON-COMPLIANT	i-0f4b1ee21412fccf9	awsslapbto01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	324	18	0	18	18 Aug 2026 23:58:39	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+gstreamer1-plugins-bad-free.x86_64:0:1.22.12-5.el9_6.6 (gstreamer1-plugins-bad-free.x86_64) (Important)
+gstreamer1-plugins-bad-free-libs.x86_64:0:1.22.12-5.el9_6.6 (gstreamer1-plugins-bad-free-libs.x86_64) (Important)
+pipewire.x86_64:0:1.0.1-1.el9_6.1 (pipewire.x86_64) (Important)
+pipewire-alsa.x86_64:0:1.0.1-1.el9_6.1 (pipewire-alsa.x86_64) (Important)
+pipewire-gstreamer.x86_64:0:1.0.1-1.el9_6.1 (pipewire-gstreamer.x86_64) (Important)
+pipewire-jack-audio-connection-kit.x86_64:0:1.0.1-1.el9_6.1 (pipewire-jack-audio-connection-kit.x86_64) (Important)
+pipewire-jack-audio-connection-kit-libs.x86_64:0:1.0.1-1.el9_6.1 (pipewire-jack-audio-connection-kit-libs.x86_64) (Important)
+pipewire-libs.x86_64:0:1.0.1-1.el9_6.1 (pipewire-libs.x86_64) (Important)
+pipewire-pulseaudio.x86_64:0:1.0.1-1.el9_6.1 (pipewire-pulseaudio.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+yelp.x86_64:2:40.3-2.el9_6.2 (yelp.x86_64) (Important)
+yelp-libs.x86_64:2:40.3-2.el9_6.2 (yelp-libs.x86_64) (Important)
+NON-COMPLIANT	i-01502b02d7aaac48d	awspsldbpt101	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:22	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-0edb67d0fd861e796	awspslapptg01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:30	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-0ed62e60692f9ba77	awspslseptk01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:57:58	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-04b76dd4b8f3cfe12	awspslappte01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	287	6	0	6	18 Aug 2026 23:58:34	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-088534212d4193491	awspslappty01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:36	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-07aa73a504175d809	awspslseptw01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:41	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-0c37ca41dfe2a24e7	awspslapptb01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:28	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-00830c216503363e6	awspslapptj01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	287	6	0	6	18 Aug 2026 23:58:31	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-0017ea5f700aa4886	awspslappto01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:26	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+NON-COMPLIANT	i-0e2afaf1a510a2062	awspslappts01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	280	6	0	6	18 Aug 2026 23:58:35	bind-libs.x86_64:32:9.16.23-31.el9_6.4 (bind-libs.x86_64) (Important)
+bind-license.noarch:32:9.16.23-31.el9_6.4 (bind-license.noarch) (Important)
+bind-utils.x86_64:32:9.16.23-31.el9_6.4 (bind-utils.x86_64) (Important)
+python3-bind.noarch:32:9.16.23-31.el9_6.4 (python3-bind.noarch) (Important)
+rhc.x86_64:1:0.2.7-1.el9_6.5 (rhc.x86_64) (Important)
+webkit2gtk3-jsc.x86_64:0:2.52.5-1.el9_6 (webkit2gtk3-jsc.x86_64) (Important)
+COMPLIANT	i-06ee3159a8f8cb915	awspsldbpt501	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	286	0	0	0	18 Aug 2026 23:58:29	-
+COMPLIANT	i-05ba6a1c39052146f	awspslapptc01	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	286	0	0	0	18 Aug 2026 23:58:32	-
+COMPLIANT	i-0ab5884dbfa69f07d	awspsldbpt301	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	286	0	0	0	18 Aug 2026 23:58:25	-
+COMPLIANT	i-08c43795563a388b3	awspsldbpt401	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	286	0	0	0	18 Aug 2026 23:58:29	-
+COMPLIANT	i-0b70f5286af5e45d6	awspsldbpt201	ap-southeast-2	Red Hat Enterprise Linux release 9.6 (Plow)	286	0	0	0	18 Aug 2026 23:58:21	-
