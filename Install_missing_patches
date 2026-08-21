@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# ==========================================================================
+# Installs the missing security updates identified in the Aug-2026 RHEL
+# patch report (11 non-compliant instances).
+#
+# Deliberately uses `dnf update`, NOT `dnf install`. `update` only touches
+# packages that are ALREADY present on a given host -- it will never pull
+# in a package that host doesn't already have. That matters here because
+# 10 of the 11 targets only need the "common six" (bind-libs, bind-license,
+# bind-utils, python3-bind, rhc, webkit2gtk3-jsc); only awsslapbto01 also
+# has the extra desktop/GUI packages (gstreamer/pipewire/webkit2gtk3/yelp)
+# installed. Sending the full 18-package list to every host is safe under
+# `update` -- it silently no-ops on any package a host doesn't have.
+#
+# USAGE:
+#   ./install_missing_patches.sh                        # all 11 targets
+#   ./install_missing_patches.sh i-0f4b1ee21412fccf9     # one host (test first!)
+#
+# PREREQUISITES:
+#   AWS CLI v2, configured with credentials/role that has ssm:SendCommand,
+#   ssm:GetCommandInvocation, ssm:ListCommandInvocations for these
+#   instances in ap-southeast-2. python3 must be on PATH locally (used only
+#   to build the SSM parameters JSON correctly -- not run on the targets).
+#
+# RECOMMENDED: run against ONE instance first (pass its ID as $1), confirm
+# the app team is happy, then run the full batch.
+# ==========================================================================
+set -euo pipefail
+
+REGION="ap-southeast-2"
+
+ALL_TARGETS=(
+  i-0f4b1ee21412fccf9   # awsslapbto01  -- needs all 18 packages
+  i-01502b02d7aaac48d   # awspsldbpt101
+  i-0edb67d0fd861e796   # awspslapptg01
+  i-0ed62e60692f9ba77   # awspslseptk01
+  i-04b76dd4b8f3cfe12   # awspslappte01
+  i-088534212d4193491   # awspslappty01
+  i-07aa73a504175d809   # awspslseptw01
+  i-0c37ca41dfe2a24e7   # awspslapptb01
+  i-00830c216503363e6   # awspslapptj01
+  i-0017ea5f700aa4886   # awspslappto01
+  i-0e2afaf1a510a2062   # awspslappts01
+)
+
+if [ "$#" -ge 1 ]; then
+  TARGETS=("$@")
+else
+  TARGETS=("${ALL_TARGETS[@]}")
+fi
+
+echo "Targeting ${#TARGETS[@]} instance(s) in ${REGION}:"
+printf '  %s\n' "${TARGETS[@]}"
+echo
+
+PARAMS_FILE=$(mktemp)
+trap 'rm -f "$PARAMS_FILE"' EXIT
+
+python3 - "$PARAMS_FILE" <<'PYEOF'
+import json, sys
+
+PKG_LIST = (
+    "bind-libs bind-license bind-utils python3-bind rhc webkit2gtk3-jsc "
+    "webkit2gtk3 gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-libs "
+    "pipewire pipewire-alsa pipewire-gstreamer pipewire-jack-audio-connection-kit "
+    "pipewire-jack-audio-connection-kit-libs pipewire-libs pipewire-pulseaudio "
+    "yelp yelp-libs"
+)
+
+commands = [
+    "set -x",
+
+    "echo '=== BEFORE: current versions (only shows packages actually present) ==='",
+    f"rpm -q {PKG_LIST} 2>&1 || true",
+
+    "echo '=== Safety check: is named (BIND server) active on this host? ==='",
+    "systemctl is-active named 2>&1 || echo 'named is not active (expected on app/db servers)'",
+
+    "echo '=== INSTALLING (dnf update -- only touches packages already installed) ==='",
+    f"dnf update -y {PKG_LIST}",
+
+    "echo '=== Transaction recorded -- note this ID if you want a precise rollback later ==='",
+    "dnf history list | head -3",
+
+    "echo '=== AFTER: confirming installed versions ==='",
+    f"rpm -q {PKG_LIST} 2>&1 || true",
+]
+
+params = {"commands": commands, "executionTimeout": ["3600"]}
+
+with open(sys.argv[1], "w") as f:
+    json.dump(params, f)
+PYEOF
+
+echo "Sending SSM command (AWS-RunShellScript / dnf update)..."
+COMMAND_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --document-name "AWS-RunShellScript" \
+  --comment "Aug-2026 RHEL patch remediation - install missing security updates" \
+  --instance-ids "${TARGETS[@]}" \
+  --parameters file://"$PARAMS_FILE" \
+  --query "Command.CommandId" --output text)
+
+echo "Command ID: $COMMAND_ID"
+echo
+echo "Check status per instance with:"
+for id in "${TARGETS[@]}"; do
+  echo "  aws ssm get-command-invocation --region $REGION --command-id $COMMAND_ID --instance-id $id --query '[Status,StandardOutputContent]' --output text"
+done
+echo
+echo "Or list all invocations at once:"
+echo "  aws ssm list-command-invocations --region $REGION --command-id $COMMAND_ID --details --query 'CommandInvocations[].[InstanceId,Status]' --output table"
+echo
+echo "After all instances show Status=Success, re-run your RHEL patch report Lambda"
+echo "(or an AWS-RunPatchBaseline Scan) to confirm compliance now shows 0 missing."
