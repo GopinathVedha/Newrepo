@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# ==========================================================================
+# Rolls back the dnf transaction created by install_missing_patches.sh,
+# restoring each host to the exact package versions it had before.
+#
+# Uses `dnf history undo`, NOT `dnf remove`. `remove` uninstalls the named
+# packages outright and can cascade-remove anything that depends on them --
+# a much bigger blast radius than we want for a rollback. `dnf history
+# undo <id>` instead replays the precise inverse of that one recorded
+# transaction, putting back exactly the previous versions.
+#
+# By default this targets the LAST dnf transaction on each host, which is
+# correct if you're rolling back shortly after running
+# install_missing_patches.sh. If time has passed or anything else was
+# installed on a host since, check first:
+#   aws ssm send-command --region ap-southeast-2 --document-name AWS-RunShellScript \
+#     --instance-ids <id> --parameters commands='["dnf history list | head -10"]'
+# then re-run this script passing the correct transaction ID explicitly.
+#
+# USAGE:
+#   ./rollback_missing_patches.sh                        # undo latest txn, all 11 hosts
+#   ./rollback_missing_patches.sh i-0f4b1ee21412fccf9     # undo latest txn, one host
+#   ./rollback_missing_patches.sh i-0f4b1ee21412fccf9 42  # undo txn ID 42, one host
+#
+# PREREQUISITES: same as install_missing_patches.sh.
+# ==========================================================================
+set -euo pipefail
+
+REGION="ap-southeast-2"
+
+ALL_TARGETS=(
+  i-0f4b1ee21412fccf9
+  i-01502b02d7aaac48d
+  i-0edb67d0fd861e796
+  i-0ed62e60692f9ba77
+  i-04b76dd4b8f3cfe12
+  i-088534212d4193491
+  i-07aa73a504175d809
+  i-0c37ca41dfe2a24e7
+  i-00830c216503363e6
+  i-0017ea5f700aa4886
+  i-0e2afaf1a510a2062
+)
+
+TXN="last"
+if [ "$#" -ge 1 ]; then
+  TARGETS=("$1")
+  if [ "$#" -ge 2 ]; then
+    TXN="$2"
+  fi
+else
+  TARGETS=("${ALL_TARGETS[@]}")
+fi
+
+echo "Rolling back dnf transaction '$TXN' on ${#TARGETS[@]} instance(s) in ${REGION}:"
+printf '  %s\n' "${TARGETS[@]}"
+echo
+
+PARAMS_FILE=$(mktemp)
+trap 'rm -f "$PARAMS_FILE"' EXIT
+
+python3 - "$PARAMS_FILE" "$TXN" <<'PYEOF'
+import json, sys
+
+txn = sys.argv[2]
+
+PKG_LIST = (
+    "bind-libs bind-license bind-utils python3-bind rhc webkit2gtk3-jsc "
+    "webkit2gtk3 gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-libs "
+    "pipewire pipewire-alsa pipewire-gstreamer pipewire-jack-audio-connection-kit "
+    "pipewire-jack-audio-connection-kit-libs pipewire-libs pipewire-pulseaudio "
+    "yelp yelp-libs"
+)
+
+commands = [
+    "set -x",
+    "echo '=== Current dnf history (most recent transactions) ==='",
+    "dnf history list | head -5",
+
+    # Resolve "last" to a concrete transaction ID ourselves rather than
+    # relying on dnf's own "last" keyword support, which varies by version.
+    (
+        f'if [ "{txn}" = "last" ]; then '
+        "TARGET_TXN=$(dnf history list | awk 'NR==3{print $1}'); "
+        f'else TARGET_TXN="{txn}"; fi'
+    ),
+    'echo "=== ROLLING BACK transaction: $TARGET_TXN ==="',
+    'dnf -y history undo "$TARGET_TXN"',
+
+    "echo '=== AFTER ROLLBACK: confirming reverted versions ==='",
+    f"rpm -q {PKG_LIST} 2>&1 || true",
+]
+
+params = {"commands": commands, "executionTimeout": ["3600"]}
+
+with open(sys.argv[1], "w") as f:
+    json.dump(params, f)
+PYEOF
+
+echo "Sending SSM rollback command (AWS-RunShellScript / dnf history undo)..."
+COMMAND_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --document-name "AWS-RunShellScript" \
+  --comment "Aug-2026 RHEL patch remediation - rollback" \
+  --instance-ids "${TARGETS[@]}" \
+  --parameters file://"$PARAMS_FILE" \
+  --query "Command.CommandId" --output text)
+
+echo "Command ID: $COMMAND_ID"
+echo
+echo "Check status per instance with:"
+for id in "${TARGETS[@]}"; do
+  echo "  aws ssm get-command-invocation --region $REGION --command-id $COMMAND_ID --instance-id $id --query '[Status,StandardOutputContent]' --output text"
+done
