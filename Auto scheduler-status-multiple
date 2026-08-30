@@ -1,0 +1,198 @@
+import boto3
+import json
+import logging
+from botocore.exceptions import ClientError
+
+# ============================================================
+# LAMBDA 2 of 2 — "Status" function (MULTI-ACCOUNT / CENTRAL HUB)
+#
+# Invoked ~3 minutes after Lambda 1, carrying ONLY the accounts and
+# instance IDs that were actually touched that cycle (never sweeps every
+# account, and never lists a whole account's fleet — only the specific
+# instances passed in). Restores capacity-downgraded instances to their
+# original type, and — only if there were starts — checks health for
+# just those started instances.
+# ============================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+region = 'ap-southeast-2'
+
+sns_topic_capacity_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
+sns_topic_health_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_health_check'
+
+ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
+
+sts_client = boto3.client('sts', region_name=region)
+sns_client = boto3.client('sns', region_name=region)
+
+
+def get_account_session(role_arn):
+    if not role_arn:
+        return boto3.Session()
+    creds = sts_client.assume_role(RoleArn=role_arn, RoleSessionName='ec2-autoscheduler-status')['Credentials']
+    return boto3.Session(
+        aws_access_key_id=creds['AccessKeyId'],
+        aws_secret_access_key=creds['SecretAccessKey'],
+        aws_session_token=creds['SessionToken'],
+    )
+
+
+def get_tag_value(instance, key):
+    if instance.tags:
+        for tag in instance.tags:
+            if tag['Key'] == key:
+                return tag['Value']
+    return None
+
+
+def send_sns_notification(message, topic_arn, subject='EC2 Scheduler Notification'):
+    try:
+        response = sns_client.publish(TopicArn=topic_arn, Message=message, Subject=subject)
+        logger.info(f"SNS notification sent to {topic_arn} (MessageId: {response.get('MessageId')})")
+    except Exception as e:
+        logger.error(f"Failed to send SNS notification to {topic_arn}: {e}")
+
+
+def get_event_table(events, columns):
+    header = " | ".join(columns)
+    sep = " | ".join(["-" * len(c) for c in columns])
+    lines = [header, sep]
+    for row in events:
+        lines.append(" | ".join(str(x) for x in row))
+    return "\n".join(lines)
+
+
+def restore_original_type(ec2_client, ec2_resource, instance_id, name, account_name, restore_events, restore_failures):
+    instance = ec2_resource.Instance(instance_id)
+    original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
+    if not original_type or original_type == instance.instance_type:
+        return
+    try:
+        ec2_client.modify_instance_attribute(InstanceId=instance_id, InstanceType={'Value': original_type})
+        logger.info(f"Restored {instance_id} ({name}, {account_name}) from {instance.instance_type} to {original_type}")
+        restore_events.append((instance_id, name, account_name, instance.instance_type, original_type))
+        ec2_client.delete_tags(Resources=[instance_id], Tags=[{'Key': ORIGINAL_TYPE_TAG}])
+    except ClientError as e:
+        logger.error(f"Failed to restore {instance_id} ({name}, {account_name}): {e}")
+        restore_failures.append((instance_id, name, account_name, str(e)))
+
+
+def get_scoped_status_table(ec2_client, instance_ids, instance_names, account_name):
+    """Health/status for ONLY the given instance IDs — never the whole account."""
+    if not instance_ids:
+        return "", 0
+    lines = ["     Instance ID     |     Server Name     |     Status      |   Health Check",
+              "------------------- | ------------------- | --------------- | ----------------"]
+    desc = ec2_client.describe_instances(InstanceIds=instance_ids)
+    states = {}
+    for res in desc['Reservations']:
+        for inst in res['Instances']:
+            states[inst['InstanceId']] = inst['State']['Name']
+
+    status_resp = ec2_client.describe_instance_status(InstanceIds=instance_ids, IncludeAllInstances=True)
+    health_by_id = {}
+    for st in status_resp['InstanceStatuses']:
+        system = st['SystemStatus']['Status']
+        instance_check = st['InstanceStatus']['Status']
+        health_by_id[st['InstanceId']] = "2/2 Passed" if system == "ok" and instance_check == "ok" else f"{system}/{instance_check}"
+
+    for iid in instance_ids:
+        name = instance_names.get(iid, 'Unnamed')
+        status = states.get(iid, 'unknown')
+        health = health_by_id.get(iid, 'N/A')
+        lines.append(f"{iid:<19} | {name:<19} | {status:<15} | {health}")
+    return "\n".join(lines), len(instance_ids)
+
+
+# ---------- Main handler ----------
+
+def lambda_handler(event, context):
+    logger.info(f"Lambda 2 (status) invoked. Event: {json.dumps(event)}")
+
+    try:
+        timestamp = event.get("timestamp", "")
+        had_starts = event.get("had_starts", False)
+        accounts_involved = event.get("accounts_involved", {})
+
+        restore_events = []     # (instance_id, name, account, ran_as, restored_to)
+        restore_failures = []   # (instance_id, name, account, reason)
+        health_sections = []    # per-account health table text
+        account_access_failures = []  # (account_id, account_name, error)
+
+        for account_id, info in accounts_involved.items():
+            account_name = info.get('name', account_id)
+            role_arn = info.get('role_arn')
+            autostop_ids = info.get('autostop_instance_ids', [])
+            autostart_ids = info.get('autostart_instance_ids', [])
+            instance_names = info.get('instance_names', {})
+
+            try:
+                session = get_account_session(role_arn)
+                ec2_resource = session.resource('ec2', region_name=region)
+                ec2_client = session.client('ec2', region_name=region)
+            except ClientError as e:
+                logger.error(f"Could not assume role for account {account_id} ({account_name}): {e}")
+                account_access_failures.append((account_id, account_name, str(e)))
+                continue
+
+            # --- Restore capacity-downgraded instances (only this account's stopped ones) ---
+            for instance_id in autostop_ids:
+                try:
+                    instance = ec2_resource.Instance(instance_id)
+                    instance.reload()
+                    if instance.state['Name'] == 'stopped':
+                        restore_original_type(ec2_client, ec2_resource, instance_id,
+                                               instance_names.get(instance_id, 'Unnamed'), account_name,
+                                               restore_events, restore_failures)
+                    else:
+                        original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
+                        if original_type:
+                            logger.info(f"{instance_id} ({account_name}) not yet stopped "
+                                        f"(state={instance.state['Name']}); will retry next cycle")
+                except Exception as e:
+                    logger.error(f"Error checking/restoring {instance_id} ({account_name}): {e}")
+
+            # --- Health check (only THIS account's started instances, only if had_starts) ---
+            if had_starts and autostart_ids:
+                table, count = get_scoped_status_table(ec2_client, autostart_ids, instance_names, account_name)
+                if table:
+                    health_sections.append(f"\n[{account_name}] {count} instance(s) checked:\n{table}")
+
+        if account_access_failures:
+            send_sns_notification(
+                "❌ EC2 Autoscheduler status check could not access these accounts:\n"
+                + get_event_table(account_access_failures, ["Account ID", "Account Name", "Error"]),
+                sns_topic_capacity_arn, subject='EC2 Scheduler - Status Check Account Access FAILED'
+            )
+
+        if restore_events or restore_failures:
+            capacity_lines = [f"♻️ EC2 Instance Type Restore Report\n\n📅 Timestamp: {timestamp}\n"]
+            if restore_events:
+                capacity_lines.append("Instances restored back to their original instance type:\n"
+                    + get_event_table(restore_events, ["Instance ID", "Name", "Account", "Ran As", "Restored To"]))
+            if restore_failures:
+                capacity_lines.append("\nInstances that FAILED to restore (will retry next stop cycle):\n"
+                    + get_event_table(restore_failures, ["Instance ID", "Name", "Account", "Reason"]))
+            send_sns_notification("\n".join(capacity_lines), sns_topic_capacity_arn,
+                                   subject='EC2 Scheduler - Instance Type Restore Report')
+
+        # Health check email — only sent when there were actual starts somewhere this cycle,
+        # and only covers the accounts/instances that were actually started.
+        if had_starts and health_sections:
+            message = (f"♻️ EC2 Autoscheduler — Follow-up Health Check\n\n📅 Timestamp: {timestamp}\n"
+                       + "".join(health_sections))
+            logger.info(message)
+            send_sns_notification(message, sns_topic_health_arn, subject='EC2 Scheduler - Follow-up Health Check')
+        else:
+            logger.info("No start actions this cycle — skipping the health-check email.")
+
+    except Exception as e:
+        logger.exception(f"Unhandled error in Lambda 2 status-check handler: {e}")
+        send_sns_notification(
+            f"❌ EC2 Autoscheduler Lambda 2 (status/restore) hit an unhandled error.\n\nError: {e}\n\n"
+            f"Check CloudWatch Logs for this function for the full traceback.",
+            sns_topic_capacity_arn, subject='EC2 Scheduler - Status Lambda FAILED'
+        )
+        raise
