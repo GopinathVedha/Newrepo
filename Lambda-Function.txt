@@ -1,0 +1,1098 @@
+import boto3
+import csv
+import io
+import os
+import json
+import logging
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+
+from botocore.exceptions import ClientError
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "90"))
+
+SOURCE_ACCOUNTS = [
+    x.strip()
+    for x in os.getenv("SOURCE_ACCOUNTS", "").split(",")
+    if x.strip()
+]
+
+REGIONS = [
+    x.strip()
+    for x in os.getenv(
+        "REGIONS",
+        "ap-southeast-2"
+    ).split(",")
+    if x.strip()
+]
+
+ROLE_NAME = os.getenv(
+    "ROLE_NAME",
+    "SnapshotCleanupRole"
+)
+
+REPORT_BUCKET = os.environ["REPORT_BUCKET"]
+
+REPORT_PREFIX = os.getenv(
+    "REPORT_PREFIX",
+    "ebs-snapshot-cleanup/"
+)
+
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+PRESIGNED_URL_EXPIRY = int(
+    os.getenv(
+        "PRESIGNED_URL_EXPIRY",
+        "86400"
+    )
+)
+
+AMI_TYPE_TAG_KEY = os.getenv(
+    "AMI_TYPE_TAG_KEY",
+    "AMI Type"
+)
+
+EXCLUDED_AMI_TAG_VALUES = {
+    x.strip().lower()
+    for x in os.getenv(
+        "EXCLUDED_AMI_TAG_VALUES",
+        "Pre Patch backup,Post Patch backup"
+    ).split(",")
+}
+
+
+# ============================================================
+# AWS CLIENTS
+# ============================================================
+
+sts = boto3.client("sts")
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def assume_role(account_id, region):
+    """
+    Assume the snapshot cleanup role in target account.
+    """
+
+    role_arn = (
+        f"arn:aws:iam::{account_id}:role/{ROLE_NAME}"
+    )
+
+    response = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName="SnapshotCleanupLambda"
+    )
+
+    credentials = response["Credentials"]
+
+    return boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        region_name=region
+    )
+
+
+def get_account_name(account_id, session):
+    """
+    Optional account-name lookup.
+
+    Requires Organizations access in the management account.
+    Falls back to account ID.
+    """
+
+    try:
+        org = session.client("organizations")
+
+        response = org.describe_account(
+            AccountId=account_id
+        )
+
+        return response["Account"]["Name"]
+
+    except Exception:
+        return account_id
+
+
+def tags_to_dict(tags):
+    return {
+        tag["Key"]: tag["Value"]
+        for tag in (tags or [])
+    }
+
+
+def get_ami_info(ec2, snapshot_id):
+    """
+    Find AMI(s) associated with the snapshot.
+
+    Snapshot -> AMI association is generally discovered
+    through the block device mappings of AMIs.
+    """
+
+    amis = []
+
+    paginator = ec2.get_paginator(
+        "describe_images"
+    )
+
+    try:
+        pages = paginator.paginate(
+            Owners=["self"]
+        )
+
+        for page in pages:
+
+            for image in page.get("Images", []):
+
+                for mapping in image.get(
+                    "BlockDeviceMappings",
+                    []
+                ):
+
+                    ebs = mapping.get("Ebs", {})
+
+                    if ebs.get(
+                        "SnapshotId"
+                    ) == snapshot_id:
+
+                        amis.append(image)
+
+    except ClientError as exc:
+        logger.warning(
+            "Unable to lookup AMI for %s: %s",
+            snapshot_id,
+            exc
+        )
+
+    return amis
+
+
+def is_excluded_ami(ami):
+    """
+    Exclude AMIs with:
+
+    AMI Type = Pre Patch backup
+    AMI Type = Post Patch backup
+    """
+
+    tags = tags_to_dict(
+        ami.get("Tags", [])
+    )
+
+    value = tags.get(
+        AMI_TYPE_TAG_KEY,
+        ""
+    ).strip().lower()
+
+    return value in EXCLUDED_AMI_TAG_VALUES
+
+
+def get_backup_recovery_points(backup, snapshot_id):
+    """
+    Try to identify AWS Backup recovery points
+    associated with the snapshot.
+
+    AWS Backup recovery points may contain lifecycle/
+    backup metadata and should not be treated as ordinary
+    EBS snapshots.
+
+    Returns matching recovery-point information.
+    """
+
+    matches = []
+
+    try:
+
+        vaults = []
+
+        paginator = backup.get_paginator(
+            "list_backup_vaults"
+        )
+
+        for page in paginator.paginate():
+
+            for vault in page.get(
+                "BackupVaultList",
+                []
+            ):
+
+                vaults.append(
+                    vault["BackupVaultName"]
+                )
+
+        for vault_name in vaults:
+
+            paginator = backup.get_paginator(
+                "list_recovery_points_by_backup_vault"
+            )
+
+            for page in paginator.paginate(
+                BackupVaultName=vault_name
+            ):
+
+                for rp in page.get(
+                    "RecoveryPoints",
+                    []
+                ):
+
+                    # AWS Backup recovery points for EC2/EBS
+                    # can contain resource information.
+                    resource_arn = rp.get(
+                        "ResourceArn",
+                        ""
+                    )
+
+                    backup_vault_arn = rp.get(
+                        "BackupVaultArn",
+                        ""
+                    )
+
+                    # Store candidate information.
+                    #
+                    # The exact relationship should be verified
+                    # in your environment because AWS Backup can
+                    # represent EC2 resources at the recovery-point
+                    # level rather than as a simple snapshot ID.
+                    if snapshot_id in json.dumps(
+                        rp,
+                        default=str
+                    ):
+
+                        matches.append({
+                            "vault": vault_name,
+                            "vault_arn": backup_vault_arn,
+                            "recovery_point_arn":
+                                rp.get(
+                                    "RecoveryPointArn",
+                                    ""
+                                ),
+                            "resource_arn":
+                                resource_arn
+                        })
+
+    except ClientError as exc:
+
+        logger.warning(
+            "AWS Backup lookup failed for %s: %s",
+            snapshot_id,
+            exc
+        )
+
+    return matches
+
+
+# ============================================================
+# SNAPSHOT COLLECTION
+# ============================================================
+
+def get_snapshots(ec2):
+
+    paginator = ec2.get_paginator(
+        "describe_snapshots"
+    )
+
+    snapshots = []
+
+    for page in paginator.paginate(
+        OwnerIds=["self"]
+    ):
+
+        snapshots.extend(
+            page.get("Snapshots", [])
+        )
+
+    return snapshots
+
+
+# ============================================================
+# PROCESS ACCOUNT / REGION
+# ============================================================
+
+def process_account_region(
+    account_id,
+    account_name,
+    region
+):
+
+    logger.info(
+        "Processing account=%s region=%s",
+        account_id,
+        region
+    )
+
+    session = assume_role(
+        account_id,
+        region
+    )
+
+    ec2 = session.client("ec2")
+
+    backup = session.client("backup")
+
+    snapshots = get_snapshots(ec2)
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    cutoff = now - timedelta(
+        days=RETENTION_DAYS
+    )
+
+    rows = []
+
+    summary = {
+        "account_id": account_id,
+        "account_name": account_name,
+        "region": region,
+        "total_snapshots": len(snapshots),
+        "older_snapshots": 0,
+        "older_snapshot_gb": 0,
+        "deleted": 0,
+        "delete_failed": 0,
+        "excluded": 0
+    }
+
+    for snapshot in snapshots:
+
+        snapshot_id = snapshot[
+            "SnapshotId"
+        ]
+
+        start_time = snapshot[
+            "StartTime"
+        ]
+
+        volume_size = snapshot.get(
+            "VolumeSize",
+            0
+        )
+
+        tags = tags_to_dict(
+            snapshot.get("Tags", [])
+        )
+
+        snapshot_name = tags.get(
+            "Name",
+            ""
+        )
+
+        age_days = (
+            now - start_time
+        ).days
+
+        older_than_retention = (
+            start_time < cutoff
+        )
+
+        if older_than_retention:
+
+            summary[
+                "older_snapshots"
+            ] += 1
+
+            summary[
+                "older_snapshot_gb"
+            ] += volume_size
+
+        # ----------------------------------------------------
+        # AMI ASSOCIATION
+        # ----------------------------------------------------
+
+        amis = get_ami_info(
+            ec2,
+            snapshot_id
+        )
+
+        ami_ids = []
+        ami_names = []
+        ami_types = []
+
+        excluded_by_ami = False
+
+        for ami in amis:
+
+            ami_id = ami.get(
+                "ImageId",
+                ""
+            )
+
+            ami_tags = tags_to_dict(
+                ami.get("Tags", [])
+            )
+
+            ami_name = ami_tags.get(
+                "Name",
+                ""
+            )
+
+            ami_type = ami_tags.get(
+                AMI_TYPE_TAG_KEY,
+                ""
+            )
+
+            ami_ids.append(
+                ami_id
+            )
+
+            ami_names.append(
+                ami_name
+            )
+
+            ami_types.append(
+                ami_type
+            )
+
+            if is_excluded_ami(
+                ami
+            ):
+
+                excluded_by_ami = True
+
+        # ----------------------------------------------------
+        # AWS BACKUP
+        # ----------------------------------------------------
+
+        backup_matches = (
+            get_backup_recovery_points(
+                backup,
+                snapshot_id
+            )
+        )
+
+        backup_protected = (
+            len(backup_matches) > 0
+        )
+
+        backup_vaults = ",".join(
+            sorted(
+                {
+                    x["vault"]
+                    for x in backup_matches
+                }
+            )
+        )
+
+        recovery_points = ",".join(
+            x["recovery_point_arn"]
+            for x in backup_matches
+        )
+
+        # ----------------------------------------------------
+        # DECISION
+        # ----------------------------------------------------
+
+        exclusion_reason = ""
+
+        eligible_for_delete = False
+
+        deletion_status = "NOT_ATTEMPTED"
+
+        if snapshot.get(
+            "State"
+        ) != "completed":
+
+            exclusion_reason = (
+                "SNAPSHOT_NOT_COMPLETED"
+            )
+
+        elif excluded_by_ami:
+
+            exclusion_reason = (
+                "AMI_PRE_POST_PATCH_BACKUP"
+            )
+
+        elif backup_protected:
+
+            exclusion_reason = (
+                "AWS_BACKUP_PROTECTED"
+            )
+
+        elif not older_than_retention:
+
+            exclusion_reason = (
+                "WITHIN_RETENTION_PERIOD"
+            )
+
+        else:
+
+            eligible_for_delete = True
+            exclusion_reason = (
+                "ELIGIBLE_FOR_DELETION"
+            )
+
+        # ----------------------------------------------------
+        # DELETE
+        # ----------------------------------------------------
+
+        if (
+            eligible_for_delete
+            and not DRY_RUN
+        ):
+
+            try:
+
+                ec2.delete_snapshot(
+                    SnapshotId=snapshot_id
+                )
+
+                deletion_status = "DELETED"
+
+                summary[
+                    "deleted"
+                ] += 1
+
+            except ClientError as exc:
+
+                deletion_status = (
+                    f"DELETE_FAILED: {exc.response['Error']['Code']}"
+                )
+
+                summary[
+                    "delete_failed"
+                ] += 1
+
+        elif eligible_for_delete:
+
+            deletion_status = (
+                "DRY_RUN_WOULD_DELETE"
+            )
+
+        else:
+
+            summary[
+                "excluded"
+            ] += 1
+
+        # ----------------------------------------------------
+        # REPORT ROW
+        # ----------------------------------------------------
+
+        rows.append({
+
+            "AccountId":
+                account_id,
+
+            "AccountName":
+                account_name,
+
+            "Region":
+                region,
+
+            "SnapshotId":
+                snapshot_id,
+
+            "SnapshotName":
+                snapshot_name,
+
+            "SnapshotDescription":
+                snapshot.get(
+                    "Description",
+                    ""
+                ),
+
+            "SnapshotCreated":
+                start_time.isoformat(),
+
+            "SnapshotAgeDays":
+                age_days,
+
+            "VolumeId":
+                snapshot.get(
+                    "VolumeId",
+                    ""
+                ),
+
+            "VolumeSizeGiB":
+                volume_size,
+
+            "SnapshotStorageTier":
+                snapshot.get(
+                    "StorageTier",
+                    ""
+                ),
+
+            "SnapshotState":
+                snapshot.get(
+                    "State",
+                    ""
+                ),
+
+            "Encrypted":
+                snapshot.get(
+                    "Encrypted",
+                    False
+                ),
+
+            "KmsKeyId":
+                snapshot.get(
+                    "KmsKeyId",
+                    ""
+                ),
+
+            "AmiIds":
+                ",".join(ami_ids),
+
+            "AmiNames":
+                ",".join(ami_names),
+
+            "AmiType":
+                ",".join(ami_types),
+
+            "AwsBackupProtected":
+                "Yes"
+                if backup_protected
+                else "No",
+
+            "AwsBackupVault":
+                backup_vaults,
+
+            "RecoveryPointArn":
+                recovery_points,
+
+            "OlderThanRetention":
+                "Yes"
+                if older_than_retention
+                else "No",
+
+            "RetentionDays":
+                RETENTION_DAYS,
+
+            "EligibleForDeletion":
+                "Yes"
+                if eligible_for_delete
+                else "No",
+
+            "ExclusionReason":
+                exclusion_reason,
+
+            "DeletionStatus":
+                deletion_status,
+
+            "SnapshotTags":
+                json.dumps(
+                    tags
+                )
+        })
+
+    return rows, summary
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+CSV_COLUMNS = [
+    "AccountId",
+    "AccountName",
+    "Region",
+    "SnapshotId",
+    "SnapshotName",
+    "SnapshotDescription",
+    "SnapshotCreated",
+    "SnapshotAgeDays",
+    "VolumeId",
+    "VolumeSizeGiB",
+    "SnapshotStorageTier",
+    "SnapshotState",
+    "Encrypted",
+    "KmsKeyId",
+    "AmiIds",
+    "AmiNames",
+    "AmiType",
+    "AwsBackupProtected",
+    "AwsBackupVault",
+    "RecoveryPointArn",
+    "OlderThanRetention",
+    "RetentionDays",
+    "EligibleForDeletion",
+    "ExclusionReason",
+    "DeletionStatus",
+    "SnapshotTags"
+]
+
+
+def create_csv(rows):
+
+    buffer = io.StringIO()
+
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=CSV_COLUMNS
+    )
+
+    writer.writeheader()
+
+    for row in rows:
+
+        writer.writerow(row)
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# S3
+# ============================================================
+
+def upload_report(csv_data):
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y%m%d-%H%M%S"
+    )
+
+    mode = (
+        "dry-run"
+        if DRY_RUN
+        else "delete"
+    )
+
+    key = (
+        f"{REPORT_PREFIX}"
+        f"snapshot-report-"
+        f"{RETENTION_DAYS}days-"
+        f"{mode}-"
+        f"{timestamp}.csv"
+    )
+
+    s3.put_object(
+        Bucket=REPORT_BUCKET,
+        Key=key,
+        Body=csv_data.encode("utf-8"),
+        ContentType="text/csv",
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=KMS_KEY_ID
+    )
+
+    presigned_url = (
+        s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": REPORT_BUCKET,
+                "Key": key
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRY
+        )
+    )
+
+    return key, presigned_url
+
+
+# ============================================================
+# SNS
+# ============================================================
+
+def send_sns(summary_list, url):
+
+    total_snapshots = sum(
+        x["total_snapshots"]
+        for x in summary_list
+    )
+
+    total_old = sum(
+        x["older_snapshots"]
+        for x in summary_list
+    )
+
+    total_gb = sum(
+        x["older_snapshot_gb"]
+        for x in summary_list
+    )
+
+    total_deleted = sum(
+        x["deleted"]
+        for x in summary_list
+    )
+
+    total_failed = sum(
+        x["delete_failed"]
+        for x in summary_list
+    )
+
+    mode = (
+        "DRY RUN"
+        if DRY_RUN
+        else "DELETE MODE"
+    )
+
+    lines = []
+
+    lines.append(
+        "EBS Snapshot Cleanup Report"
+    )
+
+    lines.append(
+        "================================"
+    )
+
+    lines.append(
+        f"Mode: {mode}"
+    )
+
+    lines.append(
+        f"Retention: {RETENTION_DAYS} days"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "Overall Summary"
+    )
+
+    lines.append(
+        "---------------"
+    )
+
+    lines.append(
+        f"Total snapshots: {total_snapshots}"
+    )
+
+    lines.append(
+        f"Older than {RETENTION_DAYS} days: "
+        f"{total_old}"
+    )
+
+    lines.append(
+        f"Older snapshot volume size: "
+        f"{total_gb:,} GiB"
+    )
+
+    lines.append(
+        f"Deleted: {total_deleted}"
+    )
+
+    lines.append(
+        f"Delete failures: {total_failed}"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "Account Summary"
+    )
+
+    lines.append(
+        "---------------"
+    )
+
+    for item in summary_list:
+
+        lines.append(
+            f"Account: "
+            f"{item['account_name']} "
+            f"({item['account_id']})"
+        )
+
+        lines.append(
+            f"  Region: {item['region']}"
+        )
+
+        lines.append(
+            f"  Total snapshots: "
+            f"{item['total_snapshots']}"
+        )
+
+        lines.append(
+            f"  Older than "
+            f"{RETENTION_DAYS} days: "
+            f"{item['older_snapshots']}"
+        )
+
+        lines.append(
+            f"  Older snapshot size: "
+            f"{item['older_snapshot_gb']:,} GiB"
+        )
+
+        lines.append(
+            f"  Excluded: "
+            f"{item['excluded']}"
+        )
+
+        lines.append(
+            f"  Deleted: "
+            f"{item['deleted']}"
+        )
+
+        lines.append(
+            f"  Delete failures: "
+            f"{item['delete_failed']}"
+        )
+
+        lines.append("")
+
+    lines.append(
+        "CSV Download:"
+    )
+
+    lines.append(url)
+
+    message = "\n".join(lines)
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=(
+            f"EBS Snapshot Report - "
+            f"{mode} - "
+            f"{RETENTION_DAYS} Days"
+        ),
+        Message=message
+    )
+
+
+# ============================================================
+# LAMBDA HANDLER
+# ============================================================
+
+def lambda_handler(event, context):
+
+    logger.info(
+        "Starting snapshot cleanup. "
+        "DRY_RUN=%s RETENTION_DAYS=%s",
+        DRY_RUN,
+        RETENTION_DAYS
+    )
+
+    if not SOURCE_ACCOUNTS:
+
+        raise ValueError(
+            "SOURCE_ACCOUNTS environment variable is empty"
+        )
+
+    all_rows = []
+
+    summaries = []
+
+    # --------------------------------------------------------
+    # PROCESS ACCOUNTS
+    # --------------------------------------------------------
+
+    for account_id in SOURCE_ACCOUNTS:
+
+        # Get account name.
+        #
+        # In a centralized deployment you can instead
+        # populate account names from AWS Organizations.
+        account_name = account_id
+
+        for region in REGIONS:
+
+            try:
+
+                rows, summary = (
+                    process_account_region(
+                        account_id,
+                        account_name,
+                        region
+                    )
+                )
+
+                all_rows.extend(rows)
+
+                summaries.append(summary)
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Failed processing "
+                    "account=%s region=%s",
+                    account_id,
+                    region
+                )
+
+                summaries.append({
+                    "account_id":
+                        account_id,
+
+                    "account_name":
+                        account_name,
+
+                    "region":
+                        region,
+
+                    "total_snapshots":
+                        0,
+
+                    "older_snapshots":
+                        0,
+
+                    "older_snapshot_gb":
+                        0,
+
+                    "deleted":
+                        0,
+
+                    "delete_failed":
+                        0,
+
+                    "excluded":
+                        0
+                })
+
+    # --------------------------------------------------------
+    # CREATE CSV
+    # --------------------------------------------------------
+
+    csv_data = create_csv(
+        all_rows
+    )
+
+    # --------------------------------------------------------
+    # UPLOAD TO S3
+    # --------------------------------------------------------
+
+    report_key, download_url = (
+        upload_report(csv_data)
+    )
+
+    # --------------------------------------------------------
+    # SNS
+    # --------------------------------------------------------
+
+    send_sns(
+        summaries,
+        download_url
+    )
+
+    # --------------------------------------------------------
+    # LAMBDA RESPONSE
+    # --------------------------------------------------------
+
+    return {
+
+        "statusCode": 200,
+
+        "dryRun": DRY_RUN,
+
+        "retentionDays":
+            RETENTION_DAYS,
+
+        "reportBucket":
+            REPORT_BUCKET,
+
+        "reportKey":
+            report_key,
+
+        "rows":
+            len(all_rows),
+
+        "downloadUrl":
+            download_url
+    }
