@@ -1,0 +1,991 @@
+import boto3
+import csv
+import io
+import os
+import json
+import logging
+from datetime import datetime, timezone, timedelta
+
+from botocore.exceptions import ClientError
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+#
+# IAM permissions this function needs:
+#
+#   Lambda execution role (runs in the management / audit account):
+#     - sts:AssumeRole                 -> arn:aws:iam::<SOURCE_ACCOUNTS>:role/<ROLE_NAME>
+#     - organizations:DescribeAccount  -> optional, only used to resolve friendly
+#                                          account names in the report; falls back
+#                                          to the raw account id if denied/absent
+#     - s3:PutObject, s3:GetObject     -> REPORT_BUCKET / REPORT_PREFIX*
+#     - kms:GenerateDataKey, kms:Decrypt -> KMS_KEY_ID
+#     - sns:Publish                    -> SNS_TOPIC_ARN
+#
+#   ROLE_NAME, assumed inside every account in SOURCE_ACCOUNTS:
+#     - ec2:DescribeSnapshots
+#     - ec2:DescribeImages
+#     - ec2:DeleteSnapshot
+#     - ec2:DeregisterImage   (only needed if DEREGISTER_ASSOCIATED_AMIS=true)
+#
+#   NOTE: this version no longer calls any `backup:*` API (see the
+#   AWS-Backup-detection note below), so backup:List*/Describe* permissions
+#   are no longer required and can be removed from ROLE_NAME if they were
+#   only added for this function.
+#
+# ============================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "90"))
+
+SOURCE_ACCOUNTS = [
+    x.strip()
+    for x in os.getenv("SOURCE_ACCOUNTS", "").split(",")
+    if x.strip()
+]
+
+# --------------------------------------------------------------
+# Region is intentionally hard-restricted to ap-southeast-2.
+#
+# This is a destructive, multi-account function, so region scope is
+# fixed in code rather than left as an open-ended env var: an env var
+# can still be set (e.g. to make the intent explicit in your IaC), but
+# anything other than ap-southeast-2 fails fast at cold start instead
+# of quietly running somewhere unintended.
+# --------------------------------------------------------------
+
+REGION = os.getenv("REGION", "ap-southeast-2")
+
+if REGION != "ap-southeast-2":
+    raise ValueError(
+        f"This function is restricted to ap-southeast-2 only. "
+        f"REGION={REGION!r} is not permitted."
+    )
+
+ROLE_NAME = os.getenv(
+    "ROLE_NAME",
+    "SnapshotCleanupRole"
+)
+
+REPORT_BUCKET = os.environ["REPORT_BUCKET"]
+
+REPORT_PREFIX = os.getenv(
+    "REPORT_PREFIX",
+    "ebs-snapshot-cleanup/"
+)
+
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+PRESIGNED_URL_EXPIRY = int(
+    os.getenv(
+        "PRESIGNED_URL_EXPIRY",
+        "86400"
+    )
+)
+
+AMI_TYPE_TAG_KEY = os.getenv(
+    "AMI_TYPE_TAG_KEY",
+    "AMI Type"
+)
+
+EXCLUDED_AMI_TAG_VALUES = {
+    x.strip().lower()
+    for x in os.getenv(
+        "EXCLUDED_AMI_TAG_VALUES",
+        "Pre Patch backup,Post Patch backup"
+    ).split(",")
+}
+
+# When an eligible-for-deletion snapshot backs an AMI that is NOT one of
+# the excluded AMI types above (i.e. an "active" AMI), AWS will refuse to
+# delete that snapshot while the AMI stays registered. Setting this to
+# true has the function deregister that AMI first -- but only when every
+# other snapshot backing the same AMI is ALSO eligible for deletion (see
+# AMI_HAS_ACTIVE_DEPENDENT_SNAPSHOT below); otherwise the snapshot is left
+# alone so a still-needed AMI is never torn apart mid-life.
+DEREGISTER_ASSOCIATED_AMIS = (
+    os.getenv("DEREGISTER_ASSOCIATED_AMIS", "true").lower() == "true"
+)
+
+
+# ============================================================
+# AWS CLIENTS
+# ============================================================
+
+sts = boto3.client("sts")
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+
+# Used only to resolve friendly account names. This MUST be a client
+# built from the Lambda's own (management-account) credentials -- calling
+# organizations:DescribeAccount from inside an assumed member-account
+# session will fail for anyone but the org's management/delegated-admin
+# account, which is why the original get_account_name() never worked.
+organizations = boto3.client("organizations")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def assume_role(account_id, region):
+    """
+    Assume the snapshot cleanup role in target account.
+    """
+
+    role_arn = (
+        f"arn:aws:iam::{account_id}:role/{ROLE_NAME}"
+    )
+
+    response = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName="SnapshotCleanupLambda"
+    )
+
+    credentials = response["Credentials"]
+
+    return boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        region_name=region
+    )
+
+
+def get_account_name(account_id):
+    """
+    Resolve a friendly account name via AWS Organizations, using the
+    Lambda's own credentials (management / delegated-admin account).
+
+    Falls back to the raw account id if Organizations access isn't
+    available -- this is expected/fine if the function isn't deployed
+    in the management account.
+    """
+
+    try:
+        response = organizations.describe_account(
+            AccountId=account_id
+        )
+
+        return response["Account"]["Name"]
+
+    except Exception as exc:
+        logger.info(
+            "Could not resolve account name for %s, "
+            "falling back to account id: %s",
+            account_id,
+            exc
+        )
+        return account_id
+
+
+def tags_to_dict(tags):
+    return {
+        tag["Key"]: tag["Value"]
+        for tag in (tags or [])
+    }
+
+
+def get_backup_tags(tags):
+    """
+    AWS Backup tags every snapshot it creates with one or more
+    "aws:backup:*" keys (e.g. "aws:backup:source-resource"). That tag,
+    present directly on the EBS snapshot itself, is the reliable way to
+    tell a snapshot is AWS-Backup-managed.
+
+    The previous approach (checking whether the snapshot id string
+    happened to appear inside the JSON of every recovery point in every
+    backup vault) does not work: AWS Backup's
+    list_recovery_points_by_backup_vault / list_recovery_points_by_resource
+    responses for EBS resources reference the recovery point ARN and the
+    source volume ARN, not the underlying snapshot id, so that substring
+    check almost never matched -- meaning AWS-Backup-protected snapshots
+    were not actually being protected. This also removes the need to call
+    the AWS Backup API at all (no more per-snapshot vault/recovery-point
+    listing), which was the other major cost/throttling problem.
+    """
+
+    return {
+        key: value
+        for key, value in tags.items()
+        if key.lower().startswith("aws:backup:")
+    }
+
+
+def is_excluded_ami(ami):
+    """
+    Exclude AMIs with:
+
+    AMI Type = Pre Patch backup
+    AMI Type = Post Patch backup
+    """
+
+    tags = tags_to_dict(
+        ami.get("Tags", [])
+    )
+
+    value = tags.get(
+        AMI_TYPE_TAG_KEY,
+        ""
+    ).strip().lower()
+
+    return value in EXCLUDED_AMI_TAG_VALUES
+
+
+def build_ami_index(ec2):
+    """
+    Fetch every self-owned AMI ONCE per account/region and index it by
+    the snapshot id(s) it's backed by.
+
+    The original code called describe_images (paginated, over every AMI
+    in the account) separately for EVERY snapshot, inside the per-snapshot
+    loop -- for an account with N snapshots that's N full AMI listings
+    instead of 1. This builds the same information a single time and
+    reuses it for every snapshot.
+    """
+
+    snapshot_to_amis = {}
+    ami_by_id = {}
+
+    paginator = ec2.get_paginator("describe_images")
+
+    for page in paginator.paginate(Owners=["self"]):
+
+        for image in page.get("Images", []):
+
+            ami_by_id[image.get("ImageId", "")] = image
+
+            for mapping in image.get("BlockDeviceMappings", []):
+
+                ebs = mapping.get("Ebs", {})
+                snap_id = ebs.get("SnapshotId")
+
+                if snap_id:
+                    snapshot_to_amis.setdefault(snap_id, []).append(image)
+
+    return snapshot_to_amis, ami_by_id
+
+
+def ami_backing_snapshot_ids(ami):
+    return [
+        mapping["Ebs"]["SnapshotId"]
+        for mapping in ami.get("BlockDeviceMappings", [])
+        if mapping.get("Ebs", {}).get("SnapshotId")
+    ]
+
+
+# ============================================================
+# SNAPSHOT COLLECTION
+# ============================================================
+
+def get_snapshots(ec2):
+
+    paginator = ec2.get_paginator(
+        "describe_snapshots"
+    )
+
+    snapshots = []
+
+    for page in paginator.paginate(
+        OwnerIds=["self"]
+    ):
+
+        snapshots.extend(
+            page.get("Snapshots", [])
+        )
+
+    return snapshots
+
+
+# ============================================================
+# SUMMARY SCAFFOLDING
+# ============================================================
+
+SUMMARY_COUNTER_KEYS = [
+    "total_snapshots",
+    "total_amis",
+    "older_snapshots",
+    "older_snapshot_gb",
+    "excluded_not_completed",
+    "excluded_ami_type",
+    "excluded_backup_tag",
+    "excluded_within_retention",
+    "excluded_ami_dependency",
+    "excluded_total",
+    "eligible_snapshots",
+    "eligible_amis",
+    "snapshots_deleted",
+    "snapshots_delete_failed",
+    "amis_deregistered",
+    "amis_deregister_failed",
+]
+
+
+def empty_summary(account_id, account_name, region, run_id, status="OK", error=""):
+
+    summary = {
+        "run_id": run_id,
+        "account_id": account_id,
+        "account_name": account_name,
+        "region": region,
+        "status": status,
+        "error": error,
+    }
+
+    for key in SUMMARY_COUNTER_KEYS:
+        summary[key] = 0
+
+    return summary
+
+
+# ============================================================
+# PROCESS ACCOUNT / REGION
+# ============================================================
+
+def process_account_region(account_id, account_name, run_id):
+
+    logger.info(
+        "Processing account=%s region=%s",
+        account_id,
+        REGION
+    )
+
+    session = assume_role(
+        account_id,
+        REGION
+    )
+
+    ec2 = session.client("ec2")
+
+    snapshots = get_snapshots(ec2)
+
+    snapshot_to_amis, ami_by_id = build_ami_index(ec2)
+
+    now = datetime.now(timezone.utc)
+    processed_at = now.isoformat()
+
+    cutoff = now - timedelta(days=RETENTION_DAYS)
+
+    summary = empty_summary(account_id, account_name, REGION, run_id)
+    summary["total_snapshots"] = len(snapshots)
+    summary["total_amis"] = len(ami_by_id)
+
+    # ----------------------------------------------------------
+    # PASS 1: base facts + base eligibility for every snapshot,
+    # independent of any AMI-dependency safety check.
+    # ----------------------------------------------------------
+
+    base_info = {}
+
+    for snapshot in snapshots:
+
+        snapshot_id = snapshot["SnapshotId"]
+        start_time = snapshot["StartTime"]
+        tags = tags_to_dict(snapshot.get("Tags", []))
+
+        amis = snapshot_to_amis.get(snapshot_id, [])
+        excluded_by_ami = any(is_excluded_ami(a) for a in amis)
+
+        backup_tags = get_backup_tags(tags)
+        backup_protected = bool(backup_tags)
+
+        state_ok = snapshot.get("State") == "completed"
+        older_than_retention = start_time < cutoff
+
+        base_eligible = (
+            state_ok
+            and not excluded_by_ami
+            and not backup_protected
+            and older_than_retention
+        )
+
+        if older_than_retention:
+            summary["older_snapshots"] += 1
+            summary["older_snapshot_gb"] += snapshot.get("VolumeSize", 0)
+
+        base_info[snapshot_id] = {
+            "snapshot": snapshot,
+            "tags": tags,
+            "amis": amis,
+            "excluded_by_ami": excluded_by_ami,
+            "backup_tags": backup_tags,
+            "backup_protected": backup_protected,
+            "state_ok": state_ok,
+            "older_than_retention": older_than_retention,
+            "base_eligible": base_eligible,
+        }
+
+    # ----------------------------------------------------------
+    # PASS 2: AMI-dependency safety check.
+    #
+    # A base-eligible snapshot that backs an active (non-excluded) AMI is
+    # only allowed through if EVERY snapshot backing that same AMI is
+    # ALSO base-eligible -- i.e. the whole AMI is stale, not just one of
+    # several volumes it spans. Otherwise deleting this snapshot would
+    # either fail outright (AWS blocks deleting a snapshot still in use
+    # by a registered AMI) or, if we deregistered the AMI to get around
+    # that, would silently break a still-needed AMI. Snapshots that fail
+    # this check keep their snapshot and are flagged for audit instead of
+    # being deleted.
+    # ----------------------------------------------------------
+
+    final_eligible_snapshots = set()
+    ami_dependency_blocked = set()
+    amis_to_deregister = {}
+
+    for snapshot_id, info in base_info.items():
+
+        if not info["base_eligible"]:
+            continue
+
+        active_amis = [a for a in info["amis"] if not is_excluded_ami(a)]
+
+        blocked = False
+
+        for ami in active_amis:
+
+            for backing_id in ami_backing_snapshot_ids(ami):
+
+                dependent = base_info.get(backing_id)
+
+                if dependent is None or not dependent["base_eligible"]:
+                    blocked = True
+
+        if blocked:
+            ami_dependency_blocked.add(snapshot_id)
+            continue
+
+        final_eligible_snapshots.add(snapshot_id)
+
+        for ami in active_amis:
+            amis_to_deregister[ami.get("ImageId", "")] = ami
+
+    summary["eligible_snapshots"] = len(final_eligible_snapshots)
+    summary["eligible_amis"] = len(amis_to_deregister)
+
+    # ----------------------------------------------------------
+    # PASS 3: act on AMIs first (deregister), then snapshots.
+    # ----------------------------------------------------------
+
+    ami_action_status = {}
+
+    for ami_id in amis_to_deregister:
+
+        if not DEREGISTER_ASSOCIATED_AMIS:
+            ami_action_status[ami_id] = "SKIPPED_DEREGISTER_DISABLED"
+            continue
+
+        if DRY_RUN:
+            ami_action_status[ami_id] = "DRY_RUN_WOULD_DEREGISTER"
+            continue
+
+        try:
+            ec2.deregister_image(ImageId=ami_id)
+            ami_action_status[ami_id] = "DEREGISTERED"
+            summary["amis_deregistered"] += 1
+
+        except ClientError as exc:
+            ami_action_status[ami_id] = (
+                f"DEREGISTER_FAILED: {exc.response['Error']['Code']}"
+            )
+            summary["amis_deregister_failed"] += 1
+
+    # ----------------------------------------------------------
+    # PASS 4: decide + record the final row for every snapshot,
+    # deleting the eligible ones.
+    # ----------------------------------------------------------
+
+    rows = []
+
+    for snapshot_id, info in base_info.items():
+
+        snapshot = info["snapshot"]
+        start_time = snapshot["StartTime"]
+        volume_size = snapshot.get("VolumeSize", 0)
+        tags = info["tags"]
+        snapshot_name = tags.get("Name", "")
+        age_days = (now - start_time).days
+
+        amis = info["amis"]
+        ami_ids = [a.get("ImageId", "") for a in amis]
+        ami_names = [
+            tags_to_dict(a.get("Tags", [])).get("Name", "") for a in amis
+        ]
+        ami_types = [
+            tags_to_dict(a.get("Tags", [])).get(AMI_TYPE_TAG_KEY, "")
+            for a in amis
+        ]
+
+        eligible_for_delete = False
+
+        if not info["state_ok"]:
+            exclusion_reason = "SNAPSHOT_NOT_COMPLETED"
+            summary["excluded_not_completed"] += 1
+
+        elif info["excluded_by_ami"]:
+            exclusion_reason = "AMI_PRE_POST_PATCH_BACKUP"
+            summary["excluded_ami_type"] += 1
+
+        elif info["backup_protected"]:
+            exclusion_reason = "AWS_BACKUP_PROTECTED"
+            summary["excluded_backup_tag"] += 1
+
+        elif not info["older_than_retention"]:
+            exclusion_reason = "WITHIN_RETENTION_PERIOD"
+            summary["excluded_within_retention"] += 1
+
+        elif snapshot_id in ami_dependency_blocked:
+            exclusion_reason = "AMI_HAS_ACTIVE_DEPENDENT_SNAPSHOT"
+            summary["excluded_ami_dependency"] += 1
+
+        else:
+            eligible_for_delete = True
+            exclusion_reason = "ELIGIBLE_FOR_DELETION"
+
+        if not eligible_for_delete:
+            summary["excluded_total"] += 1
+
+        deletion_status = "NOT_ATTEMPTED"
+
+        if eligible_for_delete:
+
+            if not DRY_RUN:
+
+                try:
+                    ec2.delete_snapshot(SnapshotId=snapshot_id)
+                    deletion_status = "DELETED"
+                    summary["snapshots_deleted"] += 1
+
+                except ClientError as exc:
+                    deletion_status = (
+                        f"DELETE_FAILED: {exc.response['Error']['Code']}"
+                    )
+                    summary["snapshots_delete_failed"] += 1
+
+            else:
+                deletion_status = "DRY_RUN_WOULD_DELETE"
+
+        associated_ami_action = "; ".join(
+            f"{ami_id}:{ami_action_status.get(ami_id, 'N/A_PROTECTED_OR_NOT_ATTEMPTED')}"
+            for ami_id in ami_ids
+        )
+
+        rows.append({
+
+            "RunId": run_id,
+            "ProcessedAtUtc": processed_at,
+
+            "AccountId": account_id,
+            "AccountName": account_name,
+            "Region": REGION,
+
+            "SnapshotId": snapshot_id,
+            "SnapshotName": snapshot_name,
+            "SnapshotDescription": snapshot.get("Description", ""),
+            "SnapshotCreated": start_time.isoformat(),
+            "SnapshotAgeDays": age_days,
+
+            "VolumeId": snapshot.get("VolumeId", ""),
+            "VolumeSizeGiB": volume_size,
+            "SnapshotStorageTier": snapshot.get("StorageTier", ""),
+            "SnapshotState": snapshot.get("State", ""),
+            "Encrypted": snapshot.get("Encrypted", False),
+            "KmsKeyId": snapshot.get("KmsKeyId", ""),
+
+            "AmiIds": ",".join(ami_ids),
+            "AmiNames": ",".join(ami_names),
+            "AmiType": ",".join(ami_types),
+
+            "AwsBackupProtected": "Yes" if info["backup_protected"] else "No",
+            "AwsBackupTagEvidence": json.dumps(info["backup_tags"]),
+
+            "OlderThanRetention": "Yes" if info["older_than_retention"] else "No",
+            "RetentionDays": RETENTION_DAYS,
+
+            "EligibleForDeletion": "Yes" if eligible_for_delete else "No",
+            "ExclusionReason": exclusion_reason,
+            "DeletionStatus": deletion_status,
+            "AssociatedAmiAction": associated_ami_action,
+
+            "SnapshotTags": json.dumps(tags),
+        })
+
+    return rows, summary
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+CSV_COLUMNS = [
+    "RunId",
+    "ProcessedAtUtc",
+    "AccountId",
+    "AccountName",
+    "Region",
+    "SnapshotId",
+    "SnapshotName",
+    "SnapshotDescription",
+    "SnapshotCreated",
+    "SnapshotAgeDays",
+    "VolumeId",
+    "VolumeSizeGiB",
+    "SnapshotStorageTier",
+    "SnapshotState",
+    "Encrypted",
+    "KmsKeyId",
+    "AmiIds",
+    "AmiNames",
+    "AmiType",
+    "AwsBackupProtected",
+    "AwsBackupTagEvidence",
+    "OlderThanRetention",
+    "RetentionDays",
+    "EligibleForDeletion",
+    "ExclusionReason",
+    "DeletionStatus",
+    "AssociatedAmiAction",
+    "SnapshotTags",
+]
+
+
+def create_csv(rows):
+
+    buffer = io.StringIO()
+
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=CSV_COLUMNS
+    )
+
+    writer.writeheader()
+
+    for row in rows:
+
+        writer.writerow(row)
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# S3
+# ============================================================
+
+def upload_report(csv_data, run_id):
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y%m%d-%H%M%S"
+    )
+
+    mode = (
+        "dry-run"
+        if DRY_RUN
+        else "delete"
+    )
+
+    key = (
+        f"{REPORT_PREFIX}"
+        f"snapshot-report-"
+        f"{RETENTION_DAYS}days-"
+        f"{mode}-"
+        f"{timestamp}-"
+        f"{run_id}.csv"
+    )
+
+    s3.put_object(
+        Bucket=REPORT_BUCKET,
+        Key=key,
+        Body=csv_data.encode("utf-8"),
+        ContentType="text/csv",
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=KMS_KEY_ID
+    )
+
+    # NOTE (audit caveat, not fixed automatically): if this Lambda's own
+    # execution role credentials are temporary (the normal case), a
+    # presigned URL signed with them stops working once those credentials
+    # expire -- which can happen well before PRESIGNED_URL_EXPIRY elapses.
+    # Treat PRESIGNED_URL_EXPIRY as an upper bound, not a guarantee.
+    presigned_url = (
+        s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": REPORT_BUCKET,
+                "Key": key
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRY
+        )
+    )
+
+    return key, presigned_url
+
+
+# ============================================================
+# SNS
+# ============================================================
+
+def send_sns(summary_list, url, run_id):
+
+    ok_summaries = [s for s in summary_list if s["status"] == "OK"]
+    failed_summaries = [s for s in summary_list if s["status"] != "OK"]
+
+    def total(key):
+        return sum(x[key] for x in ok_summaries)
+
+    total_snapshots = total("total_snapshots")
+    total_amis = total("total_amis")
+    total_old = total("older_snapshots")
+    total_gb = total("older_snapshot_gb")
+
+    total_eligible_snapshots = total("eligible_snapshots")
+    total_eligible_amis = total("eligible_amis")
+
+    total_deleted = total("snapshots_deleted")
+    total_delete_failed = total("snapshots_delete_failed")
+    total_deregistered = total("amis_deregistered")
+    total_deregister_failed = total("amis_deregister_failed")
+
+    mode = (
+        "DRY RUN"
+        if DRY_RUN
+        else "DELETE MODE"
+    )
+
+    lines = []
+
+    lines.append("EBS Snapshot Cleanup Report")
+    lines.append("================================")
+    lines.append(f"RunId: {run_id}")
+    lines.append(f"Mode: {mode}")
+    lines.append(f"Region: ap-southeast-2")
+    lines.append(f"Retention: {RETENTION_DAYS} days")
+    lines.append(f"Accounts processed OK: {len(ok_summaries)}")
+    lines.append(f"Accounts FAILED: {len(failed_summaries)}")
+    lines.append("")
+
+    if failed_summaries:
+        lines.append("*** ACCOUNT PROCESSING FAILURES ***")
+        lines.append("-----------------------------------")
+        for item in failed_summaries:
+            lines.append(
+                f"Account {item['account_id']} ({item['region']}): "
+                f"{item['error']}"
+            )
+        lines.append("")
+
+    lines.append("Overall Summary")
+    lines.append("---------------")
+    lines.append(f"Total snapshots scanned: {total_snapshots}")
+    lines.append(f"Total AMIs scanned: {total_amis}")
+    lines.append(f"Older than {RETENTION_DAYS} days: {total_old}")
+    lines.append(f"Older snapshot volume size: {total_gb:,} GiB")
+    lines.append("")
+
+    if DRY_RUN:
+        lines.append(
+            f"If DRY_RUN were false, this run would DELETE: "
+            f"{total_eligible_snapshots} snapshot(s) and "
+            f"DEREGISTER: {total_eligible_amis} AMI(s)."
+        )
+    else:
+        lines.append(
+            f"Eligible for deletion this run: "
+            f"{total_eligible_snapshots} snapshot(s), "
+            f"{total_eligible_amis} AMI(s)."
+        )
+        lines.append(f"Snapshots deleted: {total_deleted}")
+        lines.append(f"Snapshot delete failures: {total_delete_failed}")
+        lines.append(f"AMIs deregistered: {total_deregistered}")
+        lines.append(f"AMI deregister failures: {total_deregister_failed}")
+
+    lines.append("")
+    lines.append("Account Summary")
+    lines.append("---------------")
+
+    for item in summary_list:
+
+        lines.append(
+            f"Account: {item['account_name']} ({item['account_id']}) "
+            f"[{item['status']}]"
+        )
+
+        if item["status"] != "OK":
+            lines.append(f"  Error: {item['error']}")
+            lines.append("")
+            continue
+
+        lines.append(f"  Region: {item['region']}")
+        lines.append(f"  Total snapshots: {item['total_snapshots']}")
+        lines.append(f"  Total AMIs: {item['total_amis']}")
+        lines.append(
+            f"  Older than {RETENTION_DAYS} days: {item['older_snapshots']}"
+        )
+        lines.append(
+            f"  Older snapshot size: {item['older_snapshot_gb']:,} GiB"
+        )
+        lines.append("  Excluded breakdown:")
+        lines.append(
+            f"    Not completed: {item['excluded_not_completed']}"
+        )
+        lines.append(
+            f"    AMI pre/post patch: {item['excluded_ami_type']}"
+        )
+        lines.append(
+            f"    AWS Backup protected: {item['excluded_backup_tag']}"
+        )
+        lines.append(
+            f"    Within retention: {item['excluded_within_retention']}"
+        )
+        lines.append(
+            f"    AMI has active dependent snapshot: "
+            f"{item['excluded_ami_dependency']}"
+        )
+        lines.append(
+            f"  Eligible (would delete/deregister): "
+            f"{item['eligible_snapshots']} snapshot(s), "
+            f"{item['eligible_amis']} AMI(s)"
+        )
+        lines.append(f"  Snapshots deleted: {item['snapshots_deleted']}")
+        lines.append(
+            f"  Snapshot delete failures: {item['snapshots_delete_failed']}"
+        )
+        lines.append(f"  AMIs deregistered: {item['amis_deregistered']}")
+        lines.append(
+            f"  AMI deregister failures: {item['amis_deregister_failed']}"
+        )
+        lines.append("")
+
+    lines.append("CSV Download:")
+    lines.append(url)
+
+    message = "\n".join(lines)
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=(
+            f"EBS Snapshot Report - {mode} - "
+            f"{RETENTION_DAYS} Days - ap-southeast-2"
+        ),
+        Message=message
+    )
+
+
+# ============================================================
+# LAMBDA HANDLER
+# ============================================================
+
+def lambda_handler(event, context):
+
+    run_id = getattr(context, "aws_request_id", "local-test")
+
+    logger.info(
+        "Starting snapshot cleanup. run_id=%s DRY_RUN=%s "
+        "RETENTION_DAYS=%s REGION=%s DEREGISTER_ASSOCIATED_AMIS=%s",
+        run_id,
+        DRY_RUN,
+        RETENTION_DAYS,
+        REGION,
+        DEREGISTER_ASSOCIATED_AMIS,
+    )
+
+    if not SOURCE_ACCOUNTS:
+
+        raise ValueError(
+            "SOURCE_ACCOUNTS environment variable is empty"
+        )
+
+    all_rows = []
+    summaries = []
+
+    # --------------------------------------------------------
+    # PROCESS ACCOUNTS (ap-southeast-2 only)
+    # --------------------------------------------------------
+
+    for account_id in SOURCE_ACCOUNTS:
+
+        account_name = get_account_name(account_id)
+
+        try:
+
+            rows, summary = process_account_region(
+                account_id,
+                account_name,
+                run_id,
+            )
+
+            all_rows.extend(rows)
+            summaries.append(summary)
+
+        except Exception as exc:
+
+            logger.exception(
+                "Failed processing account=%s region=%s",
+                account_id,
+                REGION
+            )
+
+            summaries.append(
+                empty_summary(
+                    account_id,
+                    account_name,
+                    REGION,
+                    run_id,
+                    status="ERROR",
+                    error=str(exc),
+                )
+            )
+
+    # --------------------------------------------------------
+    # CREATE CSV
+    # --------------------------------------------------------
+
+    csv_data = create_csv(all_rows)
+
+    # --------------------------------------------------------
+    # UPLOAD TO S3
+    # --------------------------------------------------------
+
+    report_key, download_url = upload_report(csv_data, run_id)
+
+    # --------------------------------------------------------
+    # SNS
+    # --------------------------------------------------------
+
+    send_sns(summaries, download_url, run_id)
+
+    # --------------------------------------------------------
+    # LAMBDA RESPONSE
+    # --------------------------------------------------------
+
+    accounts_failed = [s for s in summaries if s["status"] != "OK"]
+
+    return {
+
+        "statusCode": 200,
+        "runId": run_id,
+        "dryRun": DRY_RUN,
+        "region": REGION,
+        "retentionDays": RETENTION_DAYS,
+        "reportBucket": REPORT_BUCKET,
+        "reportKey": report_key,
+        "rows": len(all_rows),
+        "accountsProcessed": len(summaries),
+        "accountsFailed": len(accounts_failed),
+        "eligibleSnapshots": sum(
+            s["eligible_snapshots"] for s in summaries if s["status"] == "OK"
+        ),
+        "eligibleAmis": sum(
+            s["eligible_amis"] for s in summaries if s["status"] == "OK"
+        ),
+        "downloadUrl": download_url,
+    }
