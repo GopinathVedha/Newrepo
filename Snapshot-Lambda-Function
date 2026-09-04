@@ -679,13 +679,7 @@ def create_csv(rows):
 # S3
 # ============================================================
 
-def upload_report(csv_data, run_id):
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y%m%d-%H%M%S"
-    )
+def upload_report(csv_data, run_id, label, timestamp):
 
     mode = (
         "dry-run"
@@ -696,6 +690,7 @@ def upload_report(csv_data, run_id):
     key = (
         f"{REPORT_PREFIX}"
         f"snapshot-report-"
+        f"{label}-"
         f"{RETENTION_DAYS}days-"
         f"{mode}-"
         f"{timestamp}-"
@@ -734,7 +729,7 @@ def upload_report(csv_data, run_id):
 # SNS
 # ============================================================
 
-def send_sns(summary_list, url, run_id):
+def send_sns(summary_list, reports, run_id):
 
     ok_summaries = [s for s in summary_list if s["status"] == "OK"]
     failed_summaries = [s for s in summary_list if s["status"] != "OK"]
@@ -865,8 +860,17 @@ def send_sns(summary_list, url, run_id):
         )
         lines.append("")
 
-    lines.append("CSV Download:")
-    lines.append(url)
+    lines.append("CSV Downloads:")
+    lines.append(
+        f"  Snapshots associated with an AMI "
+        f"({reports['with_ami']['count']} rows):"
+    )
+    lines.append(f"    {reports['with_ami']['url']}")
+    lines.append(
+        f"  Orphaned snapshots, no AMI association "
+        f"({reports['orphaned']['count']} rows):"
+    )
+    lines.append(f"    {reports['orphaned']['url']}")
 
     message = "\n".join(lines)
 
@@ -946,22 +950,50 @@ def lambda_handler(event, context):
             )
 
     # --------------------------------------------------------
-    # CREATE CSV
+    # SPLIT ROWS: snapshots associated with an AMI vs orphaned
+    # (a snapshot backs zero AMIs -> "AmiIds" is empty).
+    #
+    # This is a straight split of the same per-snapshot schema, not a
+    # different report: a snapshot backed by one AMI still shows that one
+    # AMI in its own "AmiIds" column, and an AMI backing four snapshots
+    # shows up as the same AMI id in each of those four rows -- it never
+    # gets its own column per snapshot.
     # --------------------------------------------------------
 
-    csv_data = create_csv(all_rows)
+    rows_with_ami = [row for row in all_rows if row["AmiIds"]]
+    rows_orphaned = [row for row in all_rows if not row["AmiIds"]]
 
     # --------------------------------------------------------
-    # UPLOAD TO S3
+    # CREATE + UPLOAD BOTH CSVs
     # --------------------------------------------------------
 
-    report_key, download_url = upload_report(csv_data, run_id)
+    upload_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    with_ami_key, with_ami_url = upload_report(
+        create_csv(rows_with_ami), run_id, "with-ami", upload_timestamp
+    )
+    orphaned_key, orphaned_url = upload_report(
+        create_csv(rows_orphaned), run_id, "orphaned", upload_timestamp
+    )
+
+    reports = {
+        "with_ami": {
+            "key": with_ami_key,
+            "url": with_ami_url,
+            "count": len(rows_with_ami),
+        },
+        "orphaned": {
+            "key": orphaned_key,
+            "url": orphaned_url,
+            "count": len(rows_orphaned),
+        },
+    }
 
     # --------------------------------------------------------
     # SNS
     # --------------------------------------------------------
 
-    send_sns(summaries, download_url, run_id)
+    send_sns(summaries, reports, run_id)
 
     # --------------------------------------------------------
     # LAMBDA RESPONSE
@@ -977,7 +1009,6 @@ def lambda_handler(event, context):
         "region": REGION,
         "retentionDays": RETENTION_DAYS,
         "reportBucket": REPORT_BUCKET,
-        "reportKey": report_key,
         "rows": len(all_rows),
         "accountsProcessed": len(summaries),
         "accountsFailed": len(accounts_failed),
@@ -987,5 +1018,16 @@ def lambda_handler(event, context):
         "eligibleAmis": sum(
             s["eligible_amis"] for s in summaries if s["status"] == "OK"
         ),
-        "downloadUrl": download_url,
+        "reports": {
+            "withAmi": {
+                "reportKey": with_ami_key,
+                "downloadUrl": with_ami_url,
+                "rows": len(rows_with_ami),
+            },
+            "orphaned": {
+                "reportKey": orphaned_key,
+                "downloadUrl": orphaned_url,
+                "rows": len(rows_orphaned),
+            },
+        },
     }
