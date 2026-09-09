@@ -1,7 +1,7 @@
-SELECT key, COUNT(*) AS retrieval_count, SUM(bytes_sent) AS total_bytes
-FROM access_logs
-WHERE operation = 'REST.GET.OBJECT'
-  AND bucket = 'corporateit-equipprd-prod'
-  AND date BETWEEN '2026-07-01' AND '2026-07-31'
-GROUP BY key
-ORDER BY retrieval_count DESC
+<Error>
+<Code>InvalidArgument</Code>
+<Message>Requests specifying Server Side Encryption with AWS KMS managed keys require AWS Signature Version 4.</Message>
+<ArgumentName>Authorization</ArgumentName>
+<RequestId>RA3PYH7MA64XSBT1</RequestId>
+<HostId>qSVFNINNe7YMh40MTyHkhkkdtGqIzkzdIY/Pd1aM8/lhIy0kgsrKH15Vwz1AI98wAK1BpnnKdFgWLIJhgRVdNqdHxAFofgfk</HostId>
+</Error>
