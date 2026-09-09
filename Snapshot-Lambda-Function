@@ -1,11 +1,13 @@
 import boto3
 import csv
+import html
 import io
 import os
 import json
 import logging
 from datetime import datetime, timezone, timedelta
 
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 
@@ -121,7 +123,20 @@ DEREGISTER_ASSOCIATED_AMIS = (
 # ============================================================
 
 sts = boto3.client("sts")
-s3 = boto3.client("s3")
+
+# Presigned URLs for a KMS-encrypted object MUST be signed with SigV4 --
+# S3 rejects a SigV2-signed presigned GET against a "aws:kms" object with
+# "Requests specifying Server Side Encryption with AWS KMS managed keys
+# require AWS Signature Version 4." Pinning signature_version explicitly
+# (rather than relying on whatever boto3/botocore defaults to) is the
+# documented fix; also pin the bucket's own region so the client doesn't
+# fall back to whatever AWS_REGION the Lambda happens to run under.
+s3 = boto3.client(
+    "s3",
+    region_name="ap-southeast-2",
+    config=Config(signature_version="s3v4"),
+)
+
 sns = boto3.client("sns")
 
 # Used only to resolve friendly account names. This MUST be a client
@@ -311,6 +326,8 @@ def get_snapshots(ec2):
 
 SUMMARY_COUNTER_KEYS = [
     "total_snapshots",
+    "with_ami_snapshots",
+    "orphaned_snapshots",
     "total_amis",
     "older_snapshots",
     "older_snapshot_gb",
@@ -524,6 +541,11 @@ def process_account_region(account_id, account_name, run_id):
             for a in amis
         ]
 
+        if ami_ids:
+            summary["with_ami_snapshots"] += 1
+        else:
+            summary["orphaned_snapshots"] += 1
+
         eligible_for_delete = False
 
         if not info["state_ok"]:
@@ -676,6 +698,178 @@ def create_csv(rows):
 
 
 # ============================================================
+# HTML SUMMARY (per-account comparison table)
+# ============================================================
+#
+# SNS email delivery is plain text only -- it cannot render an HTML
+# table in the message body. So the account-by-account comparison lives
+# here, as its own HTML file uploaded next to the CSVs, and the SNS
+# email stays short and links to it instead of repeating a long
+# text block per account.
+
+ACCOUNT_TABLE_COLUMNS = [
+    ("total_snapshots", "Total Snapshots"),
+    ("with_ami_snapshots", "With AMI"),
+    ("orphaned_snapshots", "Orphaned"),
+    ("total_amis", "Total AMIs"),
+    ("older_snapshots", f"Older Than {RETENTION_DAYS}d"),
+    ("older_snapshot_gb", "Older GiB"),
+    ("excluded_not_completed", "Excl: Not Completed"),
+    ("excluded_ami_type", "Excl: AMI Pre/Post Patch"),
+    ("excluded_backup_tag", "Excl: AWS Backup"),
+    ("excluded_within_retention", "Excl: Within Retention"),
+    ("excluded_ami_dependency", "Excl: AMI Dependency"),
+    ("eligible_snapshots", "Eligible Snapshots"),
+    ("eligible_amis", "Eligible AMIs"),
+    ("snapshots_deleted", "Snapshots Deleted"),
+    ("snapshots_delete_failed", "Delete Failed"),
+    ("amis_deregistered", "AMIs Deregistered"),
+    ("amis_deregister_failed", "Deregister Failed"),
+]
+
+
+def build_html_summary(summary_list, reports, run_id, generated_at, mode):
+
+    ok_summaries = [s for s in summary_list if s["status"] == "OK"]
+    failed_summaries = [s for s in summary_list if s["status"] != "OK"]
+
+    def total(key):
+        return sum(x[key] for x in ok_summaries)
+
+    header_cells = "".join(
+        f"<th>{html.escape(label)}</th>" for _, label in ACCOUNT_TABLE_COLUMNS
+    )
+
+    body_rows = []
+
+    for item in summary_list:
+
+        status_class = "status-ok" if item["status"] == "OK" else "status-error"
+        status_label = html.escape(item["status"])
+
+        account_cell = (
+            f"<strong>{html.escape(str(item['account_name']))}</strong>"
+            f"<br><span class='muted'>{html.escape(str(item['account_id']))}</span>"
+        )
+
+        if item["status"] != "OK":
+            body_rows.append(
+                f"<tr class='{status_class}'>"
+                f"<td>{account_cell}</td>"
+                f"<td>{status_label}</td>"
+                f"<td colspan='{len(ACCOUNT_TABLE_COLUMNS)}'>"
+                f"Error: {html.escape(str(item['error']))}</td>"
+                f"</tr>"
+            )
+            continue
+
+        data_cells = "".join(
+            f"<td>{item[key]:,}</td>" for key, _ in ACCOUNT_TABLE_COLUMNS
+        )
+
+        body_rows.append(
+            f"<tr class='{status_class}'>"
+            f"<td>{account_cell}</td>"
+            f"<td>{status_label}</td>"
+            f"{data_cells}"
+            f"</tr>"
+        )
+
+    if DRY_RUN:
+        headline = (
+            f"If DRY_RUN were false, this run would DELETE "
+            f"<strong>{total('eligible_snapshots'):,}</strong> snapshot(s) and "
+            f"DEREGISTER <strong>{total('eligible_amis'):,}</strong> AMI(s)."
+        )
+    else:
+        headline = (
+            f"Deleted <strong>{total('snapshots_deleted'):,}</strong> snapshot(s) "
+            f"({total('snapshots_delete_failed'):,} failed) and deregistered "
+            f"<strong>{total('amis_deregistered'):,}</strong> AMI(s) "
+            f"({total('amis_deregister_failed'):,} failed), out of "
+            f"{total('eligible_snapshots'):,} / {total('eligible_amis'):,} eligible."
+        )
+
+    failed_banner = ""
+    if failed_summaries:
+        failed_rows = "".join(
+            f"<li><strong>{html.escape(str(s['account_id']))}</strong>: "
+            f"{html.escape(str(s['error']))}</li>"
+            for s in failed_summaries
+        )
+        failed_banner = (
+            f"<div class='banner banner-error'>"
+            f"<strong>{len(failed_summaries)} account(s) failed to process:</strong>"
+            f"<ul>{failed_rows}</ul></div>"
+        )
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>EBS Snapshot Cleanup Report</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 24px; color: #1a1a1a; background: #fafafa; }}
+  h1 {{ font-size: 20px; margin-bottom: 4px; }}
+  .meta {{ color: #555; font-size: 13px; margin-bottom: 16px; }}
+  .meta span {{ margin-right: 16px; }}
+  .banner {{ padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }}
+  .banner-error {{ background: #fdecea; border: 1px solid #f5b5ac; color: #7a1f13; }}
+  .banner-info {{ background: #eaf2fd; border: 1px solid #b6d4fb; color: #0b3d78; font-size: 15px; }}
+  .downloads {{ margin: 16px 0; font-size: 14px; }}
+  .downloads a {{ display: inline-block; margin-right: 20px; }}
+  .table-wrap {{ overflow-x: auto; border: 1px solid #ddd; border-radius: 6px; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; white-space: nowrap; }}
+  th, td {{ padding: 6px 10px; border-bottom: 1px solid #eee; text-align: right; }}
+  th {{ background: #f2f2f2; text-align: right; position: sticky; top: 0; }}
+  th:first-child, td:first-child {{ text-align: left; white-space: nowrap; }}
+  td:nth-child(2) {{ text-align: left; }}
+  tr.status-error td {{ background: #fdecea; }}
+  .status-ok {{ color: #1a7a3c; }}
+  .status-error {{ color: #a3271a; font-weight: bold; }}
+  .muted {{ color: #888; font-size: 12px; }}
+</style>
+</head>
+<body>
+  <h1>EBS Snapshot Cleanup Report</h1>
+  <div class="meta">
+    <span>RunId: {html.escape(run_id)}</span>
+    <span>Mode: {html.escape(mode)}</span>
+    <span>Region: ap-southeast-2</span>
+    <span>Retention: {RETENTION_DAYS} days</span>
+    <span>Generated: {html.escape(generated_at)}</span>
+    <span>Accounts OK: {len(ok_summaries)} / FAILED: {len(failed_summaries)}</span>
+  </div>
+
+  <div class="banner banner-info">{headline}</div>
+
+  {failed_banner}
+
+  <div class="downloads">
+    <a href="{html.escape(reports['with_ami']['url'])}">
+      Download: Snapshots associated with an AMI ({reports['with_ami']['count']} rows)
+    </a>
+    <a href="{html.escape(reports['orphaned']['url'])}">
+      Download: Orphaned snapshots, no AMI association ({reports['orphaned']['count']} rows)
+    </a>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Account</th><th>Status</th>{header_cells}</tr>
+      </thead>
+      <tbody>
+        {''.join(body_rows)}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+
+# ============================================================
 # S3
 # ============================================================
 
@@ -725,11 +919,57 @@ def upload_report(csv_data, run_id, label, timestamp):
     return key, presigned_url
 
 
+def upload_html_summary(html_data, run_id, timestamp):
+
+    mode = (
+        "dry-run"
+        if DRY_RUN
+        else "delete"
+    )
+
+    key = (
+        f"{REPORT_PREFIX}"
+        f"summary-report-"
+        f"{RETENTION_DAYS}days-"
+        f"{mode}-"
+        f"{timestamp}-"
+        f"{run_id}.html"
+    )
+
+    s3.put_object(
+        Bucket=REPORT_BUCKET,
+        Key=key,
+        Body=html_data.encode("utf-8"),
+        ContentType="text/html",
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=KMS_KEY_ID
+    )
+
+    presigned_url = (
+        s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": REPORT_BUCKET,
+                "Key": key
+            },
+            ExpiresIn=PRESIGNED_URL_EXPIRY
+        )
+    )
+
+    return key, presigned_url
+
+
 # ============================================================
 # SNS
 # ============================================================
 
-def send_sns(summary_list, reports, run_id):
+def send_sns(summary_list, reports, summary_report_url, run_id):
+
+    # Kept deliberately short: SNS email is plain text and cannot render
+    # a table, and repeating a full per-account breakdown as text got
+    # unreadable past a handful of accounts. The full, per-account
+    # comparison table lives in the linked HTML summary report instead;
+    # this message is just enough to triage from the inbox.
 
     ok_summaries = [s for s in summary_list if s["status"] == "OK"]
     failed_summaries = [s for s in summary_list if s["status"] != "OK"]
@@ -739,8 +979,6 @@ def send_sns(summary_list, reports, run_id):
 
     total_snapshots = total("total_snapshots")
     total_amis = total("total_amis")
-    total_old = total("older_snapshots")
-    total_gb = total("older_snapshot_gb")
 
     total_eligible_snapshots = total("eligible_snapshots")
     total_eligible_amis = total("eligible_amis")
@@ -764,27 +1002,23 @@ def send_sns(summary_list, reports, run_id):
     lines.append(f"Mode: {mode}")
     lines.append(f"Region: ap-southeast-2")
     lines.append(f"Retention: {RETENTION_DAYS} days")
-    lines.append(f"Accounts processed OK: {len(ok_summaries)}")
-    lines.append(f"Accounts FAILED: {len(failed_summaries)}")
+    lines.append(
+        f"Accounts processed OK: {len(ok_summaries)} / "
+        f"FAILED: {len(failed_summaries)}"
+    )
     lines.append("")
 
     if failed_summaries:
-        lines.append("*** ACCOUNT PROCESSING FAILURES ***")
-        lines.append("-----------------------------------")
+        lines.append(
+            f"*** {len(failed_summaries)} ACCOUNT(S) FAILED TO PROCESS "
+            f"-- see summary report for details ***"
+        )
         for item in failed_summaries:
-            lines.append(
-                f"Account {item['account_id']} ({item['region']}): "
-                f"{item['error']}"
-            )
+            lines.append(f"  - {item['account_id']}: {item['error']}")
         lines.append("")
 
-    lines.append("Overall Summary")
-    lines.append("---------------")
     lines.append(f"Total snapshots scanned: {total_snapshots}")
     lines.append(f"Total AMIs scanned: {total_amis}")
-    lines.append(f"Older than {RETENTION_DAYS} days: {total_old}")
-    lines.append(f"Older snapshot volume size: {total_gb:,} GiB")
-    lines.append("")
 
     if DRY_RUN:
         lines.append(
@@ -794,83 +1028,25 @@ def send_sns(summary_list, reports, run_id):
         )
     else:
         lines.append(
-            f"Eligible for deletion this run: "
-            f"{total_eligible_snapshots} snapshot(s), "
-            f"{total_eligible_amis} AMI(s)."
+            f"Deleted: {total_deleted} snapshot(s) "
+            f"({total_delete_failed} failed) / "
+            f"Deregistered: {total_deregistered} AMI(s) "
+            f"({total_deregister_failed} failed), "
+            f"out of {total_eligible_snapshots} / {total_eligible_amis} eligible."
         )
-        lines.append(f"Snapshots deleted: {total_deleted}")
-        lines.append(f"Snapshot delete failures: {total_delete_failed}")
-        lines.append(f"AMIs deregistered: {total_deregistered}")
-        lines.append(f"AMI deregister failures: {total_deregister_failed}")
 
     lines.append("")
-    lines.append("Account Summary")
-    lines.append("---------------")
-
-    for item in summary_list:
-
-        lines.append(
-            f"Account: {item['account_name']} ({item['account_id']}) "
-            f"[{item['status']}]"
-        )
-
-        if item["status"] != "OK":
-            lines.append(f"  Error: {item['error']}")
-            lines.append("")
-            continue
-
-        lines.append(f"  Region: {item['region']}")
-        lines.append(f"  Total snapshots: {item['total_snapshots']}")
-        lines.append(f"  Total AMIs: {item['total_amis']}")
-        lines.append(
-            f"  Older than {RETENTION_DAYS} days: {item['older_snapshots']}"
-        )
-        lines.append(
-            f"  Older snapshot size: {item['older_snapshot_gb']:,} GiB"
-        )
-        lines.append("  Excluded breakdown:")
-        lines.append(
-            f"    Not completed: {item['excluded_not_completed']}"
-        )
-        lines.append(
-            f"    AMI pre/post patch: {item['excluded_ami_type']}"
-        )
-        lines.append(
-            f"    AWS Backup protected: {item['excluded_backup_tag']}"
-        )
-        lines.append(
-            f"    Within retention: {item['excluded_within_retention']}"
-        )
-        lines.append(
-            f"    AMI has active dependent snapshot: "
-            f"{item['excluded_ami_dependency']}"
-        )
-        lines.append(
-            f"  Eligible (would delete/deregister): "
-            f"{item['eligible_snapshots']} snapshot(s), "
-            f"{item['eligible_amis']} AMI(s)"
-        )
-        lines.append(f"  Snapshots deleted: {item['snapshots_deleted']}")
-        lines.append(
-            f"  Snapshot delete failures: {item['snapshots_delete_failed']}"
-        )
-        lines.append(f"  AMIs deregistered: {item['amis_deregistered']}")
-        lines.append(
-            f"  AMI deregister failures: {item['amis_deregister_failed']}"
-        )
-        lines.append("")
-
-    lines.append("CSV Downloads:")
     lines.append(
-        f"  Snapshots associated with an AMI "
-        f"({reports['with_ami']['count']} rows):"
+        f"Full per-account comparison table ({len(summary_list)} accounts):"
     )
-    lines.append(f"    {reports['with_ami']['url']}")
+    lines.append(f"  {summary_report_url}")
+    lines.append("")
+    lines.append(f"CSV - snapshots with an AMI ({reports['with_ami']['count']} rows):")
+    lines.append(f"  {reports['with_ami']['url']}")
     lines.append(
-        f"  Orphaned snapshots, no AMI association "
-        f"({reports['orphaned']['count']} rows):"
+        f"CSV - orphaned snapshots, no AMI ({reports['orphaned']['count']} rows):"
     )
-    lines.append(f"    {reports['orphaned']['url']}")
+    lines.append(f"  {reports['orphaned']['url']}")
 
     message = "\n".join(lines)
 
@@ -990,10 +1166,25 @@ def lambda_handler(event, context):
     }
 
     # --------------------------------------------------------
+    # BUILD + UPLOAD HTML SUMMARY (per-account comparison table)
+    # --------------------------------------------------------
+
+    mode_label = "DRY RUN" if DRY_RUN else "DELETE MODE"
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    summary_html = build_html_summary(
+        summaries, reports, run_id, generated_at, mode_label
+    )
+
+    summary_key, summary_url = upload_html_summary(
+        summary_html, run_id, upload_timestamp
+    )
+
+    # --------------------------------------------------------
     # SNS
     # --------------------------------------------------------
 
-    send_sns(summaries, reports, run_id)
+    send_sns(summaries, reports, summary_url, run_id)
 
     # --------------------------------------------------------
     # LAMBDA RESPONSE
@@ -1018,6 +1209,10 @@ def lambda_handler(event, context):
         "eligibleAmis": sum(
             s["eligible_amis"] for s in summaries if s["status"] == "OK"
         ),
+        "summaryReport": {
+            "reportKey": summary_key,
+            "downloadUrl": summary_url,
+        },
         "reports": {
             "withAmi": {
                 "reportKey": with_ami_key,
