@@ -331,6 +331,8 @@ SUMMARY_COUNTER_KEYS = [
     "total_amis",
     "older_snapshots",
     "older_snapshot_gb",
+    "older_snapshot_actual_gb",
+    "snapshots_missing_size_field",
     "excluded_not_completed",
     "excluded_ami_type",
     "excluded_backup_tag",
@@ -424,9 +426,30 @@ def process_account_region(account_id, account_name, run_id):
             and older_than_retention
         )
 
+        # "VolumeSize" is the source volume's provisioned capacity in
+        # GiB -- it's the same number for every snapshot of that volume
+        # and does NOT tell you how much data any one snapshot actually
+        # holds. The exact per-snapshot size is "FullSnapshotSizeInBytes",
+        # a field DescribeSnapshots started returning in Feb 2025: the
+        # total size of all blocks that make up that snapshot (its own
+        # blocks plus everything it references from earlier snapshots in
+        # the chain). It needs no extra API call or IAM permission beyond
+        # the ec2:DescribeSnapshots this function already has -- it just
+        # wasn't being read out of the response. Snapshots created before
+        # that rollout (or otherwise not yet backfilled) won't have it;
+        # those are counted separately rather than silently treated as 0.
+        full_snapshot_size_bytes = snapshot.get("FullSnapshotSizeInBytes")
+
+        if full_snapshot_size_bytes is None:
+            summary["snapshots_missing_size_field"] += 1
+
         if older_than_retention:
             summary["older_snapshots"] += 1
             summary["older_snapshot_gb"] += snapshot.get("VolumeSize", 0)
+            if full_snapshot_size_bytes is not None:
+                summary["older_snapshot_actual_gb"] += (
+                    full_snapshot_size_bytes / (1024 ** 3)
+                )
 
         base_info[snapshot_id] = {
             "snapshot": snapshot,
@@ -437,6 +460,7 @@ def process_account_region(account_id, account_name, run_id):
             "backup_protected": backup_protected,
             "state_ok": state_ok,
             "older_than_retention": older_than_retention,
+            "full_snapshot_size_bytes": full_snapshot_size_bytes,
             "base_eligible": base_eligible,
         }
 
@@ -527,6 +551,14 @@ def process_account_region(account_id, account_name, run_id):
         snapshot = info["snapshot"]
         start_time = snapshot["StartTime"]
         volume_size = snapshot.get("VolumeSize", 0)
+
+        full_snapshot_size_bytes = info["full_snapshot_size_bytes"]
+        snapshot_size_gib = (
+            round(full_snapshot_size_bytes / (1024 ** 3), 3)
+            if full_snapshot_size_bytes is not None
+            else ""
+        )
+
         tags = info["tags"]
         snapshot_name = tags.get("Name", "")
         age_days = (now - start_time).days
@@ -617,6 +649,7 @@ def process_account_region(account_id, account_name, run_id):
 
             "VolumeId": snapshot.get("VolumeId", ""),
             "VolumeSizeGiB": volume_size,
+            "SnapshotSizeGiB": snapshot_size_gib,
             "SnapshotStorageTier": snapshot.get("StorageTier", ""),
             "SnapshotState": snapshot.get("State", ""),
             "Encrypted": snapshot.get("Encrypted", False),
@@ -660,6 +693,7 @@ CSV_COLUMNS = [
     "SnapshotAgeDays",
     "VolumeId",
     "VolumeSizeGiB",
+    "SnapshotSizeGiB",
     "SnapshotStorageTier",
     "SnapshotState",
     "Encrypted",
@@ -713,7 +747,9 @@ ACCOUNT_TABLE_COLUMNS = [
     ("orphaned_snapshots", "Orphaned"),
     ("total_amis", "Total AMIs"),
     ("older_snapshots", f"Older Than {RETENTION_DAYS}d"),
-    ("older_snapshot_gb", "Older GiB"),
+    ("older_snapshot_gb", "Older Volume GiB (provisioned)"),
+    ("older_snapshot_actual_gb", "Older Actual GiB (FullSnapshotSize)"),
+    ("snapshots_missing_size_field", "Missing Size Field"),
     ("excluded_not_completed", "Excl: Not Completed"),
     ("excluded_ami_type", "Excl: AMI Pre/Post Patch"),
     ("excluded_backup_tag", "Excl: AWS Backup"),
@@ -726,6 +762,17 @@ ACCOUNT_TABLE_COLUMNS = [
     ("amis_deregistered", "AMIs Deregistered"),
     ("amis_deregister_failed", "Deregister Failed"),
 ]
+
+
+def format_metric(value):
+    """Render an int as-is with thousands separators; round a GiB float
+    (e.g. older_snapshot_actual_gb) to 2 decimal places instead of
+    dumping raw floating-point precision into the report."""
+
+    if isinstance(value, float):
+        return f"{value:,.2f}"
+
+    return f"{value:,}"
 
 
 def build_html_summary(summary_list, reports, run_id, generated_at, mode):
@@ -764,7 +811,7 @@ def build_html_summary(summary_list, reports, run_id, generated_at, mode):
             continue
 
         data_cells = "".join(
-            f"<td>{item[key]:,}</td>" for key, _ in ACCOUNT_TABLE_COLUMNS
+            f"<td>{format_metric(item[key])}</td>" for key, _ in ACCOUNT_TABLE_COLUMNS
         )
 
         body_rows.append(
@@ -846,6 +893,10 @@ def build_html_summary(summary_list, reports, run_id, generated_at, mode):
   {failed_banner}
 
   <div class="downloads">
+    <a href="{html.escape(reports['eligible']['url'])}">
+      Download: Eligible for deletion -- would be deleted if DRY_RUN=false
+      ({reports['eligible']['count']} rows)
+    </a>
     <a href="{html.escape(reports['with_ami']['url'])}">
       Download: Snapshots associated with an AMI ({reports['with_ami']['count']} rows)
     </a>
@@ -1041,6 +1092,11 @@ def send_sns(summary_list, reports, summary_report_url, run_id):
     )
     lines.append(f"  {summary_report_url}")
     lines.append("")
+    lines.append(
+        f"CSV - eligible for deletion, i.e. would be deleted if DRY_RUN=false "
+        f"({reports['eligible']['count']} rows):"
+    )
+    lines.append(f"  {reports['eligible']['url']}")
     lines.append(f"CSV - snapshots with an AMI ({reports['with_ami']['count']} rows):")
     lines.append(f"  {reports['with_ami']['url']}")
     lines.append(
@@ -1139,8 +1195,19 @@ def lambda_handler(event, context):
     rows_with_ami = [row for row in all_rows if row["AmiIds"]]
     rows_orphaned = [row for row in all_rows if not row["AmiIds"]]
 
+    # A third, mode-agnostic view: every row that met all the deletion
+    # criteria ("EligibleForDeletion" == "Yes"). In DRY_RUN mode these are
+    # the ones that WOULD be deleted if DRY_RUN were false (their
+    # DeletionStatus reads DRY_RUN_WOULD_DELETE); in live mode they're the
+    # ones that WERE attempted (DELETED or DELETE_FAILED). Each row's
+    # "AssociatedAmiAction" column also shows which AMI(s), if any, were
+    # deregistered (or would be) as part of deleting that snapshot, so
+    # this one file covers both the snapshot and AMI side of "what gets
+    # deleted."
+    rows_eligible = [row for row in all_rows if row["EligibleForDeletion"] == "Yes"]
+
     # --------------------------------------------------------
-    # CREATE + UPLOAD BOTH CSVs
+    # CREATE + UPLOAD ALL THREE CSVs
     # --------------------------------------------------------
 
     upload_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -1150,6 +1217,9 @@ def lambda_handler(event, context):
     )
     orphaned_key, orphaned_url = upload_report(
         create_csv(rows_orphaned), run_id, "orphaned", upload_timestamp
+    )
+    eligible_key, eligible_url = upload_report(
+        create_csv(rows_eligible), run_id, "eligible-for-deletion", upload_timestamp
     )
 
     reports = {
@@ -1162,6 +1232,11 @@ def lambda_handler(event, context):
             "key": orphaned_key,
             "url": orphaned_url,
             "count": len(rows_orphaned),
+        },
+        "eligible": {
+            "key": eligible_key,
+            "url": eligible_url,
+            "count": len(rows_eligible),
         },
     }
 
@@ -1223,6 +1298,11 @@ def lambda_handler(event, context):
                 "reportKey": orphaned_key,
                 "downloadUrl": orphaned_url,
                 "rows": len(rows_orphaned),
+            },
+            "eligibleForDeletion": {
+                "reportKey": eligible_key,
+                "downloadUrl": eligible_url,
+                "rows": len(rows_eligible),
             },
         },
     }
