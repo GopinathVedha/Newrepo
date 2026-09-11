@@ -1,17 +1,25 @@
 import boto3
 import json
 import logging
+import uuid
+from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
 
 # ============================================================
 # LAMBDA 2 of 2 — "Status" function (MULTI-ACCOUNT / CENTRAL HUB)
 #
 # Invoked ~3 minutes after Lambda 1, carrying ONLY the accounts and
-# instance IDs that were actually touched that cycle (never sweeps every
-# account, and never lists a whole account's fleet — only the specific
-# instances passed in). Restores capacity-downgraded instances to their
-# original type, and — only if there were starts — checks health for
-# just those started instances.
+# instance IDs actually touched that cycle. Restores capacity-downgraded
+# instances to their original type, and checks health for just the
+# started instances.
+#
+# SELF-HEALING: if a started instance genuinely fails its health check
+# (impaired — not just still-initializing), this function automatically
+# reboots it once, then schedules a one-time re-check of just that
+# instance ~5 minutes later. If it's healthy by then, a "recovered" note
+# is sent — no human involved. If it's still failing, it escalates to a
+# "Manual Intervention Required" alert instead of rebooting again, so
+# this can never loop.
 # ============================================================
 
 logger = logging.getLogger()
@@ -22,10 +30,15 @@ region = 'ap-southeast-2'
 sns_topic_capacity_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
 sns_topic_health_arn = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_health_check'
 
+# Role EventBridge Scheduler assumes to invoke this function again for a re-check
+SCHEDULER_EXECUTION_ROLE_ARN = 'arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole'
+REBOOT_RECHECK_DELAY_SECONDS = 300  # 5 minutes after the reboot
+
 ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 
 sts_client = boto3.client('sts', region_name=region)
 sns_client = boto3.client('sns', region_name=region)
+scheduler_client = boto3.client('scheduler', region_name=region)
 
 
 def get_account_session(role_arn):
@@ -64,6 +77,23 @@ def get_event_table(events, columns):
     return "\n".join(lines)
 
 
+def classify_health(status_entry):
+    """Returns 'ok', 'impaired', 'initializing', or 'unknown'.
+    Only 'impaired' should ever trigger a reboot — 'initializing' just
+    means the instance hasn't finished booting yet, which is normal."""
+    if not status_entry:
+        return 'unknown'
+    system = status_entry['SystemStatus']['Status']
+    instance_check = status_entry['InstanceStatus']['Status']
+    if system == 'ok' and instance_check == 'ok':
+        return 'ok'
+    if 'impaired' in (system, instance_check):
+        return 'impaired'
+    if 'initializing' in (system, instance_check):
+        return 'initializing'
+    return 'unknown'
+
+
 def restore_original_type(ec2_client, ec2_resource, instance_id, name, account_name, restore_events, restore_failures):
     instance = ec2_resource.Instance(instance_id)
     original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
@@ -79,31 +109,56 @@ def restore_original_type(ec2_client, ec2_resource, instance_id, name, account_n
         restore_failures.append((instance_id, name, account_name, str(e)))
 
 
-def get_scoped_status_table(ec2_client, instance_ids, instance_names, account_name):
-    """Health/status for ONLY the given instance IDs — never the whole account."""
-    if not instance_ids:
-        return "", 0
-    lines = ["     Instance ID     |     Server Name     |     Status      |   Health Check",
-              "------------------- | ------------------- | --------------- | ----------------"]
-    desc = ec2_client.describe_instances(InstanceIds=instance_ids)
-    states = {}
-    for res in desc['Reservations']:
-        for inst in res['Instances']:
-            states[inst['InstanceId']] = inst['State']['Name']
+def schedule_recheck(function_arn, payload, delay_seconds=REBOOT_RECHECK_DELAY_SECONDS):
+    run_at = (datetime.utcnow() + timedelta(seconds=delay_seconds)).strftime('%Y-%m-%dT%H:%M:%S')
+    schedule_name = f"ec2-autoscheduler-reboot-recheck-{uuid.uuid4().hex[:10]}"
+    scheduler_client.create_schedule(
+        Name=schedule_name,
+        ScheduleExpression=f"at({run_at})",
+        FlexibleTimeWindow={'Mode': 'OFF'},
+        Target={'Arn': function_arn, 'RoleArn': SCHEDULER_EXECUTION_ROLE_ARN, 'Input': json.dumps(payload)},
+        ActionAfterCompletion='DELETE'
+    )
+    logger.info(f"Scheduled reboot re-check as '{schedule_name}' for {run_at} UTC")
 
-    status_resp = ec2_client.describe_instance_status(InstanceIds=instance_ids, IncludeAllInstances=True)
-    health_by_id = {}
-    for st in status_resp['InstanceStatuses']:
-        system = st['SystemStatus']['Status']
-        instance_check = st['InstanceStatus']['Status']
-        health_by_id[st['InstanceId']] = "2/2 Passed" if system == "ok" and instance_check == "ok" else f"{system}/{instance_check}"
 
-    for iid in instance_ids:
-        name = instance_names.get(iid, 'Unnamed')
-        status = states.get(iid, 'unknown')
-        health = health_by_id.get(iid, 'N/A')
-        lines.append(f"{iid:<19} | {name:<19} | {status:<15} | {health}")
-    return "\n".join(lines), len(instance_ids)
+def handle_reboot_recheck(event):
+    """Second-pass invocation: check ONLY the one instance that was rebooted."""
+    info = event['recheck']
+    account_name = info['account_name']
+    role_arn = info.get('role_arn')
+    instance_id = info['instance_id']
+    instance_name = info.get('instance_name', 'Unnamed')
+
+    try:
+        session = get_account_session(role_arn)
+        ec2_client = session.client('ec2', region_name=region)
+        status_resp = ec2_client.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)
+        category = classify_health(status_resp['InstanceStatuses'][0]) if status_resp['InstanceStatuses'] else 'unknown'
+    except Exception as e:
+        logger.error(f"Reboot re-check failed for {instance_id} ({account_name}): {e}")
+        send_sns_notification(
+            f"❌ Could not re-check {instance_name} ({account_name}, {instance_id}) after its "
+            f"automatic reboot.\n\nError: {e}\n\nPlease check it manually.",
+            sns_topic_capacity_arn, subject='EC2 Scheduler - Reboot Recheck FAILED'
+        )
+        return
+
+    if category == 'ok':
+        logger.info(f"{instance_id} ({account_name}) recovered after auto-reboot")
+        send_sns_notification(
+            f"✅ {instance_name} ({account_name}, {instance_id}) recovered after an automatic "
+            f"reboot and is now passing 2/2 health checks. No action needed.",
+            sns_topic_health_arn, subject='EC2 Scheduler - Recovered After Auto-Reboot'
+        )
+    else:
+        logger.warning(f"{instance_id} ({account_name}) still unhealthy ({category}) after auto-reboot")
+        send_sns_notification(
+            f"🚨 {instance_name} ({account_name}, {instance_id}) is STILL failing its health check "
+            f"(status: {category}) after an automatic reboot.\n\n"
+            f"No further automatic action will be taken — this needs manual investigation.",
+            sns_topic_capacity_arn, subject='EC2 Scheduler - Manual Intervention Required'
+        )
 
 
 # ---------- Main handler ----------
@@ -111,15 +166,22 @@ def get_scoped_status_table(ec2_client, instance_ids, instance_names, account_na
 def lambda_handler(event, context):
     logger.info(f"Lambda 2 (status) invoked. Event: {json.dumps(event)}")
 
+    # Branch 1: this is a follow-up re-check after an automatic reboot
+    if 'recheck' in event:
+        handle_reboot_recheck(event)
+        return
+
+    # Branch 2: normal invocation from Lambda 1
     try:
         timestamp = event.get("timestamp", "")
         had_starts = event.get("had_starts", False)
         accounts_involved = event.get("accounts_involved", {})
 
-        restore_events = []     # (instance_id, name, account, ran_as, restored_to)
-        restore_failures = []   # (instance_id, name, account, reason)
-        health_sections = []    # per-account health table text
-        account_access_failures = []  # (account_id, account_name, error)
+        restore_events, restore_failures = [], []
+        health_sections = []
+        auto_reboot_triggered = []     # (instance_id, name, account)
+        reboot_failures = []           # (instance_id, name, account, reason)
+        account_access_failures = []
 
         for account_id, info in accounts_involved.items():
             account_name = info.get('name', account_id)
@@ -137,7 +199,7 @@ def lambda_handler(event, context):
                 account_access_failures.append((account_id, account_name, str(e)))
                 continue
 
-            # --- Restore capacity-downgraded instances (only this account's stopped ones) ---
+            # --- Restore capacity-downgraded instances ---
             for instance_id in autostop_ids:
                 try:
                     instance = ec2_resource.Instance(instance_id)
@@ -149,16 +211,50 @@ def lambda_handler(event, context):
                     else:
                         original_type = get_tag_value(instance, ORIGINAL_TYPE_TAG)
                         if original_type:
-                            logger.info(f"{instance_id} ({account_name}) not yet stopped "
-                                        f"(state={instance.state['Name']}); will retry next cycle")
+                            logger.info(f"{instance_id} ({account_name}) not yet stopped; will retry next cycle")
                 except Exception as e:
                     logger.error(f"Error checking/restoring {instance_id} ({account_name}): {e}")
 
-            # --- Health check (only THIS account's started instances, only if had_starts) ---
+            # --- Health check + auto-reboot on genuine failure (only started instances) ---
             if had_starts and autostart_ids:
-                table, count = get_scoped_status_table(ec2_client, autostart_ids, instance_names, account_name)
-                if table:
-                    health_sections.append(f"\n[{account_name}] {count} instance(s) checked:\n{table}")
+                try:
+                    desc = ec2_client.describe_instances(InstanceIds=autostart_ids)
+                    state_by_id = {inst['InstanceId']: inst['State']['Name']
+                                   for res in desc['Reservations'] for inst in res['Instances']}
+                    status_resp = ec2_client.describe_instance_status(InstanceIds=autostart_ids, IncludeAllInstances=True)
+                    status_by_id = {st['InstanceId']: st for st in status_resp['InstanceStatuses']}
+                except Exception as e:
+                    logger.error(f"Could not describe status for {account_name}: {e}")
+                    continue
+
+                table_lines = ["     Instance ID     |     Server Name     |     Status      |   Health Check",
+                                "------------------- | ------------------- | --------------- | ----------------"]
+                for iid in autostart_ids:
+                    name = instance_names.get(iid, 'Unnamed')
+                    status_entry = status_by_id.get(iid)
+                    category = classify_health(status_entry)
+                    health_label = {
+                        'ok': '2/2 Passed', 'impaired': 'IMPAIRED', 'initializing': 'Initializing',
+                    }.get(category, 'N/A')
+                    table_lines.append(f"{iid:<19} | {name:<19} | {state_by_id.get(iid, 'unknown'):<15} | {health_label}")
+
+                    if category == 'impaired':
+                        try:
+                            ec2_client.reboot_instances(InstanceIds=[iid])
+                            logger.warning(f"AUTO-REBOOT triggered for {iid} ({name}, {account_name}) — failed health check")
+                            auto_reboot_triggered.append((iid, name, account_name))
+                            schedule_recheck(context.invoked_function_arn, {
+                                "recheck": {
+                                    "account_id": account_id, "account_name": account_name,
+                                    "role_arn": role_arn, "instance_id": iid, "instance_name": name,
+                                }
+                            })
+                        except Exception as e:
+                            logger.error(f"Failed to reboot {iid} ({name}, {account_name}): {e}")
+                            reboot_failures.append((iid, name, account_name, str(e)))
+
+                health_sections.append(f"\n[{account_name}] {len(autostart_ids)} instance(s) checked:\n"
+                                        + "\n".join(table_lines))
 
         if account_access_failures:
             send_sns_notification(
@@ -178,8 +274,23 @@ def lambda_handler(event, context):
             send_sns_notification("\n".join(capacity_lines), sns_topic_capacity_arn,
                                    subject='EC2 Scheduler - Instance Type Restore Report')
 
-        # Health check email — only sent when there were actual starts somewhere this cycle,
-        # and only covers the accounts/instances that were actually started.
+        if auto_reboot_triggered or reboot_failures:
+            reboot_lines = [f"🔁 EC2 Autoscheduler — Automatic Reboot Triggered\n\n📅 Timestamp: {timestamp}\n"]
+            if auto_reboot_triggered:
+                reboot_lines.append(
+                    "These instances failed their health check and were automatically rebooted.\n"
+                    "A follow-up check will run in ~5 minutes and only escalate to an alert if still failing:\n"
+                    + get_event_table(auto_reboot_triggered, ["Instance ID", "Name", "Account"])
+                )
+            if reboot_failures:
+                reboot_lines.append(
+                    "\nThese instances failed their health check but the automatic reboot ITSELF failed "
+                    "(needs manual attention now):\n"
+                    + get_event_table(reboot_failures, ["Instance ID", "Name", "Account", "Reason"])
+                )
+            send_sns_notification("\n".join(reboot_lines), sns_topic_capacity_arn,
+                                   subject='EC2 Scheduler - Automatic Reboot Triggered')
+
         if had_starts and health_sections:
             message = (f"♻️ EC2 Autoscheduler — Follow-up Health Check\n\n📅 Timestamp: {timestamp}\n"
                        + "".join(health_sections))
