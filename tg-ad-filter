@@ -1,0 +1,56 @@
+# Define the prefix you want to search for
+$prefix = "tg-appequipcloud"
+
+# Specify the output CSV file path
+$outputFilePath = "$home\Desktop\Prod-TG-GroupMembers.csv"
+
+$domainController = "aprs.trqns.internal"
+$timeout = 300
+
+# Fetch all groups with the specified prefix
+$groups = Get-ADGroup -Filter "Name -like '$prefix*'" -Server $domainController
+
+
+# Initialize an array to store member details
+$allGroupMembers = @()
+
+# Loop through each group and get its members
+foreach ($group in $groups) {
+    $groupName = $group.Name
+    
+    # Get members of the current group
+    $members = Get-ADGroupMember -Identity $groupName -Server $domainController
+    
+    foreach ($member in $members) {
+        if ($member.objectClass -eq "user") {
+            # Get user details
+            $user = Get-ADUser -Identity $member -Properties SamAccountName
+            $userDetails = [PSCustomObject]@{
+                "GroupName"      = $groupName
+                "ObjectType"     = "User"
+                "GivenName"      = $user.GivenName
+                "Surname"        = $user.Surname
+                "SamAccountName" = $user.SamAccountName
+            }
+            $allGroupMembers += $userDetails
+        }
+        elseif ($member.objectClass -eq "group") {
+            # Nested group details
+            $nestedGroupDetails = [PSCustomObject]@{
+                "GroupName"      = $groupName
+                "ObjectType"     = "Group"
+                "SamAccountName" = $member.SamAccountName
+            }
+            $allGroupMembers += $nestedGroupDetails
+
+            # Optionally, recursively get nested group members
+            # $nestedMembers = Get-ADGroupMember -Identity $member.Name
+            # Add logic here to process nested members if needed
+        }
+    }
+}
+
+# Export the details to a CSV file
+$allGroupMembers | Export-Csv -Path $outputFilePath -NoTypeInformation
+
+Write-Output "Members of groups with the prefix '$prefix' have been exported to $outputFilePath"
