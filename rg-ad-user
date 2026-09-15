@@ -1,0 +1,33 @@
+# Define the main domain and subdomain
+$mgmtDomain = "mgrt.trqns.internal"
+
+# Define the path to the text file containing group names
+$groupNamesFile = "$home\Desktop\Prod-RGs.txt"
+
+# Read the group names from the text file
+$groupnames = Get-Content -Path $groupNamesFile
+
+# Initialize an array to hold all members
+$allMembers = @()
+
+# Loop through each group
+foreach ($groupname in $groupNames) {
+    # Fetch all members, including nested members
+    $members = Get-ADGroupMember -Identity $groupname -Server $MgmtDomain |
+               Where-Object { $_.objectClass -eq "user" } |
+               Get-ADUser -Property GivenName, Surname, SamAccountName
+
+    # Select the required properties and add the group name
+    $selectedMembers = $members | Select-Object @{Name='RG Name';Expression={$groupname}}, GivenName, Surname, SamAccountName
+
+    # Add the selected members to the allMembers array
+    $allMembers += $selectedMembers
+}
+
+# Define the output CSV file path
+$outputFile = "$home\Desktop\prod-RG-User.csv"
+
+# Export all members to CSV
+$allMembers | Export-Csv -Path $outputFile -NoTypeInformation
+
+Write-Host "User details have been exported to $outputFile"
