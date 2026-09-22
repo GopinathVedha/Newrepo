@@ -1,0 +1,181 @@
+<#
+.SYNOPSIS
+    Export members of TG-prefixed AD groups and RG groups (from a list file) into a
+    single Excel workbook, one sheet per group type.
+
+.DESCRIPTION
+    Replaces two separate scripts (tg-ad-filter / rg-ad-user) with one, parameterized
+    by domain. Uses -Recursive on Get-ADGroupMember so nested groups are properly
+    flattened to their underlying user members, rather than being skipped or logged
+    separately as "ObjectType = Group" rows.
+
+.PARAMETER TGDomain
+    Domain controller / domain FQDN to query for TG groups (e.g. aprs.trqns.internal).
+
+.PARAMETER RGDomain
+    Domain controller / domain FQDN to query for RG groups (e.g. mgrt.trqns.internal).
+
+.PARAMETER TGPrefix
+    Prefix used to find TG groups. Default: tg-appequipcloud
+
+.PARAMETER RGGroupNamesFile
+    Path to a text file listing RG group names, one per line. Default: Desktop\Prod-RGs.txt
+
+.PARAMETER OutputExcelPath
+    Path to the output .xlsx file. Default: Desktop\AD-Group-Members.xlsx
+
+.EXAMPLE
+    .\Export-AD-TG-RG-Members.ps1 -TGDomain "aprs.trqns.internal" -RGDomain "mgrt.trqns.internal"
+
+.NOTES
+    Requires the ImportExcel module (Install-Module ImportExcel -Scope CurrentUser).
+    Requires the ActiveDirectory module (RSAT).
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$TGDomain,
+
+    [Parameter(Mandatory = $true)]
+    [string]$RGDomain,
+
+    [string]$TGPrefix = "tg-appequipcloud",
+
+    [string]$RGGroupNamesFile = "$home\Desktop\Prod-RGs.txt",
+
+    [string]$OutputExcelPath = "$home\Desktop\AD-Group-Members.xlsx",
+
+    # Optional: pass -Credential (Get-Credential) if TG/RG domains need different creds
+    # than the account running the script.
+    [System.Management.Automation.PSCredential]$Credential
+)
+
+$ErrorActionPreference = "Stop"
+
+# --- Prereqs -----------------------------------------------------------
+
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    throw "The ActiveDirectory module (RSAT) is not installed on this machine."
+}
+Import-Module ActiveDirectory -ErrorAction Stop
+
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Write-Host "ImportExcel module not found - installing for current user..." -ForegroundColor Yellow
+    Install-Module ImportExcel -Scope CurrentUser -Force -ErrorAction Stop
+}
+Import-Module ImportExcel -ErrorAction Stop
+
+# --- Shared helper: recursively resolve a group's user members ---------
+
+function Get-GroupUserMembers {
+    param(
+        [Parameter(Mandatory)] [string]$GroupName,
+        [Parameter(Mandatory)] [string]$Server,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $adParams = @{
+        Identity  = $GroupName
+        Server    = $Server
+        Recursive = $true   # flattens nested groups down to their user members
+    }
+    if ($Credential) { $adParams["Credential"] = $Credential }
+
+    try {
+        $members = Get-ADGroupMember @adParams -ErrorAction Stop |
+            Where-Object { $_.objectClass -eq "user" }
+    }
+    catch {
+        Write-Warning "Failed to enumerate members of group '$GroupName' on $Server`: $($_.Exception.Message)"
+        return @()
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($member in $members) {
+        try {
+            $userParams = @{
+                Identity   = $member
+                Server     = $Server
+                Properties = @("GivenName", "Surname", "SamAccountName", "EmailAddress", "Enabled")
+            }
+            if ($Credential) { $userParams["Credential"] = $Credential }
+
+            $user = Get-ADUser @userParams -ErrorAction Stop
+
+            $results.Add([PSCustomObject]@{
+                GroupName      = $GroupName
+                GivenName      = $user.GivenName
+                Surname        = $user.Surname
+                SamAccountName = $user.SamAccountName
+                EmailAddress   = $user.EmailAddress
+                Enabled        = $user.Enabled
+            })
+        }
+        catch {
+            Write-Warning "Failed to resolve user '$($member.SamAccountName)' in group '$GroupName': $($_.Exception.Message)"
+        }
+    }
+
+    return $results
+}
+
+# --- TG groups (by prefix) ---------------------------------------------
+
+Write-Host "Fetching TG groups matching prefix '$TGPrefix' on $TGDomain ..." -ForegroundColor Cyan
+
+$tgGroupParams = @{
+    Filter = "Name -like '$TGPrefix*'"
+    Server = $TGDomain
+}
+if ($Credential) { $tgGroupParams["Credential"] = $Credential }
+
+$tgGroups = Get-ADGroup @tgGroupParams -ErrorAction Stop
+
+$tgResults = [System.Collections.Generic.List[object]]::new()
+$i = 0
+foreach ($group in $tgGroups) {
+    $i++
+    Write-Progress -Activity "TG groups" -Status $group.Name -PercentComplete (($i / [Math]::Max($tgGroups.Count,1)) * 100)
+    $groupMembers = Get-GroupUserMembers -GroupName $group.Name -Server $TGDomain -Credential $Credential
+    foreach ($m in $groupMembers) { $tgResults.Add($m) }
+}
+Write-Progress -Activity "TG groups" -Completed
+
+$tgResults = $tgResults | Sort-Object GroupName, SamAccountName -Unique
+
+Write-Host "TG: $($tgGroups.Count) groups, $($tgResults.Count) unique user rows." -ForegroundColor Green
+
+# --- RG groups (from file) ----------------------------------------------
+
+if (-not (Test-Path $RGGroupNamesFile)) {
+    throw "RG group list file not found: $RGGroupNamesFile"
+}
+
+Write-Host "Fetching RG groups listed in '$RGGroupNamesFile' on $RGDomain ..." -ForegroundColor Cyan
+
+$rgGroupNames = Get-Content -Path $RGGroupNamesFile | Where-Object { $_.Trim() -ne "" }
+
+$rgResults = [System.Collections.Generic.List[object]]::new()
+$i = 0
+foreach ($groupName in $rgGroupNames) {
+    $i++
+    Write-Progress -Activity "RG groups" -Status $groupName -PercentComplete (($i / [Math]::Max($rgGroupNames.Count,1)) * 100)
+    $groupMembers = Get-GroupUserMembers -GroupName $groupName -Server $RGDomain -Credential $Credential
+    foreach ($m in $groupMembers) { $rgResults.Add($m) }
+}
+Write-Progress -Activity "RG groups" -Completed
+
+$rgResults = $rgResults | Sort-Object GroupName, SamAccountName -Unique
+
+Write-Host "RG: $($rgGroupNames.Count) groups, $($rgResults.Count) unique user rows." -ForegroundColor Green
+
+# --- Export to a single workbook, two sheets ----------------------------
+
+if (Test-Path $OutputExcelPath) { Remove-Item $OutputExcelPath -Force }
+
+$tgResults | Export-Excel -Path $OutputExcelPath -WorksheetName "TG-Members" -AutoSize -FreezeTopRow -BoldTopRow -TableName "TGMembers"
+$rgResults | Export-Excel -Path $OutputExcelPath -WorksheetName "RG-Members" -AutoSize -FreezeTopRow -BoldTopRow -TableName "RGMembers"
+
+Write-Host "Done. Workbook written to $OutputExcelPath" -ForegroundColor Green
