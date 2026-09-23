@@ -1,13 +1,27 @@
 <#
 .SYNOPSIS
-    Export members of TG-prefixed AD groups and RG groups (from a list file) into a
-    single Excel workbook, one sheet per group type.
+    Export TG-group direct-user members, and the members of the RG groups nested
+    inside those TG groups (a different domain), into one Excel workbook.
 
 .DESCRIPTION
     Replaces two separate scripts (tg-ad-filter / rg-ad-user) with one, parameterized
-    by domain. Uses -Recursive on Get-ADGroupMember so nested groups are properly
-    flattened to their underlying user members, rather than being skipped or logged
-    separately as "ObjectType = Group" rows.
+    by domain. The pipeline is sequential, not two independent lookups:
+
+      1. Query TGDomain for groups matching -TGPrefix.
+      2. For each TG group, get its DIRECT members only (no -Recursive) and split by
+         objectClass:
+           - "user"  -> goes straight into the TG-Members sheet.
+           - "group" -> its SamAccountName is a candidate RG group name. These nested
+             groups actually live in RGDomain, so they can't be expanded against
+             TGDomain (this mirrors the original tg-ad-filter.txt, which only logged
+             them as ObjectType "Group" instead of expanding them).
+      3. Collapse the candidate RG names to unique values - the same RG group can be
+         nested under multiple TG groups, and must only be queried once.
+      4. For each unique RG name, query RGDomain (a different server) -Recursive, so
+         any groups nested *inside* the RG group (within the RG domain itself) are
+         flattened down to their user members.
+      5. De-duplicate the RG sheet by RGName + SamAccountName, in case an RG group's
+         own nested structure produces the same user twice.
 
 .PARAMETER TGDomain
     Domain controller / domain FQDN to query for TG groups (e.g. aprs.trqns.internal).
@@ -17,9 +31,6 @@
 
 .PARAMETER TGPrefix
     Prefix used to find TG groups. Default: tg-appequipcloud
-
-.PARAMETER RGGroupNamesFile
-    Path to a text file listing RG group names, one per line. Default: Desktop\Prod-RGs.txt
 
 .PARAMETER OutputExcelPath
     Path to the output .xlsx file. Default: Desktop\AD-Group-Members.xlsx
@@ -41,8 +52,6 @@ param(
     [string]$RGDomain,
 
     [string]$TGPrefix = "tg-appequipcloud",
-
-    [string]$RGGroupNamesFile = "$home\Desktop\Prod-RGs.txt",
 
     [string]$OutputExcelPath = "$home\Desktop\AD-Group-Members.xlsx",
 
@@ -66,9 +75,70 @@ if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
 }
 Import-Module ImportExcel -ErrorAction Stop
 
-# --- Shared helper: recursively resolve a group's user members ---------
+# --- Helper: resolve a group's DIRECT members, split into users / nested groups ----
 
-function Get-GroupUserMembers {
+function Get-DirectGroupMembers {
+    param(
+        [Parameter(Mandatory)] [string]$GroupName,
+        [Parameter(Mandatory)] [string]$Server,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $adParams = @{
+        Identity = $GroupName
+        Server   = $Server
+        # deliberately NOT -Recursive: nested groups here live in a different domain
+        # and must be resolved separately against RGDomain, not TGDomain.
+    }
+    if ($Credential) { $adParams["Credential"] = $Credential }
+
+    try {
+        $members = Get-ADGroupMember @adParams -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Failed to enumerate members of group '$GroupName' on $Server`: $($_.Exception.Message)"
+        return @{ Users = @(); NestedGroupNames = @() }
+    }
+
+    $userRows = [System.Collections.Generic.List[object]]::new()
+    $nestedGroupNames = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($member in $members) {
+        if ($member.objectClass -eq "user") {
+            try {
+                $userParams = @{
+                    Identity   = $member
+                    Server     = $Server
+                    Properties = @("GivenName", "Surname", "SamAccountName", "EmailAddress", "Enabled")
+                }
+                if ($Credential) { $userParams["Credential"] = $Credential }
+
+                $user = Get-ADUser @userParams -ErrorAction Stop
+
+                $userRows.Add([PSCustomObject]@{
+                    GroupName      = $GroupName
+                    GivenName      = $user.GivenName
+                    Surname        = $user.Surname
+                    SamAccountName = $user.SamAccountName
+                    EmailAddress   = $user.EmailAddress
+                    Enabled        = $user.Enabled
+                })
+            }
+            catch {
+                Write-Warning "Failed to resolve user '$($member.SamAccountName)' in group '$GroupName': $($_.Exception.Message)"
+            }
+        }
+        elseif ($member.objectClass -eq "group") {
+            $nestedGroupNames.Add($member.SamAccountName)
+        }
+    }
+
+    return @{ Users = $userRows; NestedGroupNames = $nestedGroupNames }
+}
+
+# --- Helper: resolve a group's members RECURSIVELY (single domain) ----
+
+function Get-RecursiveGroupUserMembers {
     param(
         [Parameter(Mandatory)] [string]$GroupName,
         [Parameter(Mandatory)] [string]$Server,
@@ -78,7 +148,7 @@ function Get-GroupUserMembers {
     $adParams = @{
         Identity  = $GroupName
         Server    = $Server
-        Recursive = $true   # flattens nested groups down to their user members
+        Recursive = $true   # flattens any groups nested within RGDomain itself
     }
     if ($Credential) { $adParams["Credential"] = $Credential }
 
@@ -105,7 +175,7 @@ function Get-GroupUserMembers {
             $user = Get-ADUser @userParams -ErrorAction Stop
 
             $results.Add([PSCustomObject]@{
-                GroupName      = $GroupName
+                RGName         = $GroupName
                 GivenName      = $user.GivenName
                 Surname        = $user.Surname
                 SamAccountName = $user.SamAccountName
@@ -121,7 +191,7 @@ function Get-GroupUserMembers {
     return $results
 }
 
-# --- TG groups (by prefix) ---------------------------------------------
+# --- Step 1-3: TG groups -> TG user members + unique candidate RG names ----
 
 Write-Host "Fetching TG groups matching prefix '$TGPrefix' on $TGDomain ..." -ForegroundColor Cyan
 
@@ -133,43 +203,45 @@ if ($Credential) { $tgGroupParams["Credential"] = $Credential }
 
 $tgGroups = Get-ADGroup @tgGroupParams -ErrorAction Stop
 
-$tgResults = [System.Collections.Generic.List[object]]::new()
+$tgResults           = [System.Collections.Generic.List[object]]::new()
+$rgNameCandidates    = [System.Collections.Generic.List[string]]::new()
+
 $i = 0
 foreach ($group in $tgGroups) {
     $i++
     Write-Progress -Activity "TG groups" -Status $group.Name -PercentComplete (($i / [Math]::Max($tgGroups.Count,1)) * 100)
-    $groupMembers = Get-GroupUserMembers -GroupName $group.Name -Server $TGDomain -Credential $Credential
-    foreach ($m in $groupMembers) { $tgResults.Add($m) }
+
+    $direct = Get-DirectGroupMembers -GroupName $group.Name -Server $TGDomain -Credential $Credential
+
+    foreach ($u in $direct.Users) { $tgResults.Add($u) }
+    foreach ($ng in $direct.NestedGroupNames) { $rgNameCandidates.Add($ng) }
 }
 Write-Progress -Activity "TG groups" -Completed
 
 $tgResults = $tgResults | Sort-Object GroupName, SamAccountName -Unique
 
-Write-Host "TG: $($tgGroups.Count) groups, $($tgResults.Count) unique user rows." -ForegroundColor Green
+# Unique RG group names, regardless of how many TG groups they were nested under.
+$uniqueRGNames = $rgNameCandidates | Sort-Object -Unique
 
-# --- RG groups (from file) ----------------------------------------------
+Write-Host "TG: $($tgGroups.Count) groups, $($tgResults.Count) unique user rows, $($uniqueRGNames.Count) unique nested RG group names." -ForegroundColor Green
 
-if (-not (Test-Path $RGGroupNamesFile)) {
-    throw "RG group list file not found: $RGGroupNamesFile"
-}
+# --- Step 4-5: unique RG group names -> RG user members (from RGDomain) ----
 
-Write-Host "Fetching RG groups listed in '$RGGroupNamesFile' on $RGDomain ..." -ForegroundColor Cyan
-
-$rgGroupNames = Get-Content -Path $RGGroupNamesFile | Where-Object { $_.Trim() -ne "" }
+Write-Host "Fetching RG group members for $($uniqueRGNames.Count) unique RG group(s) on $RGDomain ..." -ForegroundColor Cyan
 
 $rgResults = [System.Collections.Generic.List[object]]::new()
 $i = 0
-foreach ($groupName in $rgGroupNames) {
+foreach ($rgName in $uniqueRGNames) {
     $i++
-    Write-Progress -Activity "RG groups" -Status $groupName -PercentComplete (($i / [Math]::Max($rgGroupNames.Count,1)) * 100)
-    $groupMembers = Get-GroupUserMembers -GroupName $groupName -Server $RGDomain -Credential $Credential
+    Write-Progress -Activity "RG groups" -Status $rgName -PercentComplete (($i / [Math]::Max($uniqueRGNames.Count,1)) * 100)
+    $groupMembers = Get-RecursiveGroupUserMembers -GroupName $rgName -Server $RGDomain -Credential $Credential
     foreach ($m in $groupMembers) { $rgResults.Add($m) }
 }
 Write-Progress -Activity "RG groups" -Completed
 
-$rgResults = $rgResults | Sort-Object GroupName, SamAccountName -Unique
+$rgResults = $rgResults | Sort-Object RGName, SamAccountName -Unique
 
-Write-Host "RG: $($rgGroupNames.Count) groups, $($rgResults.Count) unique user rows." -ForegroundColor Green
+Write-Host "RG: $($uniqueRGNames.Count) groups, $($rgResults.Count) unique user rows." -ForegroundColor Green
 
 # --- Export to a single workbook, two sheets ----------------------------
 
