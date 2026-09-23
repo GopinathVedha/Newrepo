@@ -1,106 +1,131 @@
-Lambda 1
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "EC2ReadAndControl",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances",
-        "ec2:DescribeInstanceStatus",
-        "ec2:StartInstances",
-        "ec2:StopInstances",
-        "ec2:ModifyInstanceAttribute",
-        "ec2:CreateTags"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "PublishNotifications",
-      "Effect": "Allow",
-      "Action": "sns:Publish",
-      "Resource": [
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start",
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop",
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback"
-      ]
-    },
-    {
-      "Sid": "IdentityLookup",
-      "Effect": "Allow",
-      "Action": "sts:GetCallerIdentity",
-      "Resource": "*"
-    },
-    {
-      "Sid": "CreateDelayedInvocation",
-      "Effect": "Allow",
-      "Action": "scheduler:CreateSchedule",
-      "Resource": "arn:aws:scheduler:ap-southeast-2:050557606111:schedule/default/ec2-autoscheduler-status-*"
-    },
-    {
-      "Sid": "AllowPassingSchedulerRole",
-      "Effect": "Allow",
-      "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole"
-    }
-  ]
-}
-
-
-Lambda 2
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "EC2ReadAndRestore",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances",
-        "ec2:DescribeInstanceStatus",
-        "ec2:ModifyInstanceAttribute",
-        "ec2:DeleteTags"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "PublishNotifications",
-      "Effect": "Allow",
-      "Action": "sns:Publish",
-      "Resource": [
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start",
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop",
-        "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback"
-      ]
-    },
-    {
-      "Sid": "IdentityLookup",
-      "Effect": "Allow",
-      "Action": "sts:GetCallerIdentity",
-      "Resource": "*"
-    }
-  ]
-}
-
-Trust:
+EC2AutoschedulerCrossAccountRole
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": { "Service": "scheduler.amazonaws.com" },
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::050557606111:role/EC2Autoscheduler-ActionLambdaRole",
+          "arn:aws:iam::050557606111:role/EC2Autoscheduler-StatusLambdaRole"
+        ]
+      },
       "Action": "sts:AssumeRole"
     }
   ]
 }
 
-Policy:
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "EC2AutoschedulerActions",
       "Effect": "Allow",
-      "Action": "lambda:InvokeFunction",
-      "Resource": "arn:aws:lambda:ap-southeast-2:050557606111:function:ec2_autoscheduler_status"
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:StartInstances",
+                 "ec2:StopInstances", "ec2:RebootInstances", "ec2:ModifyInstanceAttribute",
+                 "ec2:CreateTags", "ec2:DeleteTags"],
+      "Resource": "*"
     }
+  ]
+}
+
+Central account Lambda 1:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OwnAccountEC2",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:StartInstances",
+                 "ec2:StopInstances", "ec2:ModifyInstanceAttribute", "ec2:CreateTags", "ec2:DeleteTags"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AssumeSpokeRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::222222222222:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::333333333333:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::444444444444:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::555555555555:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::666666666666:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::777777777777:role/EC2AutoschedulerCrossAccountRole"
+      ]
+    },
+    {
+      "Sid": "ReadConfig",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": ["arn:aws:ssm:ap-southeast-2:050557606111:parameter/autoscheduler/Holidays",
+                   "arn:aws:ssm:ap-southeast-2:050557606111:parameter/autoscheduler/Accounts"]
+    },
+    {
+      "Sid": "PublishNotifications",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": ["arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start",
+                   "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop",
+                   "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback"]
+    },
+    {
+      "Sid": "ScheduleStatusCheck",
+      "Effect": "Allow",
+      "Action": "scheduler:CreateSchedule",
+      "Resource": "arn:aws:scheduler:ap-southeast-2:050557606111:schedule/default/ec2-autoscheduler-status-*"
+    },
+    {
+      "Sid": "PassSchedulerRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole"
+    },
+    {"Sid": "IdentityLookup", "Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}
+  ]
+}
+General account Lambda 2:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OwnAccountEC2",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus",
+                 "ec2:ModifyInstanceAttribute", "ec2:DeleteTags", "ec2:RebootInstances"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AssumeSpokeRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::222222222222:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::333333333333:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::444444444444:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::555555555555:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::666666666666:role/EC2AutoschedulerCrossAccountRole",
+        "arn:aws:iam::777777777777:role/EC2AutoschedulerCrossAccountRole"
+      ]
+    },
+    {
+      "Sid": "PublishNotifications",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": ["arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback",
+                   "arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_health_check"]
+    },
+    {
+      "Sid": "ScheduleRebootRecheck",
+      "Effect": "Allow",
+      "Action": "scheduler:CreateSchedule",
+      "Resource": "arn:aws:scheduler:ap-southeast-2:050557606111:schedule/default/ec2-autoscheduler-reboot-recheck-*"
+    },
+    {
+      "Sid": "PassSchedulerRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole"
+    },
+    {"Sid": "IdentityLookup", "Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}
   ]
 }
