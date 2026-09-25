@@ -1,1 +1,7 @@
-SamAccountName
+Import-Module : Could not load file or assembly 'file:///C:\Users\a-vedachalamg\Documents\WindowsPowerShell\Modules\ImportExcel\7.8.10\EPPlus.dll' or one of its dependencies. Access is
+denied.
+At line:1 char:1
++ Import-Module ImportExcel -Force
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [Import-Module], FileLoadException
+    + FullyQualifiedErrorId : FormatXmlUpdateException,Microsoft.PowerShell.Commands.ImportModuleCommand
