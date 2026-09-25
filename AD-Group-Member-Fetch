@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Export TG-group direct-user members, and the members of the RG groups nested
-    inside those TG groups (a different domain), into one Excel workbook.
+    inside those TG groups (a different domain), into two CSV files.
 
 .DESCRIPTION
     Replaces two separate scripts (tg-ad-filter / rg-ad-user) with one, parameterized
@@ -32,15 +32,21 @@
 .PARAMETER TGPrefix
     Prefix used to find TG groups. Default: tg-appequipcloud
 
-.PARAMETER OutputExcelPath
-    Path to the output .xlsx file. Default: Desktop\AD-Group-Members.xlsx
+.PARAMETER TGOutputCsvPath
+    Path to the TG-Members output CSV. Default: Desktop\TG-Members.csv
+
+.PARAMETER RGOutputCsvPath
+    Path to the RG-Members output CSV. Default: Desktop\RG-Members.csv
 
 .EXAMPLE
     .\Export-AD-TG-RG-Members.ps1 -TGDomain "aprs.trqns.internal" -RGDomain "mgrt.trqns.internal"
 
 .NOTES
-    Requires the ImportExcel module (Install-Module ImportExcel -Scope CurrentUser).
-    Requires the ActiveDirectory module (RSAT).
+    Requires the ActiveDirectory module (RSAT). No third-party module needed - CSV
+    export uses PowerShell's built-in Export-Csv, so there's nothing to install and
+    no risk of the "Access is denied" EPPlus.dll load error some locked-down machines
+    throw for Install-Module'd binaries (Windows blocks a downloaded DLL's "Zone.Identifier"
+    unless it's explicitly unblocked - Export-Csv has no such dependency).
 #>
 
 [CmdletBinding()]
@@ -53,7 +59,9 @@ param(
 
     [string]$TGPrefix = "tg-appequipcloud",
 
-    [string]$OutputExcelPath = "$home\Desktop\AD-Group-Members.xlsx",
+    [string]$TGOutputCsvPath = "$home\Desktop\TG-Members.csv",
+
+    [string]$RGOutputCsvPath = "$home\Desktop\RG-Members.csv",
 
     # Optional: pass -Credential (Get-Credential) if TG/RG domains need different creds
     # than the account running the script.
@@ -68,12 +76,6 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
     throw "The ActiveDirectory module (RSAT) is not installed on this machine."
 }
 Import-Module ActiveDirectory -ErrorAction Stop
-
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Write-Host "ImportExcel module not found - installing for current user..." -ForegroundColor Yellow
-    Install-Module ImportExcel -Scope CurrentUser -Force -ErrorAction Stop
-}
-Import-Module ImportExcel -ErrorAction Stop
 
 # --- Helper: resolve a group's DIRECT members, split into users / nested groups ----
 
@@ -243,11 +245,11 @@ $rgResults = $rgResults | Sort-Object RGName, SamAccountName -Unique
 
 Write-Host "RG: $($uniqueRGNames.Count) groups, $($rgResults.Count) unique user rows." -ForegroundColor Green
 
-# --- Export to a single workbook, two sheets ----------------------------
+# --- Export to two separate CSV files ------------------------------------
 
-if (Test-Path $OutputExcelPath) { Remove-Item $OutputExcelPath -Force }
+$tgResults | Export-Csv -Path $TGOutputCsvPath -NoTypeInformation -Encoding UTF8
+$rgResults | Export-Csv -Path $RGOutputCsvPath -NoTypeInformation -Encoding UTF8
 
-$tgResults | Export-Excel -Path $OutputExcelPath -WorksheetName "TG-Members" -AutoSize -FreezeTopRow -BoldTopRow -TableName "TGMembers"
-$rgResults | Export-Excel -Path $OutputExcelPath -WorksheetName "RG-Members" -AutoSize -FreezeTopRow -BoldTopRow -TableName "RGMembers"
-
-Write-Host "Done. Workbook written to $OutputExcelPath" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
+Write-Host "  TG members: $TGOutputCsvPath ($($tgResults.Count) rows)" -ForegroundColor Green
+Write-Host "  RG members: $RGOutputCsvPath ($($rgResults.Count) rows)" -ForegroundColor Green
