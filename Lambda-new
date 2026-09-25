@@ -1,9 +1,1 @@
-WARNING: Error initializing default drive: 'Unable to contact the server. This may be because this server does not exist, it is currently down, or it does not have the Active Directory Web
- Services running.'.
-Fetching TG groups matching prefix 'tg-appequipcloud' on appst.transnp.internal ...
-Get-ADGroup : Unable to contact the server. This may be because this server does not exist, it is currently down, or it does not have the Active Directory Web Services running.
-At C:\Users\a-vedachalamg\Downloads\Export-AD-TG-RG-Members.ps1:206 char:13
-+ $tgGroups = Get-ADGroup @tgGroupParams -ErrorAction Stop
-+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ResourceUnavailable: (:) [Get-ADGroup], ADServerDownException
-    + FullyQualifiedErrorId : ActiveDirectoryServer:0,Microsoft.ActiveDirectory.Management.Commands.GetADGroup
+
