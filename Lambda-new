@@ -1,7 +1,9 @@
-Import-Module : Could not load file or assembly 'file:///C:\Users\a-vedachalamg\Documents\WindowsPowerShell\Modules\ImportExcel\7.8.10\EPPlus.dll' or one of its dependencies. Access is
-denied.
-At line:1 char:1
-+ Import-Module ImportExcel -Force
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [Import-Module], FileLoadException
-    + FullyQualifiedErrorId : FormatXmlUpdateException,Microsoft.PowerShell.Commands.ImportModuleCommand
+WARNING: Error initializing default drive: 'Unable to contact the server. This may be because this server does not exist, it is currently down, or it does not have the Active Directory Web
+ Services running.'.
+Fetching TG groups matching prefix 'tg-appequipcloud' on appst.transnp.internal ...
+Get-ADGroup : Unable to contact the server. This may be because this server does not exist, it is currently down, or it does not have the Active Directory Web Services running.
+At C:\Users\a-vedachalamg\Downloads\Export-AD-TG-RG-Members.ps1:206 char:13
++ $tgGroups = Get-ADGroup @tgGroupParams -ErrorAction Stop
++             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ResourceUnavailable: (:) [Get-ADGroup], ADServerDownException
+    + FullyQualifiedErrorId : ActiveDirectoryServer:0,Microsoft.ActiveDirectory.Management.Commands.GetADGroup
