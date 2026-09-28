@@ -1,1 +1,8 @@
-
+SQL Server version and edition. This decides whether WAIT_AT_LOW_PRIORITY and online rebuilds are available.
+Per database and per file: size, used space, and free space, from the query in step 1.
+Recovery model, plus any Availability Group, log shipping, or replication.
+Storage type and IOPS/throughput; CPU and RAM.
+Peak hours and available maintenance windows.
+Schedules for backups, index maintenance, and CHECKDB.
+The largest tables and indexes, and whether there is heavy LOB data or heaps.
+How much free space you want to keep for growth.
