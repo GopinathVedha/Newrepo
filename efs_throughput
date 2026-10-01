@@ -18,6 +18,13 @@ Usage:
   python3 efs_throughput_report.py --fs-id fs-0123abcd     # one file system
   python3 efs_throughput_report.py --days 30               # longer window (uses 5-min data)
   python3 efs_throughput_report.py --tz Asia/Kolkata       # show times in another zone
+  python3 efs_throughput_report.py --csv-prefix sydney_efs # CSV file name prefix
+
+CSV output (written to the current folder every run, in addition to the screen report):
+  <prefix>_summary.csv     one row per file system with all the key figures
+  <prefix>_hourly.csv      hour-of-day profile per file system (local time)
+  <prefix>_timeseries.csv  every data point: local + UTC time, metered/read/write MiB/s,
+                           PercentIOLimit — open in Excel to chart or pivot
 
 Required IAM permissions:
   elasticfilesystem:DescribeFileSystems
@@ -25,6 +32,7 @@ Required IAM permissions:
 """
 
 import argparse
+import csv
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
