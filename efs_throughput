@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""
+EFS throughput sizing report.
+
+For each EFS file system it prints:
+  - throughput / performance mode and current provisioned value
+  - storage size (total, Standard, IA, Archive) and the free baseline from Standard storage
+  - MeteredIOBytes as MiB/s: window average, p50 / p95 / p99, max,
+    and the highest 15-minute sustained average
+  - raw read / write throughput split (DataReadIOBytes / DataWriteIOBytes)
+  - PercentIOLimit (General Purpose mode only)
+  - the 5 busiest minutes (shown in IST)
+  - a suggested starting value for Provisioned throughput
+
+Usage:
+  python3 efs_throughput_report.py                         # all file systems, last 14 days
+  python3 efs_throughput_report.py --fs-id fs-0123abcd     # one file system
+  python3 efs_throughput_report.py --days 30               # longer window (uses 5-min data)
+
+Required IAM permissions:
+  elasticfilesystem:DescribeFileSystems
+  cloudwatch:GetMetricData
+"""
+
+import argparse
+import math
+from datetime import datetime, timedelta, timezone
+
+import boto3
+
+MIB = 1024 ** 2
+GIB = 1024 ** 3
+TIB = 1024 ** 4
+IST = timezone(timedelta(hours=5, minutes=30))
+BASELINE_MIBPS_PER_TIB = 50   # baseline throughput from Standard storage
+HEADROOM = 1.25               # 25% headroom on top of sustained peak
+SUSTAINED_WINDOW_MIN = 15     # minutes used for the "sustained peak" figure
+
+
+def fetch_metric(cw, fs_id, metric, stat, period, start, end):
+    """Return {timestamp: value} for one EFS metric, following pagination."""
+    query = [{
+        "Id": "m",
+        "MetricStat": {
+            "Metric": {
+                "Namespace": "AWS/EFS",
+                "MetricName": metric,
+                "Dimensions": [{"Name": "FileSystemId", "Value": fs_id}],
+            },
+            "Period": period,
+            "Stat": stat,
+        },
+        "ReturnData": True,
+    }]
+    points, token = {}, None
+    while True:
+        kwargs = dict(MetricDataQueries=query, StartTime=start, EndTime=end,
+                      ScanBy="TimestampAscending")
+        if token:
+            kwargs["NextToken"] = token
+        resp = cw.get_metric_data(**kwargs)
+        for result in resp["MetricDataResults"]:
+            points.update(zip(result["Timestamps"], result["Values"]))
+        token = resp.get("NextToken")
+        if not token:
+            return points
+
+
+def percentile(sorted_vals, p):
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * p / 100
+    lo, hi = math.floor(k), math.ceil(k)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
+
+
+def to_mibps(points, period):
+    """Convert per-period byte sums into an ordered list of (timestamp, MiB/s)."""
+    return [(ts, v / period / MIB) for ts, v in sorted(points.items())]
+
+
+def sustained_peak(series, period):
+    """Highest rolling average over SUSTAINED_WINDOW_MIN minutes."""
+    n = max(1, (SUSTAINED_WINDOW_MIN * 60) // period)
+    vals = [v for _, v in series]
+    if len(vals) < n:
+        return max(vals, default=0.0)
+    window = sum(vals[:n])
+    best = window
+    for i in range(n, len(vals)):
+        window += vals[i] - vals[i - n]
+        best = max(best, window)
+    return best / n
+
+
+def fmt_gib(b):
+    return f"{b / GIB:,.1f} GiB"
+
+
+def report(efs_fs, cw, days, period):
+    fs_id = efs_fs["FileSystemId"]
+    name = efs_fs.get("Name", "-")
+    size = efs_fs["SizeInBytes"]
+    standard = size.get("ValueInStandard", size["Value"])
+    baseline = standard / TIB * BASELINE_MIBPS_PER_TIB
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    window_seconds = (end - start).total_seconds()
+
+    metered = fetch_metric(cw, fs_id, "MeteredIOBytes", "Sum", period, start, end)
+    reads = fetch_metric(cw, fs_id, "DataReadIOBytes", "Sum", period, start, end)
+    writes = fetch_metric(cw, fs_id, "DataWriteIOBytes", "Sum", period, start, end)
+    io_limit = {}
+    if efs_fs.get("PerformanceMode") == "generalPurpose":
+        io_limit = fetch_metric(cw, fs_id, "PercentIOLimit", "Maximum", period, start, end)
+
+    series = to_mibps(metered, period)
+    vals = sorted(v for _, v in series)
+    # Average over the whole window (periods with no I/O count as zero)
+    avg = sum(metered.values()) / window_seconds / MIB
+    p50, p95, p99 = (percentile(vals, p) for p in (50, 95, 99))
+    peak = vals[-1] if vals else 0.0
+    sustained = sustained_peak(series, period)
+
+    read_vals = sorted(v for _, v in to_mibps(reads, period))
+    write_vals = sorted(v for _, v in to_mibps(writes, period))
+
+    # Suggested provisioned value: the larger of sustained peak and p99, plus headroom
+    target = max(sustained, p99) * HEADROOM
+    suggested = max(1, math.ceil(target / 10) * 10)
+
+    line = "=" * 72
+    print(line)
+    print(f"File system     : {fs_id}  ({name})")
+    print(f"Throughput mode : {efs_fs['ThroughputMode']}"
+          + (f"  (provisioned {efs_fs['ProvisionedThroughputInMibps']:.0f} MiB/s)"
+             if efs_fs.get("ProvisionedThroughputInMibps") else ""))
+    print(f"Performance mode: {efs_fs.get('PerformanceMode')}")
+    print(f"Window          : last {days} days, {period}s data points ({len(series)} points)")
+    print()
+    print("Storage")
+    print(f"  Total         : {fmt_gib(size['Value'])}")
+    print(f"  Standard      : {fmt_gib(standard)}")
+    print(f"  IA            : {fmt_gib(size.get('ValueInIA', 0))}")
+    print(f"  Archive       : {fmt_gib(size.get('ValueInArchive', 0))}")
+    print(f"  Free baseline : {baseline:,.1f} MiB/s  (50 MiB/s per TiB of Standard)")
+    print()
+    print("Metered throughput (MiB/s)  — this is what counts against your limit")
+    print(f"  Average       : {avg:,.1f}")
+    print(f"  p50 / p95 / p99: {p50:,.1f} / {p95:,.1f} / {p99:,.1f}")
+    print(f"  Max (1 period): {peak:,.1f}")
+    print(f"  Sustained peak: {sustained:,.1f}  (best {SUSTAINED_WINDOW_MIN}-min average)")
+    print()
+    print("Raw data throughput (MiB/s)  — p99 / max")
+    print(f"  Read          : {percentile(read_vals, 99):,.1f} / {max(read_vals, default=0):,.1f}")
+    print(f"  Write         : {percentile(write_vals, 99):,.1f} / {max(write_vals, default=0):,.1f}")
+    if io_limit:
+        print(f"  PercentIOLimit max: {max(io_limit.values()):.1f}%  "
+              "(near 100% = IOPS bottleneck, more throughput won't help)")
+    print()
+    print("Top 5 busiest periods (IST)")
+    for ts, v in sorted(series, key=lambda x: x[1], reverse=True)[:5]:
+        print(f"  {ts.astimezone(IST):%Y-%m-%d %H:%M}  {v:,.1f} MiB/s")
+    print()
+    print(f"Suggested starting Provisioned throughput: {suggested} MiB/s")
+    print(f"  (max of sustained peak and p99, +{int((HEADROOM - 1) * 100)}% headroom)")
+    if baseline >= suggested:
+        print("  Note: your free baseline already covers this, so Provisioned adds no "
+              "throughput cost and Bursting may be enough.")
+    else:
+        print(f"  Billed portion ≈ {suggested - baseline:,.1f} MiB/s above the free baseline.")
+    if p99 > 0 and peak / max(p99, 0.001) > 5:
+        print("  Note: max is far above p99 — the workload is spiky. Elastic may be "
+              "cheaper than provisioning for these peaks.")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="EFS throughput sizing report")
+    parser.add_argument("--region", default="ap-southeast-2")
+    parser.add_argument("--fs-id", help="Only report on this file system")
+    parser.add_argument("--days", type=int, default=14,
+                        help="Look-back window (1-min data is kept 15 days, "
+                             "5-min data 63 days)")
+    args = parser.parse_args()
+
+    # CloudWatch keeps 1-minute data for 15 days; beyond that use 5-minute data
+    period = 60 if args.days <= 15 else 300
+    if args.days > 63:
+        print("Warning: beyond 63 days only 1-hour data exists; using 3600s period.")
+        period = 3600
+
+    efs = boto3.client("efs", region_name=args.region)
+    cw = boto3.client("cloudwatch", region_name=args.region)
+
+    kwargs = {"FileSystemId": args.fs_id} if args.fs_id else {}
+    for page in efs.get_paginator("describe_file_systems").paginate(**kwargs):
+        for fs in page["FileSystems"]:
+            report(fs, cw, args.days, period)
+
+
+if __name__ == "__main__":
+    main()
