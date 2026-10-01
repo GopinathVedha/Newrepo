@@ -34,6 +34,7 @@ Required IAM permissions:
 import argparse
 import csv
 import math
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -215,6 +216,80 @@ def report(efs_fs, cw, days, period, tz):
               "cheaper than provisioning for these peaks.")
     print()
 
+    # ---- rows for the CSV files ----
+    r2 = lambda x: round(x, 2)
+    summary_row = {
+        "file_system_id": fs_id,
+        "name": name,
+        "throughput_mode": efs_fs["ThroughputMode"],
+        "current_provisioned_mibps": efs_fs.get("ProvisionedThroughputInMibps", ""),
+        "performance_mode": efs_fs.get("PerformanceMode"),
+        "window_start_local": fmt_ts(start, tz),
+        "window_end_local": fmt_ts(end, tz),
+        "days": days,
+        "period_seconds": period,
+        "total_gib": r2(size["Value"] / GIB),
+        "standard_gib": r2(standard / GIB),
+        "ia_gib": r2(size.get("ValueInIA", 0) / GIB),
+        "archive_gib": r2(size.get("ValueInArchive", 0) / GIB),
+        "free_baseline_mibps": r2(baseline),
+        "metered_avg_mibps": r2(avg),
+        "metered_p50_mibps": r2(p50),
+        "metered_p95_mibps": r2(p95),
+        "metered_p99_mibps": r2(p99),
+        "metered_max_mibps": r2(peak),
+        "sustained_peak_15min_mibps": r2(sustained),
+        "sustained_peak_start_local": fmt_ts(sustained_at, tz) if sustained_at else "",
+        "read_p99_mibps": r2(percentile(read_vals, 99)),
+        "read_max_mibps": r2(max(read_vals, default=0)),
+        "write_p99_mibps": r2(percentile(write_vals, 99)),
+        "write_max_mibps": r2(max(write_vals, default=0)),
+        "percent_io_limit_max": r2(max(io_limit.values())) if io_limit else "",
+        "suggested_provisioned_mibps": suggested,
+        "billed_above_baseline_mibps": r2(max(0, suggested - baseline)),
+    }
+
+    hourly_rows = []
+    for h in range(24):
+        hv = by_hour.get(h, [])
+        hourly_rows.append({
+            "file_system_id": fs_id,
+            "hour_local": f"{h:02d}:00",
+            "data_points": len(hv),
+            "avg_mibps": r2(sum(hv) / len(hv)) if hv else "",
+            "p95_mibps": r2(percentile(sorted(hv), 95)) if hv else "",
+            "max_mibps": r2(max(hv)) if hv else "",
+        })
+
+    read_map = dict(to_mibps(reads, period))
+    write_map = dict(to_mibps(writes, period))
+    ts_rows = []
+    for ts, v in series:
+        local = ts.astimezone(tz)
+        ts_rows.append({
+            "file_system_id": fs_id,
+            "time_local": local.strftime("%Y-%m-%d %H:%M"),
+            "tz": local.strftime("%Z"),
+            "weekday": local.strftime("%a"),
+            "time_utc": ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "metered_mibps": r2(v),
+            "read_mibps": r2(read_map.get(ts, 0.0)),
+            "write_mibps": r2(write_map.get(ts, 0.0)),
+            "percent_io_limit": r2(io_limit[ts]) if ts in io_limit else "",
+        })
+
+    return summary_row, hourly_rows, ts_rows
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved {os.path.abspath(path)}  ({len(rows)} rows)")
+
 
 def main():
     parser = argparse.ArgumentParser(description="EFS throughput sizing report")
@@ -225,6 +300,8 @@ def main():
                              "5-min data 63 days)")
     parser.add_argument("--tz", default="Australia/Sydney",
                         help="Time zone for displayed times (default Australia/Sydney)")
+    parser.add_argument("--csv-prefix", default="efs_report",
+                        help="Prefix for the CSV files (default efs_report)")
     args = parser.parse_args()
     tz = ZoneInfo(args.tz)
 
@@ -237,10 +314,22 @@ def main():
     efs = boto3.client("efs", region_name=args.region)
     cw = boto3.client("cloudwatch", region_name=args.region)
 
+    summary, hourly, timeseries = [], [], []
     kwargs = {"FileSystemId": args.fs_id} if args.fs_id else {}
     for page in efs.get_paginator("describe_file_systems").paginate(**kwargs):
         for fs in page["FileSystems"]:
-            report(fs, cw, args.days, period, tz)
+            try:
+                s, h, t = report(fs, cw, args.days, period, tz)
+            except Exception as e:  # keep going so the other file systems still get saved
+                print(f"ERROR on {fs['FileSystemId']}: {e}\n")
+                continue
+            summary.append(s)
+            hourly.extend(h)
+            timeseries.extend(t)
+
+    write_csv(f"{args.csv_prefix}_summary.csv", summary)
+    write_csv(f"{args.csv_prefix}_hourly.csv", hourly)
+    write_csv(f"{args.csv_prefix}_timeseries.csv", timeseries)
 
 
 if __name__ == "__main__":
