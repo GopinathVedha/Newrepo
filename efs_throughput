@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-EFS throughput sizing report.
+EFS throughput sizing report (times shown in Sydney local time, AEST/AEDT).
 
 For each EFS file system it prints:
   - throughput / performance mode and current provisioned value
   - storage size (total, Standard, IA, Archive) and the free baseline from Standard storage
   - MeteredIOBytes as MiB/s: window average, p50 / p95 / p99, max,
-    and the highest 15-minute sustained average
+    and the highest 15-minute sustained average (with when it happened)
   - raw read / write throughput split (DataReadIOBytes / DataWriteIOBytes)
   - PercentIOLimit (General Purpose mode only)
-  - the 5 busiest minutes (shown in IST)
+  - the 5 busiest periods
+  - an hour-of-day profile (average and max per Sydney hour) to show peak hours
   - a suggested starting value for Provisioned throughput
 
 Usage:
   python3 efs_throughput_report.py                         # all file systems, last 14 days
   python3 efs_throughput_report.py --fs-id fs-0123abcd     # one file system
   python3 efs_throughput_report.py --days 30               # longer window (uses 5-min data)
+  python3 efs_throughput_report.py --tz Asia/Kolkata       # show times in another zone
 
 Required IAM permissions:
   elasticfilesystem:DescribeFileSystems
@@ -24,14 +26,15 @@ Required IAM permissions:
 
 import argparse
 import math
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import boto3
 
 MIB = 1024 ** 2
 GIB = 1024 ** 3
 TIB = 1024 ** 4
-IST = timezone(timedelta(hours=5, minutes=30))
 BASELINE_MIBPS_PER_TIB = 50   # baseline throughput from Standard storage
 HEADROOM = 1.25               # 25% headroom on top of sustained peak
 SUSTAINED_WINDOW_MIN = 15     # minutes used for the "sustained peak" figure
@@ -80,24 +83,33 @@ def to_mibps(points, period):
 
 
 def sustained_peak(series, period):
-    """Highest rolling average over SUSTAINED_WINDOW_MIN minutes."""
+    """Highest rolling average over SUSTAINED_WINDOW_MIN minutes, and when it started."""
     n = max(1, (SUSTAINED_WINDOW_MIN * 60) // period)
+    if not series:
+        return 0.0, None
+    if len(series) < n:
+        ts, v = max(series, key=lambda x: x[1])
+        return v, ts
     vals = [v for _, v in series]
-    if len(vals) < n:
-        return max(vals, default=0.0)
     window = sum(vals[:n])
-    best = window
+    best, best_i = window, 0
     for i in range(n, len(vals)):
         window += vals[i] - vals[i - n]
-        best = max(best, window)
-    return best / n
+        if window > best:
+            best, best_i = window, i - n + 1
+    return best / n, series[best_i][0]
 
 
 def fmt_gib(b):
     return f"{b / GIB:,.1f} GiB"
 
 
-def report(efs_fs, cw, days, period):
+def fmt_ts(ts, tz):
+    # %Z prints AEST or AEDT automatically depending on daylight saving
+    return ts.astimezone(tz).strftime("%Y-%m-%d %a %H:%M %Z")
+
+
+def report(efs_fs, cw, days, period, tz):
     fs_id = efs_fs["FileSystemId"]
     name = efs_fs.get("Name", "-")
     size = efs_fs["SizeInBytes"]
@@ -121,10 +133,15 @@ def report(efs_fs, cw, days, period):
     avg = sum(metered.values()) / window_seconds / MIB
     p50, p95, p99 = (percentile(vals, p) for p in (50, 95, 99))
     peak = vals[-1] if vals else 0.0
-    sustained = sustained_peak(series, period)
+    sustained, sustained_at = sustained_peak(series, period)
 
     read_vals = sorted(v for _, v in to_mibps(reads, period))
     write_vals = sorted(v for _, v in to_mibps(writes, period))
+
+    # Hour-of-day profile in the chosen time zone
+    by_hour = defaultdict(list)
+    for ts, v in series:
+        by_hour[ts.astimezone(tz).hour].append(v)
 
     # Suggested provisioned value: the larger of sustained peak and p99, plus headroom
     target = max(sustained, p99) * HEADROOM
@@ -137,7 +154,8 @@ def report(efs_fs, cw, days, period):
           + (f"  (provisioned {efs_fs['ProvisionedThroughputInMibps']:.0f} MiB/s)"
              if efs_fs.get("ProvisionedThroughputInMibps") else ""))
     print(f"Performance mode: {efs_fs.get('PerformanceMode')}")
-    print(f"Window          : last {days} days, {period}s data points ({len(series)} points)")
+    print(f"Window          : {fmt_ts(start, tz)}  ->  {fmt_ts(end, tz)}")
+    print(f"                  {days} days, {period}s data points ({len(series)} points)")
     print()
     print("Storage")
     print(f"  Total         : {fmt_gib(size['Value'])}")
@@ -150,7 +168,8 @@ def report(efs_fs, cw, days, period):
     print(f"  Average       : {avg:,.1f}")
     print(f"  p50 / p95 / p99: {p50:,.1f} / {p95:,.1f} / {p99:,.1f}")
     print(f"  Max (1 period): {peak:,.1f}")
-    print(f"  Sustained peak: {sustained:,.1f}  (best {SUSTAINED_WINDOW_MIN}-min average)")
+    print(f"  Sustained peak: {sustained:,.1f}  (best {SUSTAINED_WINDOW_MIN}-min average"
+          + (f", starting {fmt_ts(sustained_at, tz)})" if sustained_at else ")"))
     print()
     print("Raw data throughput (MiB/s)  — p99 / max")
     print(f"  Read          : {percentile(read_vals, 99):,.1f} / {max(read_vals, default=0):,.1f}")
@@ -159,9 +178,22 @@ def report(efs_fs, cw, days, period):
         print(f"  PercentIOLimit max: {max(io_limit.values()):.1f}%  "
               "(near 100% = IOPS bottleneck, more throughput won't help)")
     print()
-    print("Top 5 busiest periods (IST)")
+    print(f"Top 5 busiest periods ({tz.key})")
     for ts, v in sorted(series, key=lambda x: x[1], reverse=True)[:5]:
-        print(f"  {ts.astimezone(IST):%Y-%m-%d %H:%M}  {v:,.1f} MiB/s")
+        print(f"  {fmt_ts(ts, tz)}  {v:,.1f} MiB/s")
+    print()
+    print(f"Hour-of-day profile ({tz.key}), metered MiB/s")
+    print("  Hour     Avg      p95      Max   ")
+    top_hour_avg = max((sum(v) / len(v) for v in by_hour.values()), default=0) or 1
+    for h in range(24):
+        hv = by_hour.get(h, [])
+        if not hv:
+            print(f"  {h:02d}:00   -")
+            continue
+        h_avg = sum(hv) / len(hv)
+        bar = "#" * round(20 * h_avg / top_hour_avg)
+        print(f"  {h:02d}:00 {h_avg:8,.1f} {percentile(sorted(hv), 95):8,.1f} "
+              f"{max(hv):8,.1f}  {bar}")
     print()
     print(f"Suggested starting Provisioned throughput: {suggested} MiB/s")
     print(f"  (max of sustained peak and p99, +{int((HEADROOM - 1) * 100)}% headroom)")
@@ -183,7 +215,10 @@ def main():
     parser.add_argument("--days", type=int, default=14,
                         help="Look-back window (1-min data is kept 15 days, "
                              "5-min data 63 days)")
+    parser.add_argument("--tz", default="Australia/Sydney",
+                        help="Time zone for displayed times (default Australia/Sydney)")
     args = parser.parse_args()
+    tz = ZoneInfo(args.tz)
 
     # CloudWatch keeps 1-minute data for 15 days; beyond that use 5-minute data
     period = 60 if args.days <= 15 else 300
@@ -197,7 +232,7 @@ def main():
     kwargs = {"FileSystemId": args.fs_id} if args.fs_id else {}
     for page in efs.get_paginator("describe_file_systems").paginate(**kwargs):
         for fs in page["FileSystems"]:
-            report(fs, cw, args.days, period)
+            report(fs, cw, args.days, period, tz)
 
 
 if __name__ == "__main__":
