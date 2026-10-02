@@ -12,6 +12,12 @@ For each EFS file system it prints:
   - the 5 busiest periods
   - an hour-of-day profile (average and max per Sydney hour) to show peak hours
   - a suggested starting value for Provisioned throughput
+  - a monthly throughput cost estimate for THIS file system:
+      Elastic     = (data + metadata read GiB x read price) + (data + metadata write GiB x write price)
+      Provisioned = (provisioned MiB/s - free baseline) x price per MiB/s-month
+    Prices are looked up automatically from the AWS Price List API for the region.
+    If that fails, pass them yourself (from https://aws.amazon.com/efs/pricing/):
+      --read-price 0.0x --write-price 0.0x --prov-price x.xx
 
 Usage:
   python3 efs_throughput_report.py                         # all file systems, last 14 days
@@ -19,6 +25,7 @@ Usage:
   python3 efs_throughput_report.py --days 30               # longer window (uses 5-min data)
   python3 efs_throughput_report.py --tz Asia/Kolkata       # show times in another zone
   python3 efs_throughput_report.py --csv-prefix sydney_efs # CSV file name prefix
+  python3 efs_throughput_report.py --fs-id fs-0123abcd --provisioned 40   # cost at 40 MiB/s
 
 CSV output (written to the current folder every run, in addition to the screen report):
   <prefix>_summary.csv     one row per file system with all the key figures
@@ -29,10 +36,12 @@ CSV output (written to the current folder every run, in addition to the screen r
 Required IAM permissions:
   elasticfilesystem:DescribeFileSystems
   cloudwatch:GetMetricData
+  pricing:GetProducts        (optional, for automatic price lookup)
 """
 
 import argparse
 import csv
+import json
 import math
 import os
 from collections import defaultdict
@@ -47,6 +56,50 @@ TIB = 1024 ** 4
 BASELINE_MIBPS_PER_TIB = 50   # baseline throughput from Standard storage
 HEADROOM = 1.25               # 25% headroom on top of sustained peak
 SUSTAINED_WINDOW_MIN = 15     # minutes used for the "sustained peak" figure
+DAYS_PER_MONTH = 30.4
+
+
+def lookup_prices(region):
+    """
+    Look up EFS Elastic read/write ($/GB) and Provisioned ($/MBps-month) prices for a
+    region from the AWS Price List API. Returns (prices dict, list of matched descriptions).
+    Missing prices are left as None.
+    """
+    prices = {"read": None, "write": None, "prov": None}
+    matched = []
+    try:
+        pc = boto3.client("pricing", region_name="us-east-1")
+        pages = pc.get_paginator("get_products").paginate(
+            ServiceCode="AmazonEFS",
+            Filters=[{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region}])
+        for page in pages:
+            for item in page["PriceList"]:
+                p = json.loads(item)
+                attrs = p["product"].get("attributes", {})
+                for term in p.get("terms", {}).get("OnDemand", {}).values():
+                    for dim in term["priceDimensions"].values():
+                        usd = float(dim["pricePerUnit"].get("USD", 0) or 0)
+                        if usd <= 0:
+                            continue
+                        text = " ".join([attrs.get("usagetype", ""), attrs.get("operation", ""),
+                                         dim.get("description", ""),
+                                         p["product"].get("productFamily", "")]).lower()
+                        if "onezone" in text.replace(" ", "") or "one zone" in text:
+                            continue
+                        key = None
+                        if "elastic" in text and "read" in text:
+                            key = "read"
+                        elif "elastic" in text and "write" in text:
+                            key = "write"
+                        elif "provisioned" in text and "throughput" in text:
+                            key = "prov"
+                        if key and prices[key] is None:
+                            prices[key] = usd
+                            matched.append(f"{key:5s} ${usd:<8g} {attrs.get('usagetype', '')} "
+                                           f"- {dim.get('description', '')}")
+    except Exception as e:
+        matched.append(f"Price lookup failed: {e}")
+    return prices, matched
 
 
 def fetch_metric(cw, fs_id, metric, stat, period, start, end):
@@ -118,7 +171,45 @@ def fmt_ts(ts, tz):
     return ts.astimezone(tz).strftime("%Y-%m-%d %a %H:%M %Z")
 
 
-def report(efs_fs, cw, days, period, tz):
+def cost_estimate(cw, fs_id, start, end, days, reads, writes, baseline, prov_mibps, prices):
+    """Monthly throughput cost for one file system in Elastic vs Provisioned mode."""
+    # Metadata bytes are billed too. Newer metrics split read/write; older accounts
+    # only have MetadataIOBytes, which we count as reads (cheaper, so a lower bound).
+    meta_r = fetch_metric(cw, fs_id, "MetadataReadIOBytes", "Sum", 3600, start, end)
+    meta_w = fetch_metric(cw, fs_id, "MetadataWriteIOBytes", "Sum", 3600, start, end)
+    if not meta_r and not meta_w:
+        meta_r = fetch_metric(cw, fs_id, "MetadataIOBytes", "Sum", 3600, start, end)
+
+    scale = DAYS_PER_MONTH / days          # window -> one month
+    read_gib = (sum(reads.values()) + sum(meta_r.values())) / GIB * scale
+    write_gib = (sum(writes.values()) + sum(meta_w.values())) / GIB * scale
+    billed_mibps = max(0.0, prov_mibps - baseline)
+
+    def mul(a, b):
+        return None if b is None else a * b
+
+    elastic_read = mul(read_gib, prices["read"])
+    elastic_write = mul(write_gib, prices["write"])
+    elastic = (None if elastic_read is None or elastic_write is None
+               else elastic_read + elastic_write)
+    provisioned = mul(billed_mibps, prices["prov"])
+    return {
+        "read_gib_month": read_gib,
+        "write_gib_month": write_gib,
+        "elastic_read_usd": elastic_read,
+        "elastic_write_usd": elastic_write,
+        "elastic_usd": elastic,
+        "prov_mibps": prov_mibps,
+        "prov_billed_mibps": billed_mibps,
+        "provisioned_usd": provisioned,
+    }
+
+
+def usd(x):
+    return "n/a (price missing)" if x is None else f"${x:,.2f}"
+
+
+def report(efs_fs, cw, days, period, tz, prices, prov_override=None):
     fs_id = efs_fs["FileSystemId"]
     name = efs_fs.get("Name", "-")
     size = efs_fs["SizeInBytes"]
@@ -214,6 +305,30 @@ def report(efs_fs, cw, days, period, tz):
     if p99 > 0 and peak / max(p99, 0.001) > 5:
         print("  Note: max is far above p99 — the workload is spiky. Elastic may be "
               "cheaper than provisioning for these peaks.")
+    if peak > suggested:
+        print(f"  Note: the 1-period max ({peak:,.1f}) is above this value, so the busiest "
+              "minutes would be throttled slightly. Use --provisioned to price a higher value.")
+    print()
+
+    prov_mibps = prov_override if prov_override else suggested
+    cost = cost_estimate(cw, fs_id, start, end, days, reads, writes, baseline,
+                         prov_mibps, prices)
+    print("Monthly throughput cost estimate for this file system (USD, storage not included)")
+    print(f"  Data moved per month : {cost['read_gib_month']:,.1f} GiB read, "
+          f"{cost['write_gib_month']:,.1f} GiB written (data + metadata, scaled from {days} days)")
+    print(f"  Elastic              : {usd(cost['elastic_usd'])}"
+          f"   (reads {usd(cost['elastic_read_usd'])} + writes {usd(cost['elastic_write_usd'])})")
+    print(f"  Provisioned {prov_mibps:>4.0f} MiB/s: {usd(cost['provisioned_usd'])}"
+          f"   ({cost['prov_billed_mibps']:,.1f} MiB/s billed above the "
+          f"{baseline:,.1f} MiB/s free baseline)")
+    print("  Bursting             : $0.00 throughput charge (but limited by burst credits)")
+    if cost["elastic_usd"] is not None and cost["provisioned_usd"] is not None:
+        diff = cost["elastic_usd"] - cost["provisioned_usd"]
+        cheaper = "Provisioned" if diff > 0 else "Elastic"
+        print(f"  => {cheaper} is cheaper by about {usd(abs(diff))} per month")
+    print("  Note: estimate from CloudWatch bytes. EFS bills each data operation at a "
+          "32 KiB minimum,\n        so lots of small-file I/O makes the real Elastic bill "
+          "higher than this.")
     print()
 
     # ---- rows for the CSV files ----
@@ -247,6 +362,15 @@ def report(efs_fs, cw, days, period, tz):
         "percent_io_limit_max": r2(max(io_limit.values())) if io_limit else "",
         "suggested_provisioned_mibps": suggested,
         "billed_above_baseline_mibps": r2(max(0, suggested - baseline)),
+        "read_gib_per_month": r2(cost["read_gib_month"]),
+        "write_gib_per_month": r2(cost["write_gib_month"]),
+        "elastic_cost_usd_month": r2(cost["elastic_usd"]) if cost["elastic_usd"] is not None else "",
+        "costed_provisioned_mibps": prov_mibps,
+        "provisioned_cost_usd_month": (r2(cost["provisioned_usd"])
+                                       if cost["provisioned_usd"] is not None else ""),
+        "price_read_per_gb": prices["read"] if prices["read"] is not None else "",
+        "price_write_per_gb": prices["write"] if prices["write"] is not None else "",
+        "price_prov_per_mibps_month": prices["prov"] if prices["prov"] is not None else "",
     }
 
     hourly_rows = []
@@ -302,8 +426,33 @@ def main():
                         help="Time zone for displayed times (default Australia/Sydney)")
     parser.add_argument("--csv-prefix", default="efs_report",
                         help="Prefix for the CSV files (default efs_report)")
+    parser.add_argument("--provisioned", type=float,
+                        help="MiB/s to price for Provisioned mode (default: the suggested value)")
+    parser.add_argument("--read-price", type=float, help="Elastic read price, USD per GB")
+    parser.add_argument("--write-price", type=float, help="Elastic write price, USD per GB")
+    parser.add_argument("--prov-price", type=float,
+                        help="Provisioned price, USD per MB/s-month")
     args = parser.parse_args()
     tz = ZoneInfo(args.tz)
+
+    prices, matched = lookup_prices(args.region)
+    for key, val in (("read", args.read_price), ("write", args.write_price),
+                     ("prov", args.prov_price)):
+        if val is not None:
+            prices[key] = val
+    print(f"Throughput prices used for {args.region} (USD):")
+    print(f"  Elastic read  : {prices['read']} per GB")
+    print(f"  Elastic write : {prices['write']} per GB")
+    print(f"  Provisioned   : {prices['prov']} per MB/s-month")
+    if matched:
+        print("  From AWS Price List API:")
+        for m in matched:
+            print(f"    {m}")
+    if None in prices.values():
+        print("  Some prices are missing. Copy them from https://aws.amazon.com/efs/pricing/ "
+              "(choose Asia Pacific (Sydney))\n  and re-run with --read-price, "
+              "--write-price and --prov-price.")
+    print()
 
     # CloudWatch keeps 1-minute data for 15 days; beyond that use 5-minute data
     period = 60 if args.days <= 15 else 300
@@ -319,7 +468,7 @@ def main():
     for page in efs.get_paginator("describe_file_systems").paginate(**kwargs):
         for fs in page["FileSystems"]:
             try:
-                s, h, t = report(fs, cw, args.days, period, tz)
+                s, h, t = report(fs, cw, args.days, period, tz, prices, args.provisioned)
             except Exception as e:  # keep going so the other file systems still get saved
                 print(f"ERROR on {fs['FileSystemId']}: {e}\n")
                 continue
