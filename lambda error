@@ -1,70 +1,73 @@
-File system     : fs-08bXXXXXXXXXX  (prd-sftp)
-Throughput mode : elastic
-Performance mode: generalPurpose
-Window          : 2026-08-03 Mon 16:28 AEST  ->  2026-10-02 Fri 16:28 AEST
-                  60 days, 300s data points (17281 points)
+Subject: Proposal: Change EFS prd-sftp from Elastic to Provisioned throughput (40 MiB/s) - approx. US$173/month saving
 
-Storage
-  Total         : 1,080.7 GiB
-  Standard      : 60.9 GiB
-  IA            : 1,019.8 GiB
-  Archive       : 0.0 GiB
-  Free baseline : 3.0 MiB/s  (50 MiB/s per TiB of Standard)
+Hi all,
 
-Metered throughput (MiB/s)  — this is what counts against your limit
-  Average       : 1.5
-  p50 / p95 / p99: 0.6 / 7.1 / 8.8
-  Max (1 period): 20.6
-  Sustained peak: 18.7  (best 15-min average, starting 2026-09-26 Sat 06:58 AEST)
+This email proposes changing the throughput mode of our production SFTP file system (prd-sftp, fs-08bXXXXXXXXXX, Sydney region) from Elastic to Provisioned at 40 MiB/s. The change keeps the current performance and should reduce throughput charges by about US$173 per month (about US$2,070 per year).
 
-Raw data throughput (MiB/s)  — p99 / max
-  Read          : 14.5 / 44.3
-  Write         : 6.9 / 14.9
-  PercentIOLimit max: 3.0%  (near 100% = IOPS bottleneck, more throughput won't help)
+1. BACKGROUND
 
-Top 5 busiest periods (Australia/Sydney)
-  2026-08-29 Sat 18:10 AEST  20.6 MiB/s
-  2026-09-26 Sat 07:03 AEST  20.4 MiB/s
-  2026-09-26 Sat 07:08 AEST  18.4 MiB/s
-  2026-08-29 Sat 17:55 AEST  18.1 MiB/s
-  2026-10-02 Fri 01:13 AEST  17.3 MiB/s
+The file system was originally in Bursting mode. In that mode, AWS gives a free base speed that depends on how much data is in the Standard storage class. 94% of our data (1,019.8 GiB of 1,080.7 GiB) has moved to the cheaper Infrequent Access (IA) class, so only 60.9 GiB remains in Standard. That gives a base speed of just 3 MiB/s. Each time SFTP traffic went above that speed it used up 'burst credits'. When the credits ran out, the speed dropped to 3 MiB/s, which caused the performance problems.
 
-Hour-of-day profile (Australia/Sydney), metered MiB/s
-  Hour     Avg      p95      Max   
-  00:00      0.7      2.1      8.6  ###
-  01:00      4.3      9.5     17.3  ####################
-  02:00      2.7      7.9     15.9  #############
-  03:00      0.8      2.3      9.3  ####
-  04:00      0.6      3.1      7.8  ###
-  05:00      2.1      6.9     10.7  ##########
-  06:00      0.6      3.5     17.2  ###
-  07:00      0.7      4.0     20.4  ###
-  08:00      0.5      3.6      7.7  ##
-  09:00      0.7      4.6      7.4  ###
-  10:00      1.1      6.5      8.7  #####
-  11:00      1.3      7.1     10.1  ######
-  12:00      1.8      7.6      9.9  #########
-  13:00      1.7      7.7      9.6  ########
-  14:00      1.6      7.1     14.2  #######
-  15:00      2.0      7.8     12.3  #########
-  16:00      2.1      7.9     12.5  ##########
-  17:00      2.2      8.1     18.1  ##########
-  18:00      1.6      7.5     20.6  #######
-  19:00      1.2      7.1      9.7  #####
-  20:00      1.5      7.2      9.3  #######
-  21:00      1.3      4.8     11.9  ######
-  22:00      1.0      2.2      8.8  #####
-  23:00      1.3      3.0      9.3  ######
+We moved to Elastic mode to fix this. Elastic performs well, but AWS charges for every GB read and written, which makes it the most expensive option for our usage.
 
-Suggested starting Provisioned throughput: 30 MiB/s
-  (max of sustained peak and p99, +25% headroom)
-  Billed portion ≈ 27.0 MiB/s above the free baseline.
+Provisioned mode charges a fixed monthly amount for a guaranteed speed. It has no credits and no slowdowns.
 
-Monthly throughput cost estimate for this file system (USD, storage not included)
-  Data moved per month : 8,335.6 GiB read, 1,513.0 GiB written (data + metadata, scaled from 60 days)
-  Elastic              : $439.33   (reads $333.42 + writes $105.91)
-  Provisioned   30 MiB/s: $194.60   (27.0 MiB/s billed above the 3.0 MiB/s free baseline)
-  Bursting             : $0.00 throughput charge (but limited by burst credits)
-  => Provisioned is cheaper by about $244.73 per month
-  Note: estimate from CloudWatch bytes. EFS bills each data operation at a 32 KiB minimum,
-        so lots of small-file I/O makes the real Elastic bill higher than this.
+2. HOW WE MEASURED USAGE
+
+We collected 60 days of AWS CloudWatch data (3 Aug to 2 Oct 2026, Sydney time) at 5-minute intervals. We also checked the last 14 days at 1-minute intervals to see short spikes more clearly.
+
+What 'p99' and 'p95' mean: if you line up every 5-minute reading from the 60 days from lowest to highest, p99 is the value that 99% of readings are at or below. Only 1 reading in 100 is higher, which works out to about 15 minutes per day. It shows the normal busy level and ignores rare one-off spikes. In the same way, p95 means usage is at or below that value 95% of the time.
+
+3. KEY FINDINGS (throughput as counted by AWS)
+
+- Average usage: 1.5 MiB/s (the file system is lightly used most of the time)
+- Median (half the time below): 0.6 MiB/s
+- p95: 7.1 MiB/s
+- p99: 8.8 MiB/s
+- Highest 5-minute average (60 days): 20.6 MiB/s (Sat 29 Aug, 18:10 AEST)
+- Highest 1-minute reading (last 14 days): 33.0 MiB/s (nightly job at about 02:10 AEST)
+- Busiest 15-minute period: 18.7 MiB/s (Sat 26 Sep, 06:58 AEST)
+- Storage operations limit (IOPS) used: 3% maximum, so IOPS is not a constraint
+
+When the load happens (Sydney time):
+- 01:00 to 02:00: busiest window, caused by a nightly batch job
+- 05:00 to 07:00: a second, smaller batch
+- 12:00 to 17:00: steady business-hours SFTP use, about 2 MiB/s on average
+
+The workload is mostly reads (file downloads). AWS counts reads at one-third of their actual size against the limit, so 40 MiB/s provisioned allows up to about 120 MiB/s of pure downloads.
+
+4. WHY 40 MiB/s INSTEAD OF 30 MiB/s
+
+The reporting tool suggested 30 MiB/s based on the 60-day figures. We recommend 40 MiB/s for these reasons:
+
+(a) The 60-day data uses 5-minute averages, which smooth out short spikes. The 1-minute data shows the nightly job reaching 33 MiB/s. At 30 MiB/s, those minutes would be slowed down. 40 MiB/s covers this peak with about 20% headroom.
+(b) It leaves room for growth in SFTP traffic without immediate re-tuning.
+(c) After any change to Provisioned mode, AWS does not allow us to reduce the value or switch back for 24 hours. Increasing it is allowed at any time. Starting with headroom avoids a performance risk during that period.
+
+The extra cost of 40 over 30 MiB/s is about US$72 per month.
+
+5. COST COMPARISON (throughput only, storage costs unchanged, Sydney prices in USD)
+
+Prices used: Elastic reads US$0.04/GB, Elastic writes US$0.07/GB, Provisioned US$7.20 per MiB/s per month. With Provisioned, the first 3 MiB/s is free, so we pay only for the amount above that.
+
+- Elastic (current): about US$439 per month (8,336 GiB read = US$333, 1,513 GiB written = US$106)
+- Provisioned 30 MiB/s: about US$195 per month (27 MiB/s billed)
+- Provisioned 40 MiB/s (recommended): about US$267 per month (37 MiB/s billed)
+
+Saving with 40 MiB/s: about US$173 per month, about US$2,070 per year.
+
+Note: The Elastic figure is an estimate from CloudWatch data. AWS bills every file operation as at least 32 KiB, so with many small files the real Elastic bill is likely somewhat higher, which would make the saving larger. We will confirm against the actual AWS bill after the change.
+
+6. IMPLEMENTATION AND RISK
+
+- The change is made online from the AWS console or CLI. There is no downtime and no data movement.
+- After the change, we cannot lower the value or move back to Elastic for 24 hours. Increasing it is possible at any time if needed.
+- We will add a CloudWatch alarm that alerts when usage exceeds 80% of the provisioned 40 MiB/s, so we can act early if traffic grows.
+- We will review usage and cost after one full month.
+
+Proposed change window: [date/time AEST], outside the 01:00 to 07:00 batch window.
+
+Please reply with approval or any questions.
+
+Regards,
+[Your name]
