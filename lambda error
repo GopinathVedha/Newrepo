@@ -1,7 +1,62 @@
-<Error>
-<Code>InvalidArgument</Code>
-<Message>Requests specifying Server Side Encryption with AWS KMS managed keys require AWS Signature Version 4.</Message>
-<ArgumentName>Authorization</ArgumentName>
-<RequestId>RA3PYH7MA64XSBT1</RequestId>
-<HostId>qSVFNINNe7YMh40MTyHkhkkdtGqIzkzdIY/Pd1aM8/lhIy0kgsrKH15Vwz1AI98wAK1BpnnKdFgWLIJhgRVdNqdHxAFofgfk</HostId>
-</Error>
+========================================================================
+File system     : fs-08bxxxxxxxxx  (prd-sftp)
+Throughput mode : elastic
+Performance mode: generalPurpose
+Window          : 2026-09-18 Fri 14:37 AEST  ->  2026-10-02 Fri 14:37 AEST
+                  14 days, 60s data points (20160 points)
+
+Storage
+  Total         : 1,080.7 GiB
+  Standard      : 61.0 GiB
+  IA            : 1,019.8 GiB
+  Archive       : 0.0 GiB
+  Free baseline : 3.0 MiB/s  (50 MiB/s per TiB of Standard)
+
+Metered throughput (MiB/s)  — this is what counts against your limit
+  Average       : 1.6
+  p50 / p95 / p99: 0.2 / 7.9 / 10.8
+  Max (1 period): 33.0
+  Sustained peak: 18.7  (best 15-min average, starting 2026-09-26 Sat 06:58 AEST)
+
+Raw data throughput (MiB/s)  — p99 / max
+  Read          : 28.4 / 50.3
+  Write         : 7.0 / 32.5
+  PercentIOLimit max: 2.5%  (near 100% = IOPS bottleneck, more throughput won't help)
+
+Top 5 busiest periods (Australia/Sydney)
+  2026-09-23 Wed 02:13 AEST  33.0 MiB/s
+  2026-09-26 Sat 02:08 AEST  31.4 MiB/s
+  2026-09-28 Mon 02:13 AEST  29.4 MiB/s
+  2026-10-02 Fri 02:13 AEST  29.2 MiB/s
+  2026-09-22 Tue 02:14 AEST  27.6 MiB/s
+
+Hour-of-day profile (Australia/Sydney), metered MiB/s
+  Hour     Avg      p95      Max   
+  00:00      0.8      6.1     10.1  ####
+  01:00      4.2      9.7     21.3  ####################
+  02:00      3.0      9.7     33.0  ##############
+  03:00      0.9      3.1      9.8  ####
+  04:00      0.6      2.8     12.9  ###
+  05:00      2.4      7.6     14.6  ###########
+  06:00      1.1     11.3     17.8  #####
+  07:00      1.4     11.8     23.2  #######
+  08:00      0.6      6.0     17.1  ###
+  09:00      0.7      5.5      8.5  ###
+  10:00      1.0      7.1     10.4  #####
+  11:00      1.4      8.1     11.4  #######
+  12:00      2.0      8.3     11.9  #########
+  13:00      1.8      8.7     11.7  ########
+  14:00      1.7      8.3     12.8  ########
+  15:00      1.9      8.4     11.7  #########
+  16:00      2.1      8.4     11.5  ##########
+  17:00      2.1      8.8     12.2  ##########
+  18:00      1.5      8.0     10.8  #######
+  19:00      1.1      7.7     11.8  #####
+  20:00      1.3      5.1     10.9  ######
+  21:00      1.6      7.5     15.7  #######
+  22:00      1.1      4.4     10.7  #####
+  23:00      1.5      4.7     10.9  #######
+
+Suggested starting Provisioned throughput: 30 MiB/s
+  (max of sustained peak and p99, +25% headroom)
+  Billed portion ≈ 27.0 MiB/s above the free baseline.
