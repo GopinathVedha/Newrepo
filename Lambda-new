@@ -1,8 +1,13 @@
-SQL Server version and edition. This decides whether WAIT_AT_LOW_PRIORITY and online rebuilds are available.
-Per database and per file: size, used space, and free space, from the query in step 1.
-Recovery model, plus any Availability Group, log shipping, or replication.
-Storage type and IOPS/throughput; CPU and RAM.
-Peak hours and available maintenance windows.
-Schedules for backups, index maintenance, and CHECKDB.
-The largest tables and indexes, and whether there is heavy LOB data or heaps.
-How much free space you want to keep for growth.
+we already taken AMI backups with below TAG key and value, can you include this TAG in the pre and post patch AMI backups. AMI Name could have anything but it should have below TAGS.
+AMI Type = Pre Patch backup
+AMI Type = Post Patch backup
+
+App servers filtered with below TAG 
+equip:os:platform = windows_ap
+equip:os:platform - linux_ap
+
+DB servers
+equip:os:platform = windows_db
+equip:os:platform - linux_db
+
+there is one more change required after pre patch AMI backup completes infra team (my team) should give go ahead to start the app or DB patch first, which ever completes first app or DB servers next patch will continue once APP or DB team approved, is it possible?
