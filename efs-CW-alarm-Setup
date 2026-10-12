@@ -1,0 +1,50 @@
+SNS TOPIC
+
+JSON File - efs-alarm.json
+[
+  {
+    "Id": "metered",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/EFS",
+        "MetricName": "MeteredIOBytes",
+        "Dimensions": [{ "Name": "FileSystemId", "Value": "fs-08bXXXXXXXXXX" }]
+      },
+      "Period": 300,
+      "Stat": "Sum"
+    },
+    "ReturnData": false
+  },
+  {
+    "Id": "permitted",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/EFS",
+        "MetricName": "PermittedThroughput",
+        "Dimensions": [{ "Name": "FileSystemId", "Value": "fs-08bXXXXXXXXXX" }]
+      },
+      "Period": 300,
+      "Stat": "Maximum"
+    },
+    "ReturnData": false
+  },
+  {
+    "Id": "usage_pct",
+    "Expression": "(metered / PERIOD(metered)) / permitted * 100",
+    "Label": "Throughput usage % of permitted",
+    "ReturnData": true
+  }
+]
+
+aws cloudwatch put-metric-alarm --region ap-southeast-2 \
+  --alarm-name "EFS-prd-sftp-throughput-above-80pct" \
+  --alarm-description "prd-sftp metered throughput above 80% of provisioned (40 MiB/s) for 15 minutes" \
+  --metrics file://efs-alarm.json \
+  --comparison-operator GreaterThanThreshold \
+  --threshold 80 \
+  --evaluation-periods 3 \
+  --datapoints-to-alarm 3 \
+  --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:ap-southeast-2:<ACCOUNT_ID>:efs-alerts \
+  --ok-actions arn:aws:sns:ap-southeast-2:<ACCOUNT_ID>:efs-alerts
+
