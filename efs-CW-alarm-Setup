@@ -1,5 +1,11 @@
 SNS TOPIC
 
+aws sns create-topic --name efs-alerts --region ap-southeast-2
+aws sns subscribe --region ap-southeast-2 \
+  --topic-arn arn:aws:sns:ap-southeast-2:<ACCOUNT_ID>:efs-alerts \
+  --protocol email --notification-endpoint you@company.com
+
+
 JSON File - efs-alarm.json
 [
   {
