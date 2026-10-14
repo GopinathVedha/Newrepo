@@ -53,7 +53,7 @@ ACCOUNTS_PARAM_NAME = '/autoscheduler/Accounts'
 # Tags (unchanged from the single-account version)
 ORIGINAL_TYPE_TAG = 'equip:infra:original-instance-type'
 EXCEPTION_TAG = 'equip:infra:autoscheduler:exception'
-WEEKLY_SCHEDULE_TAG = 'equip:infratest:weeklyschedule'
+WEEKLY_SCHEDULE_TAG = 'equip:infra:weeklyschedule'
 
 SIZE_ORDER = [
     'nano', 'micro', 'small', 'medium', 'large',
@@ -316,9 +316,9 @@ def process_account(acct, trigger_type, ct_sec, today_abbr, is_skip_day, holiday
                     key, value = tag['Key'], tag['Value']
                     if key == 'equip:infra:autoscheduler':
                         scheduler_flag = value.lower()
-                    elif key == 'equip:infratest:autostarttime':
+                    elif key == 'equip:infra:autostarttime':
                         autostart_flag = value
-                    elif key == 'equip:infratest:autostoptime':
+                    elif key == 'equip:infra:autostoptime':
                         autostop_flag = value
 
             if scheduler_flag != 'enabled':
