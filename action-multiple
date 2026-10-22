@@ -1,0 +1,455 @@
+"""EC2 AutoScheduler — Lambda 1 (Action), multi-account.
+
+Drop-in single-file Lambda handler: ec2_autoscheduler_action.lambda_handler
+Preserves: ap-southeast-2, Sydney scheduling, SSM paths, existing tags/SNS
+names, DB/APP/ALL trigger, weekly schedules, weekend/holiday rules, and
+same-family capacity fallback. No extra Python packages beyond boto3.
+
+Status Lambda must be deployed before this Lambda. See DEPLOYMENT.md.
+"""
+import json
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import boto3
+from botocore.exceptions import ClientError
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+REGION = 'ap-southeast-2'
+TIMEZONE = ZoneInfo('Australia/Sydney')
+SNS_START = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_start'
+SNS_STOP = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop'
+SNS_CAPACITY = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
+STATUS_LAMBDA_ARN = 'arn:aws:lambda:ap-southeast-2:050557606111:function:ec2_autoscheduler_status'
+SCHEDULER_ROLE_ARN = 'arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole'
+HOLIDAYS_SSM = '/autoscheduler/Holidays'
+ACCOUNTS_SSM = '/autoscheduler/Accounts'
+TAG_ORIGINAL = 'equip:infra:original-instance-type'
+TAG_EXCEPTION = 'equip:infra:autoscheduler:exception'
+TAG_WEEKLY = 'equip:infra:weeklyschedule'
+TAG_ENABLED = 'equip:infra:autoscheduler'
+TAG_START = 'equip:infra:autostarttime'
+TAG_STOP = 'equip:infra:autostoptime'
+TAG_ROLE = 'equip:infra:role'
+STATUS_DELAY = 180
+WINDOW_SECONDS = 300
+SIZE_ORDER = ['nano','micro','small','medium','large','xlarge','2xlarge','4xlarge',
+              '8xlarge','9xlarge','12xlarge','16xlarge','18xlarge','24xlarge','32xlarge','48xlarge']
+DAY_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+
+sts = boto3.client('sts', region_name=REGION)
+sns = boto3.client('sns', region_name=REGION)
+ssm = boto3.client('ssm', region_name=REGION)
+scheduler = boto3.client('scheduler', region_name=REGION)
+cloudwatch = boto3.client('cloudwatch', region_name=REGION)
+
+
+def metric(name, value=1):
+    try:
+        cloudwatch.put_metric_data(Namespace='EC2AutoScheduler', MetricData=[{
+            'MetricName': name, 'Value': value, 'Unit': 'Count',
+            'Dimensions': [{'Name': 'Function', 'Value': 'Action'}]}])
+    except Exception:
+        log.exception('METRIC_DELIVERY_FAILED %s', name)
+
+
+def notify(topic, subject, body, cycle):
+    message = f'EC2 AutoScheduler | Cycle: {cycle} | Region: {REGION}\n' + body
+    try:
+        res = sns.publish(TopicArn=topic, Subject=subject[:100], Message=message)
+        log.info('SNS_SENT subject=%s id=%s cycle=%s', subject, res.get('MessageId'), cycle)
+        return True
+    except Exception:
+        log.exception('SNS_PUBLISH_FAILED topic=%s subject=%s cycle=%s', topic, subject, cycle)
+        metric('NotificationFailures')
+        return False
+
+
+def tags_of(instance):
+    return {tag['Key']: tag['Value'] for tag in (instance.tags or [])}
+
+
+def description(inst):
+    return tags_of(inst).get('Name', 'Unnamed')
+
+
+def role_of(inst):
+    return tags_of(inst).get(TAG_ROLE, 'unknown').strip().lower()
+
+
+def get_account_session(role_arn):
+    if not role_arn:
+        return boto3.Session()
+    credentials = sts.assume_role(RoleArn=role_arn, RoleSessionName='ec2-autoscheduler-action')['Credentials']
+    return boto3.Session(aws_access_key_id=credentials['AccessKeyId'],
+                         aws_secret_access_key=credentials['SecretAccessKey'],
+                         aws_session_token=credentials['SessionToken'])
+
+
+def accounts_config():
+    raw = json.loads(ssm.get_parameter(Name=ACCOUNTS_SSM)['Parameter']['Value'])
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f'{ACCOUNTS_SSM} must be a nonempty JSON array')
+    central_id = sts.get_caller_identity()['Account']
+    valid, errors, used = [], [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            errors.append('Account entry must be a JSON object')
+            continue
+        aid = str(item.get('account_id', ''))
+        role = item.get('role_arn')
+        if not re.fullmatch(r'\d{12}', aid) or aid in used:
+            errors.append(f'Invalid/duplicate account ID: {aid!r}')
+            continue
+        if role is None:
+            if aid != central_id:
+                errors.append(f'Account {aid}: null role only valid for central account {central_id}')
+                continue
+        elif not isinstance(role, str) or not re.fullmatch(
+                rf'arn:aws[a-z-]*:iam::{aid}:role/[\w+=,.@/\-]+', role):
+            errors.append(f'Account {aid}: invalid cross-account role ARN')
+            continue
+        used.add(aid)
+        valid.append({'account_id': aid, 'name': str(item.get('name') or aid), 'role_arn': role})
+    return valid, errors
+
+
+def holiday_dates():
+    """Do not accidentally auto-start on holidays if SSM cannot be read."""
+    raw = ssm.get_parameter(Name=HOLIDAYS_SSM)['Parameter']['Value']
+    dates = {d.strip() for d in raw.split(',') if d.strip()}
+    for value in dates:
+        datetime.strptime(value, '%Y-%m-%d')
+    return dates
+
+
+def schedule_for(tags, day):
+    start, stop = tags.get(TAG_START, ''), tags.get(TAG_STOP, '')
+    if not tags.get(TAG_WEEKLY):
+        return start, stop
+    data = json.loads(tags[TAG_WEEKLY])
+    if not isinstance(data, dict):
+        raise ValueError('Weekly schedule must be a JSON object')
+    by_day = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or key.strip()[:3].capitalize() not in DAY_NAMES:
+            raise ValueError('Invalid weekday in weekly schedule')
+        if not isinstance(value, dict):
+            raise ValueError('Each weekday must contain an object')
+        by_day[key.strip()[:3].capitalize()] = value
+    entry = by_day.get(day, {})
+    start, stop = entry.get('start', ''), entry.get('stop', '')
+    if not isinstance(start, str) or not isinstance(stop, str):
+        raise ValueError('start/stop fields must be HH:MM strings')
+    return start, stop
+
+
+def in_window(raw, current_sec):
+    if not raw:
+        return False
+    match = re.fullmatch(r'([01]?\d|2[0-3]):([0-5]\d)', raw)
+    if not match:
+        raise ValueError(f'Invalid HH:MM time: {raw!r}')
+    at_sec = int(match.group(1)) * 3600 + int(match.group(2)) * 60
+    return 0 <= current_sec - at_sec < WINDOW_SECONDS
+
+
+def smaller_types(original):
+    if '.' not in original:
+        return []
+    family, size = original.split('.', 1)
+    if size not in SIZE_ORDER:
+        return []
+    return [f'{family}.{s}' for s in reversed(SIZE_ORDER[:SIZE_ORDER.index(size)])]
+
+
+def ec2_error_code(exc):
+    return exc.response.get('Error', {}).get('Code', '') if isinstance(exc, ClientError) else ''
+
+
+def capacity_shortage(exc):
+    return ec2_error_code(exc) in ('InsufficientInstanceCapacity', 'InsufficientHostCapacity',
+                                    'InsufficientCapacityOnHost')
+
+
+def unavailable_type(exc):
+    code = ec2_error_code(exc)
+    msg = exc.response.get('Error', {}).get('Message', '').lower()
+    return code in ('InvalidInstanceType', 'Unsupported', 'InvalidParameterValue') and any(
+        phrase in msg for phrase in ('do not exist', 'not supported', 'not available', 'invalid instance type'))
+
+
+def get_live_instance(client, iid):
+    response = client.describe_instances(InstanceIds=[iid])
+    instances = [i for r in response.get('Reservations', []) for i in r.get('Instances', [])]
+    if len(instances) != 1:
+        raise RuntimeError(f'Instance lookup yielded {len(instances)} records for {iid}')
+    return instances[0]
+
+
+def select_offered_smaller_types(client, original, az):
+    options = smaller_types(original)
+    if not options or not az:
+        return []
+    offered = set()
+    pager = client.get_paginator('describe_instance_type_offerings')
+    for page in pager.paginate(LocationType='availability-zone', Filters=[
+            {'Name': 'location', 'Values': [az]}, {'Name': 'instance-type', 'Values': options}]):
+        offered.update(t['InstanceType'] for t in page.get('InstanceTypeOfferings', []))
+    return [kind for kind in options if kind in offered]
+
+
+def start_with_fallback(client, iid, name, account, cycle):
+    """Returns (accepted, downgraded_tuple_or_None, failure_or_None, tag_pending).
+
+    Always persist & re-read original metadata BEFORE a downsize. A failed start
+    after resizing leaves the tag in place for reconciliation/restore.
+    """
+    live = get_live_instance(client, iid)
+    state = live['State']['Name']
+    if state != 'stopped':
+        return False, None, f'Not stopped ({state})', False
+    current = live['InstanceType']
+    original = {t['Key']: t['Value'] for t in live.get('Tags', [])}.get(TAG_ORIGINAL, current)
+    root = live.get('RootDeviceType')
+    az = live.get('Placement', {}).get('AvailabilityZone')
+    try:
+        options = [original] + (select_offered_smaller_types(client, original, az) if root == 'ebs' else [])
+    except Exception as exc:
+        # A failure to list offerings should not suppress an ordinary start.
+        log.exception('OFFERING_DISCOVERY_FAILED instance=%s', iid)
+        options = [original]  # fail safely: no speculative resize
+    changed_to_smaller = False
+    last_error = None
+    for target in options:
+        try:
+            live = get_live_instance(client, iid)
+            current = live['InstanceType']
+            if target != current:
+                if live['State']['Name'] != 'stopped':
+                    raise RuntimeError('Instance stopped state lost while changing instance type')
+                if target != original:
+                    existing = {t['Key']: t['Value'] for t in live.get('Tags', [])}.get(TAG_ORIGINAL)
+                    if existing and existing != original:
+                        raise RuntimeError(f'Unsafe original tag mismatch: {existing} != {original}')
+                    client.create_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL, 'Value': original}])
+                    verify = get_live_instance(client, iid)
+                    if {t['Key']: t['Value'] for t in verify.get('Tags', [])}.get(TAG_ORIGINAL) != original:
+                        raise RuntimeError('Original type tag not visible after write; resize cancelled')
+                client.modify_instance_attribute(InstanceId=iid, InstanceType={'Value': target})
+                observed = get_live_instance(client, iid)
+                if observed['InstanceType'] != target:
+                    raise RuntimeError(f'Instance type mismatch after modification: expected {target}')
+            client.start_instances(InstanceIds=[iid])
+            if target == original:
+                # A successfully accepted start stays successful even when
+                # optional stale-tag cleanup subsequently fails. Reconciliation
+                # will handle stale tags independently.
+                try:
+                    observed = get_live_instance(client, iid)
+                    if (observed['InstanceType'] == original and
+                            any(t['Key'] == TAG_ORIGINAL for t in observed.get('Tags', []))):
+                        client.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
+                except Exception:
+                    log.exception('STALE_TAG_CLEANUP_DEFERRED instance=%s', iid)
+            else:
+                changed_to_smaller = True
+            return True, ((iid, name, account, original, target) if changed_to_smaller else None), None, False
+        except ClientError as exc:
+            last_error = f'{ec2_error_code(exc)}: {exc}'
+            if capacity_shortage(exc):
+                log.warning('CAPACITY_SHORTAGE instance=%s attempted=%s cycle=%s', iid, target, cycle)
+                continue
+            if unavailable_type(exc) and target != original:
+                log.warning('UNSUPPORTED_FALLBACK instance=%s type=%s', iid, target)
+                continue
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            log.exception('START_ERROR instance=%s target=%s', iid, target)
+            break
+    try:
+        live = get_live_instance(client, iid)
+        pending = (live['State']['Name'] == 'stopped' and
+                   any(t['Key'] == TAG_ORIGINAL for t in live.get('Tags', [])))
+    except Exception:
+        pending = True  # reconciliation can investigate
+    return False, None, last_error or 'No available compatible capacity in same family', pending
+
+
+def create_status_schedule(payload):
+    when = (datetime.now(timezone.utc) + timedelta(seconds=STATUS_DELAY)).strftime('%Y-%m-%dT%H:%M:%S')
+    name = f'ec2-autoscheduler-status-{uuid.uuid4().hex[:14]}'
+    target = {'Arn': STATUS_LAMBDA_ARN, 'RoleArn': SCHEDULER_ROLE_ARN,
+              'Input': json.dumps(payload, separators=(',', ':')),
+              'RetryPolicy': {'MaximumRetryAttempts': 3, 'MaximumEventAgeInSeconds': 3600}}
+    dlq = os.environ.get('AUTOSCHEDULER_SCHEDULER_DLQ_ARN', '').strip()
+    if dlq:
+        target['DeadLetterConfig'] = {'Arn': dlq}
+    else:
+        log.warning('SCHEDULER_DLQ_UNCONFIGURED action Lambda; configure env var for reliable recovery')
+    scheduler.create_schedule(Name=name, ScheduleExpression=f'at({when})',
+                              ScheduleExpressionTimezone='UTC',
+                              FlexibleTimeWindow={'Mode': 'OFF'}, Target=target,
+                              ActionAfterCompletion='DELETE')
+    return name
+
+
+def server_line(name, iid, account, result):
+    return f'- {account} | {name} | {iid} | {result}'
+
+
+def process_account(acct, trigger, now, skip_start, cycle, results, involved):
+    aid, aname, role_arn = acct['account_id'], acct['name'], acct['role_arn']
+    try:
+        client = get_account_session(role_arn).client('ec2', region_name=REGION)
+        pager = client.get_paginator('describe_instances')
+        selected = []
+        for page in pager.paginate(Filters=[{'Name': 'tag-key', 'Values': [TAG_ENABLED]}]):
+            for reservation in page.get('Reservations', []):
+                selected.extend(reservation.get('Instances', []))
+    except Exception as exc:
+        results['account_errors'].append(f'{aname} ({aid}) | cannot inspect account: {exc}')
+        metric('AccountFailures')
+        return
+    started, stopped, pending_restore, names = [], [], [], {}
+    for instance in selected:
+        iid = instance['InstanceId']
+        tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+        if tags.get(TAG_ENABLED, '').strip().lower() != 'enabled':
+            continue
+        name = tags.get('Name', 'Unnamed')
+        names[iid] = name
+        role = tags.get(TAG_ROLE, 'unknown').strip().lower()
+        if trigger != 'all' and role != trigger:
+            continue
+        try:
+            start_at, stop_at = schedule_for(tags, DAY_NAMES[now.weekday()])
+            start_due = in_window(start_at, now.hour * 3600 + now.minute * 60)
+            stop_due = in_window(stop_at, now.hour * 3600 + now.minute * 60)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            results['invalid_schedule'].append(server_line(name, iid, aname, f'Invalid schedule: {exc}'))
+            continue
+        state = instance['State']['Name']
+        exception = tags.get(TAG_EXCEPTION, '').strip().lower()
+        if start_due and state == 'stopped':
+            if skip_start and exception != 'true':
+                results['skipped'].append(server_line(name, iid, aname, 'Weekend/holiday or holiday data unavailable'))
+            else:
+                accepted, downgrade, error, pending = start_with_fallback(client, iid, name, aname, cycle)
+                if accepted:
+                    started.append(iid)
+                    results['start'].append(server_line(name, iid, aname, 'START REQUEST ACCEPTED (verification pending)'))
+                    if downgrade:
+                        results['downgrade'].append(f'- {aname} | {name} | {iid} | {downgrade[3]} -> {downgrade[4]}')
+                else:
+                    results['start_failed'].append(server_line(name, iid, aname, f'START FAILED: {error}'))
+                    if pending:
+                        pending_restore.append(iid)
+        if stop_due and state == 'running' and exception != 'nonstop':
+            try:
+                client.stop_instances(InstanceIds=[iid])
+                stopped.append(iid)
+                results['stop'].append(server_line(name, iid, aname, 'STOP REQUEST ACCEPTED (verification pending)'))
+            except Exception as exc:
+                results['stop_failed'].append(server_line(name, iid, aname, f'STOP FAILED: {exc}'))
+    if started or stopped or pending_restore:
+        involved[aid] = {'name': aname, 'role_arn': role_arn,
+                         'autostart_instance_ids': started, 'autostop_instance_ids': stopped,
+                         'restore_instance_ids': list(dict.fromkeys(pending_restore)),
+                         'instance_names': {i: names.get(i, 'Unnamed') for i in set(started + stopped + pending_restore)}}
+
+
+def lambda_handler(event, context):
+    event = event or {}
+    cycle = str(event.get('cycle_id') or uuid.uuid4().hex[:12])
+    trigger = str(event.get('trigger', 'all')).strip().lower()
+    if trigger not in ('all', 'db', 'app'):
+        notify(SNS_CAPACITY, '[EC2 Scheduler][ACTION][FAILED] Invalid trigger',
+               f'Unsupported trigger: {trigger!r}. Valid: all/db/app. No actions taken.', cycle)
+        raise ValueError(f'Invalid trigger: {trigger}')
+    now = datetime.now(TIMEZONE)
+    stamp = now.strftime('%Y-%m-%d %H:%M:%S %Z')
+    results = {k: [] for k in ('start','stop','start_failed','stop_failed','downgrade',
+                               'skipped','invalid_schedule','account_errors')}
+    try:
+        accounts, config_errors = accounts_config()
+    except Exception as exc:
+        notify(SNS_CAPACITY, '[EC2 Scheduler][CONFIG][FAILED]',
+               f'Account SSM config unavailable/invalid: {exc}. NO accounts processed.', cycle)
+        metric('AccountFailures')
+        raise
+    results['account_errors'].extend(config_errors)
+    if not accounts:
+        notify(SNS_CAPACITY, '[EC2 Scheduler][CONFIG][FAILED]',
+               'No valid accounts remain after SSM validation. No EC2 actions taken.', cycle)
+        metric('AccountFailures')
+        raise ValueError('No valid accounts configured')
+    holiday_error = None
+    try:
+        holidays = holiday_dates()
+    except Exception as exc:
+        holiday_error = str(exc)
+        holidays = set()
+        metric('AccountFailures')
+    skip_start = (now.weekday() >= 5 or now.strftime('%Y-%m-%d') in holidays or holiday_error is not None)
+    involved = {}
+    for acct in accounts:
+        process_account(acct, trigger, now, skip_start, cycle, results, involved)
+    heading = f'Time: {stamp}\nTrigger: {trigger}\nAccount count: {len(accounts)}\n'
+    if holiday_error:
+        results['account_errors'].append(f'Holiday parameter could not be loaded: {holiday_error}; auto-starts fail closed; stops remain permitted')
+    for name in ('start','stop'):
+        if results[name]:
+            label = 'START' if name == 'start' else 'STOP'
+            body = heading + f'\n{label} REQUESTS: {len(results[name])}\n' + '\n'.join(results[name])
+            body += '\n\nNote: EC2 state/health is checked by Status Lambda in a follow-up.'
+            if name == 'start':
+                body += ('\n\nCapacity downgrades:\n' + '\n'.join(results['downgrade'])) if results['downgrade'] else ''
+            notify(SNS_START if name == 'start' else SNS_STOP,
+                   f'[EC2 Scheduler][{label}][REQUESTED] {len(results[name])} instance(s)', body, cycle)
+    if any(results[k] for k in ('downgrade','start_failed','stop_failed','account_errors','invalid_schedule')):
+        parts = [heading]
+        for key, label in (('downgrade','CAPACITY DOWNGRADES'), ('start_failed','START FAILURES'),
+                           ('stop_failed','STOP FAILURES'), ('account_errors','CONFIG/ACCOUNT ISSUES'),
+                           ('invalid_schedule','INVALID SCHEDULES')):
+            if results[key]:
+                parts.append(f'\n{label} ({len(results[key])}):\n' + '\n'.join(results[key]))
+        notify(SNS_CAPACITY, '[EC2 Scheduler][ACTION][ATTENTION]', '\n'.join(parts), cycle)
+    if results['skipped']:
+        notify(SNS_START, f'[EC2 Scheduler][START][SKIPPED] {len(results["skipped"])} instance(s)',
+               heading + f'\nAUTO-START SKIPPED ({len(results["skipped"])}):\n' +
+               '\n'.join(results['skipped']), cycle)
+        log.info('AUTO_START_SKIPPED count=%d cycle=%s', len(results['skipped']), cycle)
+    if results['account_errors']:
+        metric('AccountFailures', len(results['account_errors']))
+    if results['start_failed'] or results['stop_failed']:
+        metric('ActionFailures', len(results['start_failed']) + len(results['stop_failed']))
+    if not involved:
+        log.info('NO_FOLLOWUP_NEEDED cycle=%s; periodic reconciliation still required', cycle)
+        return {'cycle_id': cycle, 'counts': {k: len(v) for k, v in results.items()}, 'followups': 0}
+    # One schedule per account limits payload size and isolates failures by account.
+    schedule_failures = []
+    for aid, info in involved.items():
+        payload = {'mode': 'status', 'cycle_id': cycle, 'timestamp': stamp,
+                   'accounts_involved': {aid: info}}
+        try:
+            create_status_schedule(payload)
+        except Exception as exc:
+            msg = f'{info["name"]} ({aid}): {exc}'
+            schedule_failures.append(msg)
+            metric('SchedulerFailures')
+            log.exception('SCHEDULER_CREATE_FAILED account=%s cycle=%s', aid, cycle)
+    if schedule_failures:
+        notify(SNS_CAPACITY, '[EC2 Scheduler][FOLLOWUP][SCHEDULING FAILED]',
+               'Start/stop requests were sent, but follow-up status/restore scheduling FAILED:\n' +
+               '\n'.join(schedule_failures) + '\n\nCheck EventBridge Scheduler. Enable periodic status reconciliation.', cycle)
+        # Raise to trigger Lambda error alarms; EC2 start/stop calls remain state-gated on any retry.
+        raise RuntimeError('Failed to schedule follow-up for: ' + '; '.join(schedule_failures))
+    return {'cycle_id': cycle, 'counts': {k: len(v) for k, v in results.items()},
+            'followups': len(involved)}
