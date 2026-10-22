@@ -1,0 +1,472 @@
+"""EC2 AutoScheduler — Lambda 2 (Status / Restore / Reconciliation).
+
+Handler: ec2_autoscheduler_status.lambda_handler
+Handles follow-up health, verification of stops, guarded original-type
+restoration, bounded retries and periodic tag reconciliation. See DEPLOYMENT.md.
+"""
+import json
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import boto3
+from botocore.exceptions import ClientError
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+REGION = 'ap-southeast-2'
+SNS_CAPACITY = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_capacity_fallback'
+SNS_HEALTH = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_health_check'
+SNS_STOP = 'arn:aws:sns:ap-southeast-2:050557606111:Autoscheduler_stop'
+SCHEDULER_ROLE_ARN = 'arn:aws:iam::050557606111:role/EC2Autoscheduler-SchedulerInvokeRole'
+ACCOUNTS_SSM = '/autoscheduler/Accounts'
+TAG_ORIGINAL = 'equip:infra:original-instance-type'
+MAX_RESTORE_ATTEMPTS = 8
+MAX_HEALTH_ATTEMPTS = 6
+RESTORE_RETRY_SECONDS = 180
+HEALTH_RETRY_SECONDS = 180
+REBOOT_RECHECK_SECONDS = 300
+BATCH_SIZE = 100
+
+sts = boto3.client('sts', region_name=REGION)
+sns = boto3.client('sns', region_name=REGION)
+ssm = boto3.client('ssm', region_name=REGION)
+scheduler = boto3.client('scheduler', region_name=REGION)
+cloudwatch = boto3.client('cloudwatch', region_name=REGION)
+
+
+def metric(name, value=1):
+    try:
+        cloudwatch.put_metric_data(Namespace='EC2AutoScheduler', MetricData=[{
+            'MetricName': name, 'Value': value, 'Unit': 'Count',
+            'Dimensions': [{'Name': 'Function', 'Value': 'Status'}]}])
+    except Exception:
+        log.exception('METRIC_DELIVERY_FAILED %s', name)
+
+
+def notify(topic, subject, message, cycle):
+    body = f'EC2 AutoScheduler | Cycle: {cycle} | Region: {REGION}\n' + message
+    try:
+        response = sns.publish(TopicArn=topic, Subject=subject[:100], Message=body)
+        log.info('SNS_SENT subject=%s message_id=%s cycle=%s', subject, response.get('MessageId'), cycle)
+        return True
+    except Exception:
+        log.exception('SNS_PUBLISH_FAILED subject=%s cycle=%s topic=%s', subject, cycle, topic)
+        metric('NotificationFailures')
+        return False
+
+
+def get_session(role_arn):
+    if not role_arn:
+        return boto3.Session()
+    credentials = sts.assume_role(RoleArn=role_arn, RoleSessionName='ec2-autoscheduler-status')['Credentials']
+    return boto3.Session(aws_access_key_id=credentials['AccessKeyId'],
+                         aws_secret_access_key=credentials['SecretAccessKey'],
+                         aws_session_token=credentials['SessionToken'])
+
+
+def get_ec2(acct):
+    return get_session(acct.get('role_arn')).client('ec2', region_name=REGION)
+
+
+def get_instance(ec2, iid):
+    response = ec2.describe_instances(InstanceIds=[iid])
+    matches = [x for reservation in response.get('Reservations', [])
+               for x in reservation.get('Instances', [])]
+    if len(matches) != 1:
+        raise RuntimeError(f'Expected one record for {iid}; got {len(matches)}')
+    return matches[0]
+
+
+def instance_tags(live):
+    return {tag['Key']: tag['Value'] for tag in live.get('Tags', [])}
+
+
+def format_line(acct, name, iid, explanation):
+    return f'- {acct} | {name} | {iid} | {explanation}'
+
+
+def validated_accounts():
+    raw = json.loads(ssm.get_parameter(Name=ACCOUNTS_SSM)['Parameter']['Value'])
+    if not isinstance(raw, list) or not raw:
+        raise ValueError('SSM account list must be a nonempty JSON array')
+    central = sts.get_caller_identity()['Account']
+    valid, failures, seen = [], [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            failures.append('Malformed account entry')
+            continue
+        aid = str(item.get('account_id', ''))
+        role = item.get('role_arn')
+        if not re.fullmatch(r'\d{12}', aid) or aid in seen:
+            failures.append(f'Invalid or duplicate account ID: {aid}')
+            continue
+        if role is None:
+            if aid != central:
+                failures.append(f'{aid}: null role cannot target external account')
+                continue
+        elif not isinstance(role, str) or not re.fullmatch(
+                rf'arn:aws[a-z-]*:iam::{aid}:role/[\w+=,.@/\-]+', role):
+            failures.append(f'{aid}: role ARN invalid')
+            continue
+        seen.add(aid)
+        valid.append({'account_id': aid, 'name': str(item.get('name') or aid), 'role_arn': role})
+    return valid, failures
+
+
+def create_recheck(kind, acct, iid, name, cycle, attempt=1, rebooted=False, delay=180):
+    payload = {'mode': 'recheck', 'cycle_id': cycle,
+               'recheck': {'kind': kind, 'account_id': acct['account_id'],
+                           'account_name': acct['name'], 'role_arn': acct.get('role_arn'),
+                           'instance_id': iid, 'instance_name': name, 'attempt': attempt,
+                           'rebooted': rebooted}}
+    run_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime('%Y-%m-%dT%H:%M:%S')
+    target = {'Arn': os.environ.get('AWS_LAMBDA_FUNCTION_ARN') or STATUS_LAMBDA_ARN,
+              'RoleArn': SCHEDULER_ROLE_ARN, 'Input': json.dumps(payload, separators=(',', ':')),
+              'RetryPolicy': {'MaximumRetryAttempts': 3, 'MaximumEventAgeInSeconds': 3600}}
+    dlq = os.environ.get('AUTOSCHEDULER_SCHEDULER_DLQ_ARN', '').strip()
+    if dlq:
+        target['DeadLetterConfig'] = {'Arn': dlq}
+    else:
+        log.warning('SCHEDULER_DLQ_UNCONFIGURED status Lambda; configure env var for reliable recovery')
+    name_schedule = f'ec2-autoscheduler-recheck-{uuid.uuid4().hex[:14]}'
+    scheduler.create_schedule(Name=name_schedule, ScheduleExpression=f'at({run_at})',
+                              ScheduleExpressionTimezone='UTC',
+                              FlexibleTimeWindow={'Mode': 'OFF'}, Target=target,
+                              ActionAfterCompletion='DELETE')
+    return name_schedule
+
+
+# The original deployed function name, unchanged.
+STATUS_LAMBDA_ARN = 'arn:aws:lambda:ap-southeast-2:050557606111:function:ec2_autoscheduler_status'
+
+
+def restore(ec2, acct, iid, name, cycle, attempt=0, verify_stop=False):
+    """Return (outcome, message): VERIFIED, CLEANED, NONE, PENDING or FAILED.
+
+    Never remove the original-type tag before verifying EC2 reports the
+    original instance type. A running downgraded instance is never modified.
+    """
+    account_name = acct['name']
+    try:
+        live = get_instance(ec2, iid)
+        state, current = live['State']['Name'], live['InstanceType']
+        original = instance_tags(live).get(TAG_ORIGINAL)
+        if original and state == 'running' and current == original and not verify_stop:
+            ec2.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
+            return 'CLEANED', format_line(account_name, name, iid, 'Stale original-type tag removed; already original type')
+        if not original and state == 'stopped' and verify_stop:
+            return 'STOPPED', format_line(account_name, name, iid, 'STOP VERIFIED; no instance-type restore required')
+        if not original and not verify_stop:
+            return 'NONE', ''
+        if state == 'running' and not verify_stop:
+            # Periodic reconciliation must not stop or resize running servers.
+            return 'NONE', ''
+        if state not in ('stopped',):
+            if attempt < MAX_RESTORE_ATTEMPTS:
+                create_recheck('restore', acct, iid, name, cycle, attempt + 1,
+                               delay=RESTORE_RETRY_SECONDS)
+                return 'PENDING', format_line(account_name, name, iid, f'EC2 {state}; restore/stop recheck {attempt+1}/{MAX_RESTORE_ATTEMPTS} scheduled')
+            metric('RestoreFailures')
+            return 'FAILED', format_line(account_name, name, iid, f'EC2 remained {state} after {attempt} retries; MANUAL ACTION')
+        if not original:
+            return 'STOPPED', format_line(account_name, name, iid, 'STOP VERIFIED; no original-type tag')
+        if current == original:
+            ec2.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
+            return 'CLEANED', format_line(account_name, name, iid, f'Already {original}; stale original-type tag removed')
+        ec2.modify_instance_attribute(InstanceId=iid, InstanceType={'Value': original})
+        verified = get_instance(ec2, iid)
+        if verified['State']['Name'] != 'stopped' or verified['InstanceType'] != original:
+            raise RuntimeError(f'Post-restore verification failed: state={verified["State"]["Name"]}, type={verified["InstanceType"]}')
+        log.info('RESTORE_VERIFIED instance=%s account=%s %s->%s cycle=%s',
+                 iid, acct['account_id'], current, original, cycle)
+        metric('RestorationsVerified')
+        try:
+            ec2.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
+        except Exception as cleanup_exc:
+            log.exception('RESTORED_BUT_TAG_CLEANUP_FAILED instance=%s', iid)
+            try:
+                create_recheck('restore', acct, iid, name, cycle, attempt + 1,
+                               delay=RESTORE_RETRY_SECONDS)
+                cleanup_note = 'tag cleanup retry scheduled'
+            except Exception as schedule_exc:
+                metric('SchedulerFailures')
+                cleanup_note = f'tag cleanup requires MANUAL ACTION: {schedule_exc}'
+            return 'VERIFIED_CLEANUP_PENDING', format_line(account_name, name, iid,
+                      f'RESTORED AND VERIFIED {current} -> {original}; tag deletion failed ({cleanup_exc}); {cleanup_note}')
+        return 'VERIFIED', format_line(account_name, name, iid,
+                                       f'RESTORED {current} -> {original}; stopped; tag removed; no action required')
+    except Exception as exc:
+        log.exception('RESTORE_ERROR account=%s instance=%s cycle=%s', account_name, iid, cycle)
+        if attempt < MAX_RESTORE_ATTEMPTS:
+            try:
+                create_recheck('restore', acct, iid, name, cycle, attempt + 1,
+                               delay=RESTORE_RETRY_SECONDS)
+                return 'PENDING', format_line(account_name, name, iid, f'Restore error: {exc}; retry {attempt+1}/{MAX_RESTORE_ATTEMPTS} scheduled')
+            except Exception as schedule_exc:
+                metric('SchedulerFailures')
+                metric('RestoreFailures')
+                return 'FAILED', format_line(account_name, name, iid,
+                                             f'Restore failed ({exc}); retry could NOT be scheduled ({schedule_exc})')
+        metric('RestoreFailures')
+        return 'FAILED', format_line(account_name, name, iid,
+                                     f'Restore failed after {attempt} retries: {exc}; original-type tag should be retained')
+
+
+def status_entries(ec2, ids):
+    """Chunk EC2 DescribeInstanceStatus requests; isolate failures per batch."""
+    states, checks, errors = {}, {}, {}
+    for ix in range(0, len(ids), BATCH_SIZE):
+        batch = ids[ix:ix+BATCH_SIZE]
+        try:
+            res = ec2.describe_instances(InstanceIds=batch)
+            for reservation in res.get('Reservations', []):
+                for instance in reservation.get('Instances', []):
+                    states[instance['InstanceId']] = instance['State']['Name']
+            checks_resp = ec2.describe_instance_status(InstanceIds=batch, IncludeAllInstances=True)
+            for entry in checks_resp.get('InstanceStatuses', []):
+                checks[entry['InstanceId']] = entry
+        except Exception as exc:
+            log.exception('HEALTH_BATCH_API_ERROR ids=%s', batch)
+            # Per-instance retry permits a bad ID to not suppress the others.
+            for iid in batch:
+                try:
+                    single = ec2.describe_instances(InstanceIds=[iid])
+                    inst = single['Reservations'][0]['Instances'][0]
+                    states[iid] = inst['State']['Name']
+                    result = ec2.describe_instance_status(InstanceIds=[iid], IncludeAllInstances=True)
+                    if result.get('InstanceStatuses'):
+                        checks[iid] = result['InstanceStatuses'][0]
+                except Exception as individual_exc:
+                    errors[iid] = str(individual_exc)
+    return states, checks, errors
+
+
+def health_category(state, check):
+    if state != 'running':
+        return 'initializing' if state in ('pending', 'stopping') else 'unknown'
+    if not check:
+        return 'unknown'
+    sys_status = check.get('SystemStatus', {}).get('Status', 'unknown')
+    inst_status = check.get('InstanceStatus', {}).get('Status', 'unknown')
+    if sys_status == inst_status == 'ok':
+        return 'ok'
+    if 'impaired' in (sys_status, inst_status):
+        return 'impaired'
+    if 'initializing' in (sys_status, inst_status):
+        return 'initializing'
+    return 'unknown'
+
+
+def inspect_health(ec2, acct, iid, name, cycle, attempt=0, rebooted=False,
+                   state=None, check=None, error=None):
+    """Return (category, full-line, attention-message)."""
+    account = acct['name']
+    if state is None and error is None:
+        states, checks, errors = status_entries(ec2, [iid])
+        state, check, error = states.get(iid, 'unknown'), checks.get(iid), errors.get(iid)
+    category = 'unknown' if error else health_category(state, check)
+    info = format_line(account, name, iid, f'state={state} | EC2 2/2={category.upper()}')
+    if error:
+        info += f' | API error={error}'
+    if category == 'ok':
+        if rebooted:
+            info += ' | RECOVERED after one automatic reboot'
+        elif attempt:
+            info += f' | Verified on retry {attempt}'
+        return category, info, None
+    if rebooted and category == 'impaired':
+        metric('HealthUnresolved')
+        return 'critical', info + ' | STILL IMPAIRED after single automatic reboot; MANUAL INTERVENTION REQUIRED', info
+    # After reboot, INITIALIZING/UNKNOWN is not a demonstrated failure. Recheck
+    # within the same bounded policy, never reboot a second time.
+    if category == 'impaired' and state == 'running':
+        try:
+            ec2.reboot_instances(InstanceIds=[iid])
+        except Exception as exc:
+            metric('HealthUnresolved')
+            return 'critical', info + f' | AUTO-REBOOT FAILED: {exc}', info + f' | Reboot failed: {exc}'
+        try:
+            create_recheck('health', acct, iid, name, cycle, attempt + 1,
+                           rebooted=True, delay=REBOOT_RECHECK_SECONDS)
+            return 'rebooted', info + ' | AUTO-REBOOT REQUESTED; one-time recheck scheduled', None
+        except Exception as exc:
+            metric('SchedulerFailures')
+            metric('HealthUnresolved')
+            return 'critical', info + f' | REBOOT REQUESTED, but recheck scheduling FAILED: {exc}', info + f' | Recheck scheduling failed: {exc}'
+    if attempt >= MAX_HEALTH_ATTEMPTS:
+        metric('HealthUnresolved')
+        return 'critical', info + f' | UNRESOLVED after {attempt} checks; MANUAL ACTION', info
+    try:
+        create_recheck('health', acct, iid, name, cycle, attempt + 1,
+                       rebooted=rebooted, delay=HEALTH_RETRY_SECONDS)
+        return 'pending', info + f' | Recheck {attempt+1}/{MAX_HEALTH_ATTEMPTS} scheduled', None
+    except Exception as exc:
+        metric('SchedulerFailures')
+        metric('HealthUnresolved')
+        return 'critical', info + f' | RECHECK SCHEDULING FAILED: {exc}', info + f' | Scheduler failed: {exc}'
+
+
+def send_restoration_report(outcomes, cycle):
+    report = [(status, line) for status, line in outcomes if status not in ('NONE',) and line]
+    if not report:
+        return
+    for kind, subject_status in (('VERIFIED', 'RESTORED'),
+                                 ('VERIFIED_CLEANUP_PENDING', 'RESTORED - TAG CLEANUP PENDING'),
+                                 ('PENDING', 'PENDING'),
+                                 ('FAILED', 'FAILED'), ('CLEANED', 'TAG CLEANUP')):
+        lines = [line for status, line in report if status == kind]
+        if lines:
+            notify(SNS_CAPACITY, f'[EC2 Scheduler][RESTORE][{subject_status}] {len(lines)} instance(s)',
+                   f'Original-instance-type restore result: {kind}\n' + '\n'.join(lines), cycle)
+    stopped = [line for status, line in report if status == 'STOPPED']
+    if stopped:
+        notify(SNS_STOP, f'[EC2 Scheduler][STOP][VERIFIED] {len(stopped)} instance(s)',
+               'EC2 stop verified:\n' + '\n'.join(stopped), cycle)
+
+
+def run_status(event, cycle):
+    accounts = event.get('accounts_involved') or {}
+    if not isinstance(accounts, dict):
+        raise ValueError('accounts_involved must be an object')
+    all_restores, lines_health, urgent, errors, reboots = [], [], [], [], []
+    for account_id, raw in accounts.items():
+        account = {'account_id': account_id, 'name': raw.get('name', account_id),
+                   'role_arn': raw.get('role_arn')}
+        start_ids = list(dict.fromkeys(raw.get('autostart_instance_ids') or []))
+        stop_ids = list(dict.fromkeys((raw.get('autostop_instance_ids') or []) +
+                                          (raw.get('restore_instance_ids') or [])))
+        names = raw.get('instance_names') or {}
+        try:
+            ec2 = get_ec2(account)
+            # Force an API call to surface failed role assumption before reporting.
+            if not hasattr(ec2, 'describe_instances'):
+                raise RuntimeError('EC2 client unavailable')
+        except Exception as exc:
+            errors.append(f'{account["name"]} ({account_id}) | assume-role/client failed: {exc}')
+            metric('AccountFailures')
+            # Don't silently drop attempted start health from summary.
+            lines_health.extend(format_line(account['name'], names.get(iid, 'Unnamed'), iid,
+                                            'NOT CHECKED | cross-account access failure') for iid in start_ids)
+            continue
+        for iid in stop_ids:
+            outcome = restore(ec2, account, iid, names.get(iid, 'Unnamed'), cycle,
+                              verify_stop=iid in raw.get('autostop_instance_ids', []))
+            all_restores.append(outcome)
+        if start_ids:
+            states, checks, api_errors = status_entries(ec2, start_ids)
+            for iid in start_ids:
+                category, line, urgent_line = inspect_health(
+                    ec2, account, iid, names.get(iid, 'Unnamed'), cycle,
+                    state=states.get(iid, 'unknown'), check=checks.get(iid), error=api_errors.get(iid))
+                lines_health.append(line)
+                if urgent_line:
+                    urgent.append(urgent_line)
+                if category == 'rebooted':
+                    reboots.append(line)
+    send_restoration_report(all_restores, cycle)
+    if reboots:
+        notify(SNS_CAPACITY, f'[EC2 Scheduler][HEALTH][AUTO-REBOOT] {len(reboots)} instance(s)',
+               'EC2 health impaired: a single automatic reboot was requested. Rechecks are scheduled.\n' +
+               '\n'.join(reboots), cycle)
+    if lines_health:
+        summary = f'FOLLOW-UP EC2 HEALTH REPORT | {len(lines_health)} start request(s)\n' + '\n'.join(lines_health)
+        if errors:
+            summary += '\n\nACCOUNT/API ERRORS:\n' + '\n'.join(errors)
+        notify(SNS_HEALTH, '[EC2 Scheduler][HEALTH][FOLLOW-UP] ' + str(len(lines_health)) + ' instance(s)',
+               summary, cycle)
+    if urgent or errors:
+        notify(SNS_CAPACITY, '[EC2 Scheduler][HEALTH/ACCOUNT][ATTENTION]',
+               'MANUAL ATTENTION / AUTOMATION ERROR:\n' + '\n'.join(urgent + errors), cycle)
+    return {'restorations': len(all_restores), 'health_checked': len(lines_health),
+            'errors': len(errors), 'urgent': len(urgent)}
+
+
+def run_recheck(event, cycle):
+    raw = event['recheck']
+    acct = {'account_id': raw['account_id'], 'name': raw['account_name'],
+            'role_arn': raw.get('role_arn')}
+    iid, name, kind = raw['instance_id'], raw.get('instance_name', 'Unnamed'), raw['kind']
+    attempt = int(raw.get('attempt', 0))
+    try:
+        ec2 = get_ec2(acct)
+        if kind == 'restore':
+            outcome = restore(ec2, acct, iid, name, cycle, attempt=attempt, verify_stop=True)
+            send_restoration_report([outcome], cycle)
+            return {'kind': kind, 'outcome': outcome[0]}
+        if kind == 'health':
+            category, line, urgent = inspect_health(ec2, acct, iid, name, cycle,
+                                                     attempt=attempt, rebooted=bool(raw.get('rebooted')))
+            if category != 'pending':
+                notify(SNS_HEALTH, f'[EC2 Scheduler][HEALTH][{category.upper()}]', line, cycle)
+            if urgent:
+                notify(SNS_CAPACITY, '[EC2 Scheduler][HEALTH][MANUAL INTERVENTION]', urgent, cycle)
+            return {'kind': kind, 'outcome': category}
+        raise ValueError(f'Unsupported recheck kind: {kind}')
+    except Exception as exc:
+        log.exception('RECHECK_FAILED kind=%s instance=%s cycle=%s', kind, iid, cycle)
+        metric('AccountFailures')
+        notify(SNS_CAPACITY, '[EC2 Scheduler][RECHECK][FAILED]',
+               f'Unable to recheck {iid} ({name}, {acct["name"]}), kind={kind}, attempt={attempt}: {exc}', cycle)
+        raise
+
+
+def run_reconcile(cycle):
+    """External EventBridge rule invokes {"mode":"reconcile"} every 15 minutes.
+
+    Deliberately does not start/stop any EC2 instance. Only stopped tagged
+    instances are resized back, and stopping ones get bounded retry.
+    """
+    accounts, config_errors = validated_accounts()
+    results, errors = [], list(config_errors)
+    for acct in accounts:
+        try:
+            ec2 = get_ec2(acct)
+            pages = ec2.get_paginator('describe_instances').paginate(
+                Filters=[{'Name': 'tag-key', 'Values': [TAG_ORIGINAL]}])
+            for page in pages:
+                for reservation in page.get('Reservations', []):
+                    for instance in reservation.get('Instances', []):
+                        iid = instance['InstanceId']
+                        state = instance['State']['Name']
+                        # Never resize a running EC2 instance; leave tag for shutdown.
+                        original = instance_tags(instance).get(TAG_ORIGINAL)
+                        # Avoid racing an Action Lambda that has JUST written
+                        # the safety tag but has not yet resized the server.
+                        # If already original, do not clean the tag in the
+                        # periodic job; normal start/stop handles stale tags.
+                        if original and original != instance['InstanceType'] and state in ('stopped', 'stopping'):
+                            name = instance_tags(instance).get('Name', 'Unnamed')
+                            results.append(restore(ec2, acct, iid, name, cycle))
+        except Exception as exc:
+            errors.append(f'{acct["name"]} ({acct["account_id"]}): {exc}')
+            metric('AccountFailures')
+            log.exception('RECONCILIATION_ACCOUNT_FAILED account=%s', acct['name'])
+    send_restoration_report(results, cycle)
+    if errors:
+        notify(SNS_CAPACITY, '[EC2 Scheduler][RECONCILE][FAILED]',
+               'Some accounts could not be reconciled:\n' + '\n'.join(errors), cycle)
+    return {'examined': len(results), 'errors': len(errors)}
+
+
+def lambda_handler(event, context):
+    event = event or {}
+    cycle = str(event.get('cycle_id') or uuid.uuid4().hex[:12])
+    mode = event.get('mode') or ('recheck' if 'recheck' in event else 'status')
+    log.info('STATUS_INVOKED mode=%s cycle=%s', mode, cycle)
+    try:
+        if mode == 'recheck':
+            return run_recheck(event, cycle)
+        if mode == 'reconcile':
+            return run_reconcile(cycle)
+        if mode == 'status':
+            return run_status(event, cycle)
+        raise ValueError(f'Unsupported status mode: {mode}')
+    except Exception as exc:
+        log.exception('STATUS_LAMBDA_FAILED mode=%s cycle=%s', mode, cycle)
+        metric('StatusFailures')
+        notify(SNS_CAPACITY, '[EC2 Scheduler][STATUS LAMBDA][FAILED]',
+               f'Mode: {mode}\nError: {exc}\nCheck CloudWatch logs for cycle {cycle}.', cycle)
+        raise
