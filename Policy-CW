@@ -1,0 +1,117 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<TARGET_ROLE_NAME>"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<REPORT_BUCKET>/<REPORT_PREFIX>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:ap-southeast-2:<SNS_ACCOUNT_ID>:<SNS_TOPIC_NAME>"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ap-southeast-2:<CENTRAL_ACCOUNT_ID>:log-group:/aws/lambda/<FUNCTION_NAME>:*"
+    }
+  ]
+}
+
+
+#############
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<REPORT_BUCKET>/<REPORT_PREFIX>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<REPORT_BUCKET>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "<REPORT_PREFIX>",
+            "<REPORT_PREFIX>/*"
+          ]
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:ap-southeast-2:<S3_KEY_ACCOUNT_ID>:key/<S3_KEY_ID>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.ap-southeast-2.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+###########
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-southeast-2"
+        }
+      }
+    }
+  ]
+}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "logs:PutRetentionPolicy",
+      "Resource": "arn:aws:logs:ap-southeast-2:<TARGET_ACCOUNT_ID>:log-group:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-southeast-2"
+        }
+      }
+    }
+  ]
+}
+##########
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<CENTRAL_ACCOUNT_ID>:role/<CENTRAL_ROLE_NAME>"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<EXTERNAL_ID>"
+        }
+      }
+    }
+  ]
+}
