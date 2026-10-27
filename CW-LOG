@@ -1,0 +1,233 @@
+"""CloudWatch Logs governance: read-only audit and explicitly gated retention enforcement.
+Python 3.12, boto3 provided by AWS Lambda. Cross-account central execution.
+"""
+import csv
+import io
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+CONFIG = Config(retries={'max_attempts': 8, 'mode': 'standard'})
+VALID_DAYS = {1,3,5,7,14,30,60,90,120,150,180,365,400,545,731,1096,1827,2192,2557,2922,3288,3653}
+REGION = os.getenv('AWS_REGION', 'ap-southeast-2')
+
+
+def flag(name, default=False):
+    return os.getenv(name, str(default)).lower() in ('true','1','yes')
+
+
+def env_list(name):
+    return [v.strip() for v in os.getenv(name, '').split(',') if v.strip()]
+
+
+def get_tags(client, arn):
+    # Newer accounts use ListTagsForResource; older SDK/permissions can differ.
+    try:
+        return client.list_tags_for_resource(resourceArn=arn).get('tags', {})
+    except ClientError as exc:
+        LOG.warning('Tag lookup failed for %s: %s', arn, exc)
+        return None  # Fail closed: do not update when tag inspection fails.
+
+
+def csv_bytes(rows, headers):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode('utf-8-sig')
+
+
+def money(value):
+    return str(Decimal(str(value)).quantize(Decimal('0.0001')))
+
+
+def actual_costs(ce, now, account_id=None):
+    # Cost Explorer is billed by AWS; GetCostAndUsage covers account-level charges,
+    # not attributable per log group. Calendar-month-to-date, UTC boundaries.
+    start = now.replace(day=1).date().isoformat()
+    end = (now.date() + timedelta(days=1)).isoformat()
+    if start >= end:
+        return {'status':'not_available'}
+    try:
+        response = ce.get_cost_and_usage(
+            TimePeriod={'Start':start, 'End':end}, Granularity='MONTHLY',
+            Metrics=['UnblendedCost'],
+            Filter={'And': ([{'Dimensions':{'Key':'SERVICE','Values':['AmazonCloudWatch']}}] + ([{'Dimensions':{'Key':'LINKED_ACCOUNT','Values':[account_id]}}] if account_id else []))},
+            GroupBy=[{'Type':'DIMENSION','Key':'USAGE_TYPE'}]
+        )
+        groups = []
+        for period in response.get('ResultsByTime', []):
+            for g in period.get('Groups', []):
+                groups.append({'usage_type':g['Keys'][0], 'cost_usd':g['Metrics']['UnblendedCost']['Amount']})
+        return {'status':'ok','start':start,'end_exclusive':end,
+                'cloudwatch_usage_types':groups,
+                'note':'Account-level AmazonCloudWatch service charges, not a per-log-group bill. Filter relevant Logs usage types manually.'}
+    except (ClientError, Exception) as exc:
+        LOG.warning('Cost Explorer unavailable: %s', exc)
+        return {'status':'unavailable','reason':str(exc)[:300]}
+
+
+def handler(event, context):
+    event = event or {}
+    region = os.getenv('TARGET_REGION', 'ap-southeast-2')
+    if region != 'ap-southeast-2':
+        raise ValueError('This deployment is restricted to ap-southeast-2')
+    target = int(os.getenv('RETENTION_DAYS', '365'))
+    if target not in VALID_DAYS:
+        raise ValueError(f'Unsupported CloudWatch retention days: {target}')
+    mode = str(event.get('mode', os.getenv('MODE','AUDIT'))).upper()
+    if mode not in ('AUDIT','ENFORCE'):
+        raise ValueError('MODE must be AUDIT or ENFORCE')
+    dry_run = flag('DRY_RUN', True)
+    # ENFORCE requires all three explicit gates. Events cannot bypass environment safeguards.
+    apply_changes = (mode == 'ENFORCE' and not dry_run and flag('ALLOW_ENFORCEMENT')
+                     and event.get('confirm') == 'APPLY_RETENTION')
+    if mode == 'ENFORCE' and not apply_changes:
+        LOG.warning('ENFORCE requested without all authorization gates; running dry run')
+    bucket = os.environ['REPORT_BUCKET']
+    prefix = os.environ.get("REPORT_PREFIX", "cloudwatch-logs/audit-reports/").strip("/")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    s3_key = f"{prefix}/cloudwatch_audit_{timestamp}.csv"
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=csv_content,
+        ContentType="text/csv"
+    )
+    exclude_prefixes = env_list('EXCLUDE_PREFIXES')
+    exclude_regex = os.getenv('EXCLUDE_REGEX','')
+    pattern = re.compile(exclude_regex) if exclude_regex else None
+    now = datetime.now(timezone.utc)
+    sts = boto3.client('sts', config=CONFIG)
+    account = sts.get_caller_identity()['Account']
+    targets = env_list('AWS_TARGET_ACCOUNTS') or [account]
+    if len(targets) != len(set(targets)) or any(not re.fullmatch(r'\d{12}', a) for a in targets):
+        raise ValueError('AWS_TARGET_ACCOUNTS must contain unique 12-digit account IDs')
+    role_name = os.getenv('TARGET_ROLE_NAME','CloudWatchLogsAuditRole')
+    if not re.fullmatch(r'[A-Za-z0-9+=,.@_/-]{1,64}',role_name):
+        raise ValueError('Invalid TARGET_ROLE_NAME')
+    logs = boto3.client('logs', region_name=region, config=CONFIG)
+    s3 = boto3.client('s3', region_name=region, config=CONFIG)
+    ses = boto3.client('ses', region_name=region, config=CONFIG)
+    rows = []
+    gb = Decimal(1024 ** 3)
+    price = Decimal(os.getenv('STORAGE_PRICE_USD_PER_GB_MONTH','0'))
+    failures = 0
+    account_failures = []
+    for target_account in targets:
+        try:
+            if target_account == account:
+                target_logs = logs
+            else:
+                assumed = sts.assume_role(RoleArn=f'arn:aws:iam::{target_account}:role/{role_name}',RoleSessionName='CloudWatchLogsGovernance')
+                credentials = assumed['Credentials']
+                target_logs = boto3.client('logs',region_name=region,config=CONFIG,
+                    aws_access_key_id=credentials['AccessKeyId'],
+                    aws_secret_access_key=credentials['SecretAccessKey'],
+                    aws_session_token=credentials['SessionToken'])
+            for page in target_logs.get_paginator('describe_log_groups').paginate():
+                for group in page.get('logGroups', []):
+                    name = group['logGroupName']
+                    old = group.get('retentionInDays')
+                    size = group.get('storedBytes',0)
+                    arn = group.get('arn','').removesuffix(':*')
+                    tags = get_tags(target_logs, arn)
+                    reason = ''
+                    if tags is None:
+                        reason = 'TAG_LOOKUP_FAILED'
+                    elif tags.get('LogRetentionExclude','').lower() in ('true','yes','1'):
+                        reason = 'EXCLUDE_TAG'
+                    elif any(name.startswith(p) for p in exclude_prefixes):
+                        reason = 'EXCLUDE_PREFIX'
+                    elif pattern and pattern.search(name):
+                        reason = 'EXCLUDE_REGEX'
+                    elif 'LogRetentionDays' in tags:
+                        reason = 'CUSTOM_RETENTION_TAG'
+                    desired = target
+                    if tags is not None and 'LogRetentionDays' in tags:
+                        try:
+                            desired = int(tags['LogRetentionDays'])
+                            if desired not in VALID_DAYS:
+                                reason = 'INVALID_CUSTOM_RETENTION'
+                        except ValueError:
+                            reason = 'INVALID_CUSTOM_RETENTION'
+                    candidate = not reason and (old is None or old > desired)
+                    status = 'EXCLUDED' if reason else ('NO_CHANGE' if not candidate else 'WOULD_UPDATE')
+                    if candidate and apply_changes:
+                        try:
+                            target_logs.put_retention_policy(logGroupName=name, retentionInDays=desired)
+                            status = 'UPDATE_API_SUCCEEDED'
+                        except ClientError as exc:
+                            failures += 1
+                            status = 'FAILED: ' + exc.response.get('Error',{}).get('Code','Unknown')
+                    created = group.get('creationTime')
+                    created_iso = datetime.fromtimestamp(created/1000,timezone.utc).isoformat() if created else ''
+                    stored_gb = Decimal(size)/gb
+                    rows.append({'account_id':target_account,'region':region,'log_group':name,
+                                 'log_class':group.get('logGroupClass','STANDARD'),
+                                 'created_utc':created_iso,'stored_bytes':size,
+                                 'stored_gb':str(stored_gb.quantize(Decimal('0.000001'))),
+                                 'existing_retention_days':old if old is not None else 'Never Expire',
+                                 'target_retention_days':desired,
+                                 'estimated_monthly_storage_usd':money(stored_gb*price) if price else 'NOT_CONFIGURED',
+                                 'exception_reason':reason,'action_status':status})
+        except Exception as exc:
+            failures += 1
+            LOG.exception('Target account %s failed', target_account)
+            account_failures.append({'account_id':target_account,'error':str(exc)[:350]})
+    counts = {}
+    for row in rows:
+        counts[row['action_status']] = counts.get(row['action_status'],0)+1
+    summary = {'generated_utc':now.isoformat(),'account_id':account,'region':region,
+               'mode_requested':mode,'changes_enabled':apply_changes,'retention_days':target,
+               'target_accounts':targets,'account_failures':account_failures,'log_group_count':len(rows), 'total_stored_gb':str((sum((Decimal(r['stored_gb']) for r in rows),Decimal(0))).quantize(Decimal('0.001'))),
+               'never_expire_count':sum(r['existing_retention_days']=='Never Expire' for r in rows),
+               'status_counts':counts,'update_failures':failures,
+               'storage_price_usd_per_gb_month':str(price),
+               'cost_note':'Illustrative storage estimate only; pricing depends on region, class and actual AWS bill. Zero price means estimate disabled.',
+               'deletion_note':'Retention updates cause AWS to expire older events asynchronously; no age-specific stored byte count is available from DescribeLogGroups.'}
+    if flag('INCLUDE_COST_EXPLORER', True):
+        summary['cost_explorer'] = actual_costs(boto3.client('ce',region_name='us-east-1',config=CONFIG), now)
+        summary['cost_explorer']['note'] = 'Central payer account costs if billing visibility is enabled; may not cover standalone accounts. Cross-account cost data requires billing access or separate target account queries.'
+    stamp = now.strftime('%Y/%m/%d/%H%M%S')
+    keybase = f'{prefix}/{account}/{region}/{stamp}'
+    headers = ['account_id','region','log_group','log_class','created_utc','stored_bytes','stored_gb',
+               'existing_retention_days','target_retention_days','estimated_monthly_storage_usd',
+               'exception_reason','action_status']
+    s3.put_object(Bucket=bucket,Key=keybase+'/log_groups.csv',Body=csv_bytes(rows,headers),ContentType='text/csv')
+    s3.put_object(Bucket=bucket,Key=keybase+'/summary.json',Body=json.dumps(summary,indent=2).encode(),ContentType='application/json')
+    summary['report_s3_prefix'] = f's3://{bucket}/{keybase}/'
+    sender = os.getenv('EMAIL_FROM','').strip()
+    recipients = env_list('EMAIL_TO')
+    if sender and recipients:
+        body = (f"CloudWatch Logs governance report\nAccount: {account}\nRegion: {region}\n"
+                f"Mode: {mode}\nChanges enabled: {apply_changes}\n"
+                f"Accounts: {', '.join(targets)}\nAccount failures: {account_failures}\nGroups: {len(rows)}\nStored GB: {summary['total_stored_gb']}\n"
+                f"Never Expire: {summary['never_expire_count']}\nStatuses: {counts}\n"
+                f"Report: {summary['report_s3_prefix']}\n"
+                'Storage estimates are illustrative; see summary.json for billing caveats.\n')
+        try:
+            ses.send_email(Source=sender,Destination={'ToAddresses':recipients},
+                           Message={'Subject':{'Data':f'CloudWatch Logs {mode} | {len(targets)} accounts | {now.date()}'},
+                                    'Body':{'Text':{'Data':body}}})
+            summary['email_status']='SENT'
+        except ClientError as exc:
+            summary['email_status']='FAILED: '+str(exc)[:200]
+            LOG.exception('SES notification failed')
+    else:
+        summary['email_status']='NOT_CONFIGURED'
+    LOG.info('SUMMARY %s',json.dumps(summary))
+    if failures:
+        raise RuntimeError(f'{failures} retention updates failed; report: {summary["report_s3_prefix"]}')
+    return summary
