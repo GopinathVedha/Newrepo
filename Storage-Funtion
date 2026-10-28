@@ -1,0 +1,210 @@
+"""Cross-account AWS storage audit. Python 3.12+, boto3 only. Handler: lambda_function.lambda_handler"""
+import boto3
+import csv
+import io
+import json
+import os
+import re
+import html
+import logging
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.config import Config
+from botocore.exceptions import ClientError, BotoCoreError
+
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+CFG = Config(retries={'max_attempts': 5, 'mode': 'standard'}, connect_timeout=5, read_timeout=30)
+UTC = timezone.utc
+FIELDS = ['account','region','service','category','name','resource_id','vault','resource_type','status','size_gib','standard_gib','ia_gib','archive_gib','provisioned_gib','recovery_points','metric_time','size_source','notes']
+S3_TYPES = ['StandardStorage','StandardIAStorage','StandardIASizeOverhead','StandardIAObjectOverhead','OneZoneIAStorage','OneZoneIASizeOverhead','IntelligentTieringFAStorage','IntelligentTieringIAStorage','IntelligentTieringAAStorage','IntelligentTieringAIAStorage','IntelligentTieringDAAStorage','IntelligentTieringAAObjectOverhead','ReducedRedundancyStorage','GlacierStorage','GlacierStagingStorage','GlacierObjectOverhead','GlacierS3ObjectOverhead','DeepArchiveStorage','DeepArchiveObjectOverhead','DeepArchiveStagingStorage','GlacierInstantRetrievalStorage','GlacierIRSizeOverhead','ExpressOneZoneStorage']
+
+def env_list(key):
+    return [x.strip() for x in re.split('[,;\\s]+', os.getenv(key, '')) if x.strip()]
+
+def client(session, service, region):
+    return session.client(service, region_name=region, config=CFG)
+
+def pages(c, operation, result_key, **kwargs):
+    if c.can_paginate(operation):
+        for page in c.get_paginator(operation).paginate(**kwargs):
+            yield from page.get(result_key, [])
+    else:
+        yield from getattr(c, operation)(**kwargs).get(result_key, [])
+
+def gib(value):
+    return round(float(value) / (1024 ** 3), 4) if value is not None else None
+
+def row(account, region, service, category, name, **kw):
+    obj = {x: '' for x in FIELDS}
+    obj.update(account=account, region=region, service=service, category=category, name=name)
+    obj.update(kw)
+    return obj
+
+def error(errors, account, region, service, exception, resource=''):
+    message = str(exception)
+    LOG.warning('%s %s %s %s: %s', account, region, service, resource, message)
+    errors.append({'account':account,'region':region,'service':service,'resource':resource,'error':message[:500]})
+
+def assume(account, role, external_id):
+    c = boto3.client('sts', config=CFG)
+    req = {'RoleArn':f'arn:aws:iam::{account}:role/{role}','RoleSessionName':'StorageInventoryAudit'}
+    if external_id: req['ExternalId'] = external_id
+    creds = c.assume_role(**req)['Credentials']
+    return boto3.Session(aws_access_key_id=creds['AccessKeyId'],aws_secret_access_key=creds['SecretAccessKey'],aws_session_token=creds['SessionToken'])
+
+def metric(c, namespace, metric_name, dimensions, days=3, period=3600):
+    end = datetime.now(UTC)
+    data = c.get_metric_statistics(Namespace=namespace,MetricName=metric_name,Dimensions=[{'Name':k,'Value':v} for k,v in dimensions.items()],StartTime=end-timedelta(days=days),EndTime=end,Period=period,Statistics=['Average'])['Datapoints']
+    if not data: return None, ''
+    p = max(data,key=lambda v:v['Timestamp'])
+    return p['Average'],p['Timestamp'].isoformat()
+
+def backup_inventory(session, account, region, rows, errors):
+    c = client(session,'backup',region)
+    try:
+        for vault in pages(c,'list_backup_vaults','BackupVaultList'):
+            name = vault['BackupVaultName']
+            groups = defaultdict(lambda: {'count':0,'bytes':0,'missing':0})
+            total = 0
+            try:
+                for point in pages(c,'list_recovery_points_by_backup_vault','RecoveryPoints',BackupVaultName=name):
+                    total += 1
+                    typ = point.get('ResourceType') or 'Unknown'
+                    g=groups[typ]
+                    g['count'] += 1
+                    size=point.get('BackupSizeInBytes')
+                    if size is None or size < 0: g['missing'] += 1
+                    else: g['bytes'] += size
+                for typ,g in sorted(groups.items()):
+                    rows.append(row(account,region,'AWS Backup','Recovery points by type',name,resource_id=vault.get('BackupVaultArn',''),vault=name,resource_type=typ,status='PARTIAL' if g['missing'] else 'OK',size_gib=gib(g['bytes']) if g['count']>g['missing'] else None,recovery_points=g['count'],size_source='Sum of reported recovery point sizes',notes=f"{g['missing']} recovery points without reported size; not physical billed usage"))
+                rows.append(row(account,region,'AWS Backup','Vault total',name,resource_id=vault.get('BackupVaultArn',''),vault=name,status='OK' if not any(x['missing'] for x in groups.values()) else 'PARTIAL',size_gib=gib(sum(x['bytes'] for x in groups.values())) if total and any(x['count']>x['missing'] for x in groups.values()) else (0 if not total else None),recovery_points=total,size_source='Sum of recovery point reported sizes',notes='Logical sum, NOT physical billed vault usage; excludes unknown sizes'))
+            except (ClientError,BotoCoreError,Exception) as ex:
+                error(errors,account,region,'AWS Backup',ex,name)
+                rows.append(row(account,region,'AWS Backup','Vault total',name,vault=name,status='ERROR',notes='Recovery point enumeration failed'))
+    except Exception as ex: error(errors,account,region,'AWS Backup',ex)
+
+def efs_inventory(session, account, region, rows, errors):
+    c=client(session,'efs',region)
+    try:
+        for fs in pages(c,'describe_file_systems','FileSystems'):
+            try:
+                fsid=fs['FileSystemId']; sz=fs.get('SizeInBytes',{})
+                name=fs.get('Name') or next((t['Value'] for t in fs.get('Tags',[]) if t.get('Key')=='Name'),fsid)
+                rows.append(row(account,region,'EFS','File system',name,resource_id=fsid,status=fs.get('LifeCycleState',''),size_gib=gib(sz.get('Value')),standard_gib=gib(sz.get('ValueInStandard')),ia_gib=gib(sz.get('ValueInIA')),archive_gib=gib(sz.get('ValueInArchive')),metric_time=sz.get('Timestamp').isoformat() if sz.get('Timestamp') else '',size_source='EFS SizeInBytes API',notes='Metered bytes; IA/Archive are EFS storage classes'))
+            except Exception as ex: error(errors,account,region,'EFS',ex,fs.get('FileSystemId',''))
+    except Exception as ex: error(errors,account,region,'EFS',ex)
+
+def fsx_inventory(session, account, region, rows, errors):
+    c=client(session,'fsx',region); cw=client(session,'cloudwatch',region)
+    try:
+        for fs in pages(c,'describe_file_systems','FileSystems'):
+            fid=fs.get('FileSystemId',''); ftype=fs.get('FileSystemType','Unknown')
+            name=next((t.get('Value') for t in fs.get('Tags',[]) if t.get('Key')=='Name'),fid)
+            provisioned=fs.get('StorageCapacity')
+            used=ia=None; times=[]; notes=[]
+            try:
+                if ftype=='ONTAP':
+                    # File-system-wide detailed tier metrics (do not sum volume metrics).
+                    used_ssd,t1=metric(cw,'AWS/FSx','StorageUsed',{'FileSystemId':fid,'StorageTier':'SSD','DataType':'All'})
+                    used_pool,t2=metric(cw,'AWS/FSx','StorageUsed',{'FileSystemId':fid,'StorageTier':'StandardCapacityPool','DataType':'All'})
+                    if used_ssd is not None or used_pool is not None:
+                        used=(used_ssd or 0)+(used_pool or 0)
+                        ia=used_pool
+                    times=[x for x in (t1,t2) if x]
+                    notes.append('Capacity pool is FSx ONTAP tiering, not EFS IA')
+                else:
+                    # This metric is only displayed if AWS actually publishes it for this filesystem.
+                    used,t=metric(cw,'AWS/FSx','StorageUsed',{'FileSystemId':fid})
+                    if t: times.append(t)
+                    notes.append('IA is not available as a universal FSx metric')
+            except Exception as ex:
+                error(errors,account,region,'FSx CloudWatch',ex,fid)
+            rows.append(row(account,region,'FSx',ftype,name,resource_id=fid,status=fs.get('Lifecycle',''),size_gib=gib(used),ia_gib=gib(ia),provisioned_gib=round(float(provisioned),4) if provisioned is not None else None,metric_time=max(times) if times else '',size_source='CloudWatch AWS/FSx StorageUsed' if used is not None else 'No compatible used-storage metric available',notes='; '.join(notes)))
+    except Exception as ex: error(errors,account,region,'FSx',ex)
+
+def s3_inventory(session, account, rows, errors, region_allow):
+    c=client(session,'s3',region_allow[0]); now=datetime.now(UTC)
+    try: buckets=c.list_buckets().get('Buckets',[])
+    except Exception as ex:
+        error(errors,account,'global','S3',ex); return
+    for b in buckets:
+        name=b['Name']
+        try:
+            loc=c.get_bucket_location(Bucket=name).get('LocationConstraint')
+            region='us-east-1' if not loc else ('eu-west-1' if loc=='EU' else loc)
+            if region not in region_allow: continue
+            cw=client(session,'cloudwatch',region)
+            seen={}; latest=''
+            # Enumerate only actual AWS/S3 BucketSizeBytes metric StorageType dimensions.
+            for m in pages(cw,'list_metrics','Metrics',Namespace='AWS/S3',MetricName='BucketSizeBytes',Dimensions=[{'Name':'BucketName','Value':name}]):
+                dims={x['Name']:x['Value'] for x in m.get('Dimensions',[])}
+                typ=dims.get('StorageType')
+                if typ not in S3_TYPES or dims.get('BucketName') != name or typ in seen: continue
+                value,dt=metric(cw,'AWS/S3','BucketSizeBytes',{'BucketName':name,'StorageType':typ},days=4,period=86400)
+                if value is not None: seen[typ]=value;latest=max(latest,dt)
+            # Empty buckets may have no published storage metrics; keep unknown instead of false zero.
+            total=sum(seen.values()) if seen else None
+            ia=sum(v for k,v in seen.items() if k in ('StandardIAStorage','StandardIASizeOverhead','StandardIAObjectOverhead','OneZoneIAStorage','OneZoneIASizeOverhead','IntelligentTieringIAStorage','IntelligentTieringAIAStorage','IntelligentTieringAAStorage')) if seen else None
+            archive=sum(v for k,v in seen.items() if 'Glacier' in k or 'DeepArchive' in k or 'IntelligentTieringDAA' in k) if seen else None
+            rows.append(row(account,region,'S3','Bucket total',name,resource_id=name,status='OK' if seen else 'NO_METRIC',size_gib=gib(total),ia_gib=gib(ia),archive_gib=gib(archive),metric_time=latest,size_source='CloudWatch daily BucketSizeBytes',notes='All reported storage classes, including overhead; no metrics means unknown size'))
+            for typ,value in sorted(seen.items()):
+                rows.append(row(account,region,'S3','Storage class',name,resource_id=name,resource_type=typ,status='OK',size_gib=gib(value),metric_time=latest,size_source='CloudWatch daily BucketSizeBytes',notes='Breakdown; do not add to Bucket total'))
+        except Exception as ex:
+            error(errors,account,'bucket','S3',ex,name)
+            rows.append(row(account,'unknown','S3','Bucket total',name,resource_id=name,status='ERROR',notes='Unable to retrieve location or metrics'))
+
+def html_report(rows, errors, generated):
+    payload=json.dumps({'rows':rows,'errors':errors,'generated':generated},ensure_ascii=True).replace('</','<\\/')
+    return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AWS Multi-Account Storage Audit</title>
+<style>body{font-family:system-ui,Arial,sans-serif;margin:0;background:#f5f7fb;color:#17233c}header{background:#112b49;color:white;padding:24px 4%}h1{margin:0 0 8px}main{padding:22px 4%}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}.card,.panel{background:white;border:1px solid #d9e2ed;border-radius:9px;padding:15px}.big{font-size:24px;font-weight:bold}.filters{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}select,input,button{padding:10px;border:1px solid #b9c8d9;border-radius:6px;max-width:100%}button{background:#1265a8;color:white;cursor:pointer}button.secondary{background:white;color:#153b61}.tabs button{margin-right:6px}.scroll{overflow:auto;max-height:65vh}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}th,td{padding:9px;border-bottom:1px solid #e6ebf1;text-align:left}th{background:#e8f0fa;position:sticky;top:0;cursor:pointer}tr:hover{background:#f5faff}.muted{color:#627086;font-size:13px}.warning{color:#a05700}a{color:#1265a8}</style></head><body><header><h1>Multi-Account AWS Storage Audit</h1><div id="timestamp"></div></header><main><div class="cards" id="cards"></div><section class="panel"><div class="tabs"><button onclick="switchTab('data')">Inventory</button><button onclick="switchTab('errors')">Collection errors</button></div><div class="filters"><select id="account"></select><select id="region"></select><select id="service"></select><select id="category"></select><select id="vault"></select><select id="type"></select><select id="status"></select><input id="query" placeholder="Search vault, bucket, resource..." aria-label="Search"><button onclick="downloadCsv()">Export filtered CSV</button><button class="secondary" onclick="resetFilters()">Reset</button></div><p class="muted" id="count"></p><div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div></section><p class="muted">Sizes are GiB (1024³ bytes). Blank = unknown/not applicable. AWS Backup recovery-point totals are not physical billed vault storage. FSx capacity pool is not EFS IA. S3 daily metrics may lag; S3 total rows must not be added to storage-class rows.</p></main>
+<script id="payload" type="application/json">''' + payload + '''</script><script>
+const source=JSON.parse(document.getElementById('payload').textContent);let tab='data',sortKey='',sortAsc=true;
+const fields=['account','region','service','category','name','resource_id','vault','resource_type','status','size_gib','standard_gib','ia_gib','archive_gib','provisioned_gib','recovery_points','metric_time','size_source','notes'];const errorFields=['account','region','service','resource','error'];const filterMap={account:'account',region:'region',service:'service',category:'category',vault:'vault',type:'resource_type',status:'status'};
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function init(){document.getElementById('timestamp').textContent='Generated UTC: '+source.generated;for(const [id,key] of Object.entries(filterMap)){const el=document.getElementById(id);el.innerHTML='<option value="">All '+id+'</option>'+[...new Set(source.rows.map(r=>r[key]).filter(Boolean))].sort().map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');el.addEventListener('change',render)}document.getElementById('query').addEventListener('input',render);document.getElementById('cards').innerHTML=['AWS Backup','S3','EFS','FSx'].map(s=>{let x=source.rows.filter(r=>r.service===s&&(s!=='AWS Backup'||r.category==='Vault total')&&(s!=='S3'||r.category==='Bucket total'));let sum=x.reduce((n,r)=>n+(Number(r.size_gib)||0),0);return '<div class="card"><div>'+esc(s)+'</div><div class="big">'+x.length+' resources</div><div class="muted">Reported: '+sum.toLocaleString(undefined,{maximumFractionDigits:2})+' GiB</div></div>'}).join('');render()}
+function switchTab(t){tab=t;render()}
+function filtered(){let data=source[tab==='data'?'rows':'errors'].filter(r=>Object.entries(filterMap).every(([id,key])=>!document.getElementById(id).value||r[key]===document.getElementById(id).value));let q=document.getElementById('query').value.trim().toLowerCase();if(q)data=data.filter(r=>Object.values(r).join(' ').toLowerCase().includes(q));if(sortKey)data.sort((a,b)=>{let x=a[sortKey]??'',y=b[sortKey]??'';let c=(typeof x==='number'&&typeof y==='number')?x-y:String(x).localeCompare(String(y),undefined,{numeric:true});return sortAsc?c:-c});return data}
+function render(){const cols=tab==='data'?fields:errorFields;document.getElementById('head').innerHTML='<tr>'+cols.map(c=>'<th data-key="'+c+'">'+c.replaceAll('_',' ')+'</th>').join('')+'</tr>';document.querySelectorAll('th').forEach(e=>e.onclick=()=>{if(sortKey===e.dataset.key)sortAsc=!sortAsc;else{sortKey=e.dataset.key;sortAsc=true}render()});const data=filtered();document.getElementById('count').textContent=data.length+' rows ('+source.errors.length+' collection errors across report)';document.getElementById('body').innerHTML=data.map(r=>'<tr>'+cols.map(c=>'<td>'+esc(r[c])+'</td>').join('')+'</tr>').join('')||'<tr><td colspan="'+cols.length+'">No matching rows</td></tr>'}
+function resetFilters(){Object.keys(filterMap).forEach(k=>document.getElementById(k).value='');document.getElementById('query').value='';sortKey='';render()}
+function downloadCsv(){const cols=tab==='data'?fields:errorFields;const text=[cols,...filtered().map(r=>cols.map(c=>r[c]??''))].map(a=>a.map(v=>'"'+String(v).replace(/^[=+@\\-]/,'\\' $&').replaceAll('"','""')+'"').join(',')).join('\\r\\n');const blob=new Blob([text],{type:'text/csv;charset=utf-8;'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='aws-storage-'+tab+'-filtered.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),2000)}
+init();</script></body></html>'''.replace("replace(/^[=+@\\-]/,'\\' $&')", "replace(/^[=+@\\-]/, m => '\\'' + m)")
+
+def lambda_handler(event, context):
+    accounts=env_list('ACCOUNT_IDS'); regions=env_list('REGIONS');role=os.getenv('TARGET_ROLE_NAME','CentralStorageAuditReadRole');external=os.getenv('EXTERNAL_ID','').strip()
+    bucket=os.environ['REPORT_BUCKET'];prefix=os.getenv('REPORT_PREFIX','storage-audit/').strip('/')
+    if not regions: raise ValueError('REGIONS must include the regions to inventory')
+    if not accounts: raise ValueError('ACCOUNT_IDS is required')
+    if not re.fullmatch(r'[0-9]{12}',accounts[0]) or any(not re.fullmatch(r'[0-9]{12}',x) for x in accounts): raise ValueError('ACCOUNT_IDS must contain 12-digit AWS account IDs')
+    errors=[]; allrows=[]; now=datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+    def work(account):
+        rr=[];ee=[]
+        try:
+            sess=assume(account,role,external)
+            for region in regions:
+                for fn in (backup_inventory,efs_inventory,fsx_inventory):
+                    try: fn(sess,account,region,rr,ee)
+                    except Exception as exc: error(ee,account,region,fn.__name__,exc)
+            s3_inventory(sess,account,rr,ee,regions)
+        except Exception as exc: error(ee,account,'all','AssumeRole',exc)
+        return rr,ee
+    with ThreadPoolExecutor(max_workers=min(int(os.getenv('MAX_WORKERS','4')),len(accounts),12)) as pool:
+        for fut in as_completed([pool.submit(work,a) for a in accounts]):
+            r,e=fut.result();allrows.extend(r);errors.extend(e)
+    allrows.sort(key=lambda x:(x['account'],x['region'],x['service'],x['name'],x['category'],x['resource_type']))
+    out=html_report(allrows,errors,now).encode('utf-8')
+    stamp=datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ');s3=boto3.client('s3',config=CFG)
+    extra={}
+    if os.getenv('SSE_KMS_KEY_ID'):extra={'ServerSideEncryption':'aws:kms','SSEKMSKeyId':os.environ['SSE_KMS_KEY_ID']}
+    else:extra={'ServerSideEncryption':'AES256'}
+    root=prefix+'/' if prefix else ''
+    report_key=f'{root}reports/storage-audit-{stamp}.html';latest_key=f'{root}latest/storage-audit.html'
+    for key in (report_key,latest_key):
+        s3.put_object(Bucket=bucket,Key=key,Body=out,ContentType='text/html; charset=utf-8',**extra)
+    buf=io.StringIO();w=csv.DictWriter(buf,fieldnames=FIELDS);w.writeheader();w.writerows(allrows)
+    s3.put_object(Bucket=bucket,Key=f'{root}reports/storage-audit-{stamp}.csv',Body=buf.getvalue().encode('utf-8-sig'),ContentType='text/csv',**extra)
+    s3.put_object(Bucket=bucket,Key=f'{root}reports/storage-audit-{stamp}-errors.json',Body=json.dumps(errors,indent=2).encode(),ContentType='application/json',**extra)
+    result={'accounts':len(accounts),'rows':len(allrows),'errors':len(errors),'bucket':bucket,'html_key':report_key,'latest_html_key':latest_key}
+    LOG.info('Completed %s',json.dumps(result))
+    return result
