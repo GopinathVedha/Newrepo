@@ -1,0 +1,115 @@
+AWS MULTI-ACCOUNT STORAGE AUDIT -- IAM POLICIES AND DIRECT LAMBDA DEPLOYMENT
+================================================================================
+1) TARGET ACCOUNT: Create IAM role CentralStorageAuditReadRole in EACH target account.
+Trust policy (replace MANAGEMENT_ACCOUNT_ID and EXTERNAL_ID; remove ExternalId condition if not using it):
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"AWS": "arn:aws:iam::MANAGEMENT_ACCOUNT_ID:role/CentralStorageAuditLambdaRole"},
+    "Action": "sts:AssumeRole",
+    "Condition": {"StringEquals": {"sts:ExternalId": "CHANGE_TO_SHARED_EXTERNAL_ID"}}
+  }]
+}
+
+Attach target-role permissions policy (read-only, all resources needed for inventory):
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid":"BackupRead","Effect":"Allow","Action":["backup:ListBackupVaults","backup:ListRecoveryPointsByBackupVault"],"Resource":"*"},
+    {"Sid":"FileSystemsRead","Effect":"Allow","Action":["efs:DescribeFileSystems","fsx:DescribeFileSystems"],"Resource":"*"},
+    {"Sid":"S3InventoryRead","Effect":"Allow","Action":["s3:ListAllMyBuckets","s3:GetBucketLocation"],"Resource":"*"},
+    {"Sid":"CloudWatchMetricsRead","Effect":"Allow","Action":["cloudwatch:ListMetrics","cloudwatch:GetMetricStatistics"],"Resource":"*"}
+  ]
+}
+
+NOTE: s3:GetBucketLocation for buckets restricted by bucket policies or SCPs may need special permission.
+AWS Organizations is NOT required. Cross-account AssumeRole uses the listed account IDs.
+
+2) MANAGEMENT ACCOUNT: Create execution role CentralStorageAuditLambdaRole.
+Lambda service trust policy:
+{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]
+}
+
+Attach management-role permissions policy (replace account IDs, destination bucket, and prefix):
+{
+  "Version":"2012-10-17",
+  "Statement":[
+    {"Sid":"AssumeTargetRoles","Effect":"Allow","Action":"sts:AssumeRole","Resource":[
+      "arn:aws:iam::111111111111:role/CentralStorageAuditReadRole",
+      "arn:aws:iam::222222222222:role/CentralStorageAuditReadRole"
+    ]},
+    {"Sid":"WriteReport","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::MY_EXISTING_BUCKET/storage-audit/*"},
+    {"Sid":"CreateLogs","Effect":"Allow","Action":"logs:CreateLogGroup","Resource":"arn:aws:logs:*:MANAGEMENT_ACCOUNT_ID:*"},
+    {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:MANAGEMENT_ACCOUNT_ID:log-group:/aws/lambda/*:*"}
+  ]
+}
+
+S3 bucket policy: Not required when bucket is in same management account and no explicit deny applies;
+the Lambda role's identity policy can authorize PutObject. If cross-account bucket, its bucket policy
+MUST explicitly authorize the Lambda execution-role principal s3:PutObject for the chosen prefix.
+
+Optional SSE-KMS for REPORT bucket: Add to Lambda execution role:
+{
+ "Version":"2012-10-17",
+ "Statement":[{"Effect":"Allow","Action":["kms:GenerateDataKey","kms:Decrypt"],
+ "Resource":"arn:aws:kms:REGION:MANAGEMENT_ACCOUNT_ID:key/YOUR-KEY-ID"}]
+}
+The customer-managed KMS key policy must permit this role (directly or through IAM).
+For S3 Bucket Keys or report reading, also grant kms:Decrypt to report readers as appropriate.
+Reading EFS, FSx, AWS Backup, and CloudWatch metadata does NOT require decrypting their data keys.
+
+3) LAMBDA SETTINGS (create directly in AWS Console; no SAM/CloudFormation)
+Runtime: Python 3.12 or newer supported runtime with boto3.
+Handler: lambda_function.lambda_handler
+Architecture: x86_64 or arm64.
+Timeout: up to 900 sec (15 min); start at 900 for many accounts/regions.
+Memory: start 1024 MB; increase for large inventories and embedded HTML dataset.
+Place the function outside a VPC unless VPC networking is necessary; VPC requires NAT or suitable endpoints.
+Lambda must be able to reach AWS STS, S3, CloudWatch, Backup, EFS and FSx endpoints.
+
+Environment variables example:
+ACCOUNT_IDS=111111111111,222222222222
+REGIONS=ap-southeast-2,ap-south-1,us-east-1
+TARGET_ROLE_NAME=CentralStorageAuditReadRole
+EXTERNAL_ID=CHANGE_TO_SHARED_EXTERNAL_ID
+REPORT_BUCKET=MY_EXISTING_BUCKET
+REPORT_PREFIX=storage-audit/production
+MAX_WORKERS=4
+# Optional, only for S3 SSE-KMS report encryption:
+SSE_KMS_KEY_ID=arn:aws:kms:REGION:MANAGEMENT_ACCOUNT_ID:key/YOUR-KEY-ID
+
+REGIONS must include every region you want scanned, and regions of S3 buckets you want reported.
+The code reads ALL accounts given; include the management account as a target only if you create
+and trust the target role there too.
+
+4) DEPLOYMENT
+- Create target IAM role with trust and read-only permissions in EACH target account.
+- Create management Lambda execution role and attach management policy.
+- AWS Lambda > Create function > Author from scratch > choose Python runtime and execution role.
+- Paste/upload lambda_function.py and set handler as above.
+- Set environment variables, timeout, memory, and click Deploy.
+- Use a Test event: {} . The function returns the keys it uploaded.
+- Read report from s3://MY_EXISTING_BUCKET/storage-audit/production/latest/storage-audit.html
+  and dated report from s3://.../reports/storage-audit-YYYYMMDDTHHMMSSZ.html
+- S3 console 'Open' or download HTML and open locally in browser; JavaScript filtering/export
+  requires allowing local file JavaScript. For secure shared access, use an authenticated
+  portal or controlled CloudFront distribution, not a public S3 bucket.
+- Optionally schedule this Lambda with Amazon EventBridge Scheduler; allow lambda:InvokeFunction.
+- Run once manually and review *-errors.json for partial failures before relying on totals.
+
+5) LIMITATIONS AND COST ACCURACY
+- AWS Backup: sizes = sum BackupSizeInBytes on recovery points, NOT actual physical/billable
+  vault usage; incremental and shared storage prevents treating this as a billing total.
+- S3: CloudWatch BucketSizeBytes daily metrics, including eligible storage-class overhead;
+  blank/NO_METRIC means metric missing (NOT an empty bucket). Bucket total and class rows overlap.
+- EFS: SizeInBytes metered Standard, IA and Archive; AWS updates periodically.
+- FSx: ONTAP uses per-file-system StorageUsed SSD + StandardCapacityPool metrics; other FSx
+  types show StorageUsed only IF published with the simple FileSystemId dimension.
+  If unavailable, used size is blank; provisioned capacity remains visible. IA for
+  non-ONTAP FSx types is not assumed. FSx provisioned capacity is GiB.
+- Large accounts: Lambda 15-minute timeout / HTML memory can be exceeded. Split accounts into
+  batches or regional invocations and merge results using Step Functions/S3 for very large estates.
+- No delete, restore, modify, or S3 object-read permissions are requested.
