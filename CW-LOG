@@ -12,15 +12,11 @@ from datetime import datetime, timezone
 REGION = "ap-southeast-2"
 RETENTIONS = {1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545,
               731, 1096, 1827, 2192, 2557, 2922, 3288, 3653}
-FIELDS = ["account_id", "region", "log_group", "log_class", "retention_before",
-          "target_days", "status", "stored_bytes_snapshot", "storage_gib_proxy",
-          "usd_per_gib_month_input", "monthly_storage_usd_proxy", "detail"]
-CAVEAT = ("Storage cost proxy only: snapshot storedBytes / 2^30 multiplied by your supplied "
-          "class-specific monthly rate. Not an AWS bill or savings forecast. Archived storage "
-          "billing uses compressed data; inventory is not a billing meter. No age distribution "
-          "is available, so reclaimable bytes and savings are unknown. Ingestion, queries, "
-          "taxes, discounts, free tier, S3, SNS, KMS and Lambda costs are excluded. "
-          "Retention does not refund ingestion charges. Bytes are captured before changes.")
+FIELDS = ["account_id", "region", "log_group", "log_class", "retention_before", "status", "stored_bytes_snapshot"]
+CAVEAT = ("Note: Stored bytes are a snapshot, not billed storage or potential savings. "
+          "AWS bills compressed archival storage separately; ingestion and other charges are excluded. "
+          "Retention deletion is asynchronous.")
+
 
 
 def boolean(env, name, default):
@@ -39,8 +35,7 @@ def configuration(env=None):
     if days not in RETENTIONS:
         raise ValueError("RETENTION_DAYS is not supported by CloudWatch Logs")
     dry = boolean(env, "DRY_RUN", "true")
-    if not dry and env.get("ENFORCEMENT_CONFIRMATION") != f"APPLY_RETENTION_{days}_DAYS":
-        raise ValueError("Enforcement blocked: confirmation must match APPLY_RETENTION_<days>_DAYS")
+    allow = boolean(env, "ALLOW_ENFORCEMENT", "false")
     bucket = env.get("REPORT_BUCKET", "").strip()
     prefix = env.get("REPORT_PREFIX", "cloudwatch-retention-audit").strip("/")
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
@@ -65,14 +60,17 @@ def configuration(env=None):
     if key and not re.fullmatch(r"arn:aws:kms:ap-southeast-2:\d{12}:key/[A-Za-z0-9-]+", key):
         raise ValueError("S3_KMS_KEY_ARN must be a full key ARN in ap-southeast-2")
     excludes = [x.strip() for x in env.get("EXCLUDE_LOG_GROUP_PREFIXES", "").split(",") if x.strip()]
-    return dict(excludes=excludes, accounts=accounts, days=days, dry=dry, bucket=bucket, prefix=prefix,
+    expiry = int(env.get("REPORT_LINK_EXPIRY_SECONDS", "86400"))
+    if not 60 <= expiry <= 604800:
+        raise ValueError("REPORT_LINK_EXPIRY_SECONDS must be between 60 and 604800")
+    return dict(excludes=excludes, accounts=accounts, days=days, dry=dry, allow=allow, link_expiry=expiry, bucket=bucket, prefix=prefix,
                 role=role, topic=topic, rates=rates, maximum=maximum, key=key,
                 external_id=env.get("ASSUME_ROLE_EXTERNAL_ID", ""))
 
 
 def blank_row(account, cfg, status, detail=""):
     row = dict.fromkeys(FIELDS, "")
-    row.update(account_id=account, region=REGION, target_days=cfg["days"], status=status, detail=detail)
+    row.update(account_id=account, region=REGION, status=status)
     return row
 
 
@@ -84,13 +82,6 @@ def assess(group, account, cfg, logs):
     row.update(log_group=group["logGroupName"], log_class=cls,
                retention_before=before if before is not None else "Never expire",
                stored_bytes_snapshot=size if size is not None else "")
-    rate = cfg["rates"].get(cls)
-    if size is not None:
-        gib = size / (2 ** 30)
-        row["storage_gib_proxy"] = round(gib, 9)
-        if rate is not None:
-            row["usd_per_gib_month_input"] = rate
-            row["monthly_storage_usd_proxy"] = round(gib * rate, 6)
     if cls not in {"STANDARD", "INFREQUENT_ACCESS"}:
         row.update(status="UNSUPPORTED_CLASS", detail="Not changed; class requires separate review")
     elif any(group["logGroupName"].startswith(p) for p in cfg["excludes"]):
@@ -140,7 +131,7 @@ th{background:#e9eff6;position:sticky;top:0}td:nth-child(3){max-width:460px;over
 <div id="meta" class="muted"></div><div class="cards" id="cards"></div>
 <div class="toolbar"><select id="account" aria-label="Filter account"><option value="">All accounts</option></select>
 <select id="status" aria-label="Filter status"><option value="">All statuses</option></select>
-<input id="search" type="search" placeholder="Search log group or details" aria-label="Search log groups">
+<input id="search" type="search" placeholder="Search log groups" aria-label="Search log groups">
 <button id="export" type="button">Export filtered CSV</button></div>
 <div class="muted" id="count"></div><div class="tablewrap"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
 <div class="warning" id="caveat"></div></main><script id="audit-data" type="application/json">__AUDIT_DATA__</script>
@@ -153,9 +144,13 @@ function node(tag,txt){const el=document.createElement(tag);el.textContent=Strin
 function addOptions(select,values){for(const v of [...new Set(values)].sort()){const o=node('option',v);o.value=v;select.appendChild(o);}}
 addOptions(account,rows.map(r=>r.account_id).filter(Boolean));addOptions(status,rows.map(r=>r.status).filter(Boolean));
 document.getElementById('meta').textContent=`Generated: ${summary.generated_utc} | Region: ${summary.region} | Retention: ${summary.retention_days} days | ${summary.dry_run?'DRY RUN':'ENFORCEMENT'} | ${summary.outcome}`;
-const cards=[['Accounts',summary.accounts.length],['Groups scanned',summary.groups_scanned],['Inventory complete',summary.inventory_complete?'Yes':'No'],['Retention changes',summary.statuses.UPDATED||0]];
+const cards=[['Accounts',summary.accounts.length],['Groups scanned',summary.groups_scanned],['Never expire groups',summary.never_expire_groups],['Never expire bytes',Number(summary.never_expire_bytes).toLocaleString()],['Retention changes',summary.statuses.UPDATED||0]];
 for(const [label,value] of cards){const c=document.createElement('div');c.className='card';c.append(node('span',label),node('strong',value));document.getElementById('cards').append(c);}
 document.getElementById('caveat').textContent=data.caveat;
+const acctSummary=document.createElement('div');acctSummary.className='tablewrap';acctSummary.style.marginBottom='16px';
+const acctTitle=node('h3','Never Expire storage by account');acctTitle.style.padding='0 12px';acctSummary.appendChild(acctTitle);
+const acctTable=document.createElement('table');const acctHead=document.createElement('tr');for(const h of ['Account','Scan status','Never Expire groups','Stored bytes','Stored GiB'])acctHead.appendChild(node('th',h));acctTable.appendChild(acctHead);
+for(const a of summary.accounts){const tr=document.createElement('tr');for(const v of [a.account_id,a.status,a.never_expire_groups,a.never_expire_bytes,(a.never_expire_bytes/1073741824).toFixed(3)])tr.appendChild(node('td',v));acctTable.appendChild(tr);}acctSummary.appendChild(acctTable);document.getElementById('cards').after(acctSummary);
 const tr=document.createElement('tr');for(const f of fields)tr.appendChild(node('th',f.replaceAll('_',' ')));document.getElementById('head').appendChild(tr);
 function selected(){const q=search.value.trim().toLowerCase();return rows.filter(r=>(!account.value||r.account_id===account.value)&&(!status.value||r.status===status.value)&&(!q||fields.some(f=>String(r[f]??'').toLowerCase().includes(q))));}
 function render(){const body=document.getElementById('body');body.replaceChildren();const result=selected();const fragment=document.createDocumentFragment();for(const r of result){const tr=document.createElement('tr');for(const f of fields)tr.appendChild(node('td',r[f]));fragment.appendChild(tr);}body.appendChild(fragment);document.getElementById('count').textContent=`Showing ${result.length} of ${rows.length} rows`;}
@@ -179,14 +174,16 @@ def audit(cfg, session, context=None):
         return session.client(service, region_name=REGION, config=sdk_config, **kwargs)
     sts = client("sts")
     rows, accounts, count = [], [], 0
+    never_total_bytes = never_total_groups = 0
     def near_deadline():
         return context is not None and context.get_remaining_time_in_millis() < 120000
     for account in cfg["accounts"]:
         if near_deadline() or count >= cfg["maximum"]:
             rows.append(blank_row(account, cfg, "NOT_SCANNED", "Time or inventory limit reached; split account list"))
-            accounts.append({"account_id": account, "status": "NOT_SCANNED", "groups": 0})
+            accounts.append({"account_id": account, "status": "NOT_SCANNED", "groups": 0, "never_expire_groups": 0, "never_expire_bytes": 0})
             continue
         scanned = 0
+        never_bytes = never_groups = 0
         state = "COMPLETE"
         try:
             args = dict(RoleArn=f"arn:aws:iam::{account}:role/{cfg['role']}",
@@ -209,6 +206,9 @@ def audit(cfg, session, context=None):
                     if near_deadline() or count >= cfg["maximum"]:
                         state, stop = "PARTIAL", True
                         break
+                    if group.get("retentionInDays") is None:
+                        never_groups += 1
+                        never_bytes += int(group.get("storedBytes") or 0)
                     rows.append(assess(group, account, cfg, logs))
                     count += 1
                     scanned += 1
@@ -219,7 +219,10 @@ def audit(cfg, session, context=None):
         except Exception as exc:
             state = "FAILED" if not scanned else "PARTIAL"
             rows.append(blank_row(account, cfg, "SCAN_FAILED", str(exc)[:1000]))
-        accounts.append({"account_id": account, "status": state, "groups": scanned})
+        never_total_bytes += never_bytes
+        never_total_groups += never_groups
+        accounts.append({"account_id": account, "status": state, "groups": scanned,
+                         "never_expire_groups": never_groups, "never_expire_bytes": never_bytes})
     statuses = dict(Counter(row["status"] for row in rows))
     incomplete = any(a["status"] != "COMPLETE" for a in accounts)
     problem = incomplete or any(statuses.get(s, 0) for s in ("UPDATE_FAILED", "UNSUPPORTED_CLASS"))
@@ -227,7 +230,8 @@ def audit(cfg, session, context=None):
                    generated_utc=datetime.now(timezone.utc).isoformat(), region=REGION,
                    dry_run=cfg["dry"], retention_days=cfg["days"], policy="maximum retention; preserve shorter",
                    outcome="ATTENTION" if problem else "COMPLETE", inventory_complete=not incomplete,
-                   groups_scanned=count, accounts=accounts, statuses=statuses,
+                   groups_scanned=count, never_expire_groups=never_total_groups,
+                   never_expire_bytes=never_total_bytes, accounts=accounts, statuses=statuses,
                    rates=cfg["rates"], cost_caveat=CAVEAT)
     # No grand total: unpriced classes and partial scans must not look like a complete bill.
     base = f"{cfg['prefix']}/{summary['run_id']}"
@@ -235,23 +239,59 @@ def audit(cfg, session, context=None):
     extra = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": cfg["key"]} if cfg["key"] else {}
     artifacts = {"inventory.csv": (csv_report(rows), "text/csv; charset=utf-8"),
                  "report.html": (html_report(rows, summary), "text/html; charset=utf-8")}
-    uris = {name: f"s3://{cfg['bucket']}/{base}/{name}" for name in [*artifacts, "summary.json"]}
+    uris = {name: f"s3://{cfg['bucket']}/{base}/{name}" for name in artifacts}
     summary["artifacts"] = uris
-    artifacts["summary.json"] = (json.dumps(summary, indent=2), "application/json")
-    # Summary is written last and is the completion marker for report uploads.
     for name, (body, mime) in artifacts.items():
         s3.put_object(Bucket=cfg["bucket"], Key=f"{base}/{name}", Body=body.encode("utf-8"),
                       ContentType=mime, CacheControl="no-store", **extra)
     if cfg["topic"]:
-        client("sns").publish(TopicArn=cfg["topic"], Subject=f"CloudWatch retention audit: {summary['outcome']}",
-                              Message=json.dumps({k: summary[k] for k in ["run_id", "outcome", "dry_run", "groups_scanned", "statuses", "artifacts"]}, indent=2))
+        # SNS cannot attach HTML. A short-lived signed URL enables browser download.
+        # If link generation fails, the S3 URI is still included in the notification.
+        link = "Unavailable; open the S3 URI with authorized AWS credentials"
+        try:
+            link = s3.generate_presigned_url(
+                "get_object", Params={"Bucket": cfg["bucket"], "Key": f"{base}/report.html",
+                                      "ResponseContentDisposition": 'attachment; filename="cloudwatch-report.html"'},
+                ExpiresIn=cfg["link_expiry"])
+        except Exception as exc:
+            print("Report link generation failed:", type(exc).__name__, str(exc)[:200])
+        lines = [f"CloudWatch Logs: {summary['outcome']} ({'DRY RUN' if cfg['dry'] else 'ENFORCEMENT'})",
+                 f"Region: {REGION} | Retention target: {cfg['days']} days",
+                 f"Scanned: {count} log groups across {len(accounts)} accounts",
+                 f"Never Expire: {never_total_groups} groups, {never_total_bytes:,} bytes",
+                 "", "Never Expire by account:"]
+        for a in accounts:
+            lines.append(f"{a['account_id']}: {a['never_expire_groups']} groups; {a['never_expire_bytes']:,} bytes ({a['status']})")
+        lines.extend(["", "Status counts: " + ", ".join(f"{k}={v}" for k, v in sorted(statuses.items())),
+                      "", "Download HTML report (time-limited link):", link,
+                      f"Link validity: {cfg['link_expiry']} seconds",
+                      "", "S3 HTML: " + uris['report.html'], "S3 CSV: " + uris['inventory.csv'],
+                      "", CAVEAT])
+        client("sns").publish(TopicArn=cfg["topic"],
+                              Subject=f"CloudWatch Logs audit: {summary['outcome']}",
+                              Message="\n".join(lines))
     return summary
 
 
 def lambda_handler(event, context):
-    # Deliberately ignore invocation payload: it cannot enable enforcement or replace scope.
+    """Audit is default. Enforcement needs explicit event AND all three env safeguards."""
+    event = event or {}
+    if not isinstance(event, dict):
+        raise ValueError("Event must be a JSON object")
     cfg = configuration()
+    mode = str(event.get("mode", "AUDIT")).upper()
+    if mode not in {"AUDIT", "ENFORCE"}:
+        raise ValueError("mode must be AUDIT or ENFORCE")
+    if mode == "ENFORCE":
+        if (cfg["dry"] or not cfg["allow"] or
+                os.environ.get("ENFORCEMENT_CONFIRMATION") != f"APPLY_RETENTION_{cfg['days']}_DAYS" or
+                event.get("confirm") != "APPLY_RETENTION"):
+            raise ValueError("Enforcement blocked: DRY_RUN=false, ALLOW_ENFORCEMENT=true, "
+                             "matching ENFORCEMENT_CONFIRMATION and event confirm are required")
+        cfg["dry"] = False
+    else:
+        cfg["dry"] = True
     import boto3
     result = audit(cfg, boto3.Session(), context)
-    print(json.dumps({k: result[k] for k in ("run_id", "outcome", "groups_scanned", "statuses")}))
+    print(json.dumps({k: result[k] for k in ("run_id", "outcome", "groups_scanned", "statuses", "never_expire_bytes")}))
     return result
