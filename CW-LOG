@@ -170,6 +170,11 @@ def audit(cfg, session, context=None):
     from botocore.config import Config
     sdk_config = Config(retries={"mode": "standard", "total_max_attempts": 3},
                         connect_timeout=3, read_timeout=10)
+    # S3 presigned downloads for SSE-KMS objects must use Signature Version 4.
+    s3_config = Config(signature_version="s3v4",
+                       s3={"addressing_style": "virtual"},
+                       retries={"mode": "standard", "total_max_attempts": 3},
+                       connect_timeout=3, read_timeout=10)
     def client(service, **kwargs):
         return session.client(service, region_name=REGION, config=sdk_config, **kwargs)
     sts = client("sts")
@@ -235,7 +240,7 @@ def audit(cfg, session, context=None):
                    rates=cfg["rates"], cost_caveat=CAVEAT)
     # No grand total: unpriced classes and partial scans must not look like a complete bill.
     base = f"{cfg['prefix']}/{summary['run_id']}"
-    s3 = client("s3")
+    s3 = session.client("s3", region_name=REGION, config=s3_config)
     extra = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": cfg["key"]} if cfg["key"] else {}
     artifacts = {"inventory.csv": (csv_report(rows), "text/csv; charset=utf-8"),
                  "report.html": (html_report(rows, summary), "text/html; charset=utf-8")}
@@ -252,7 +257,7 @@ def audit(cfg, session, context=None):
             link = s3.generate_presigned_url(
                 "get_object", Params={"Bucket": cfg["bucket"], "Key": f"{base}/report.html",
                                       "ResponseContentDisposition": 'attachment; filename="cloudwatch-report.html"'},
-                ExpiresIn=cfg["link_expiry"])
+                ExpiresIn=cfg["link_expiry"], HttpMethod="GET")
         except Exception as exc:
             print("Report link generation failed:", type(exc).__name__, str(exc)[:200])
         lines = [f"CloudWatch Logs: {summary['outcome']} ({'DRY RUN' if cfg['dry'] else 'ENFORCEMENT'})",
