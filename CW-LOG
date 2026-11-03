@@ -8,7 +8,6 @@ import re
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path
 
 REGION = "ap-southeast-2"
 RETENTIONS = {1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545,
@@ -65,7 +64,8 @@ def configuration(env=None):
     key = env.get("S3_KMS_KEY_ARN", "").strip()
     if key and not re.fullmatch(r"arn:aws:kms:ap-southeast-2:\d{12}:key/[A-Za-z0-9-]+", key):
         raise ValueError("S3_KMS_KEY_ARN must be a full key ARN in ap-southeast-2")
-    return dict(accounts=accounts, days=days, dry=dry, bucket=bucket, prefix=prefix,
+    excludes = [x.strip() for x in env.get("EXCLUDE_LOG_GROUP_PREFIXES", "").split(",") if x.strip()]
+    return dict(excludes=excludes, accounts=accounts, days=days, dry=dry, bucket=bucket, prefix=prefix,
                 role=role, topic=topic, rates=rates, maximum=maximum, key=key,
                 external_id=env.get("ASSUME_ROLE_EXTERNAL_ID", ""))
 
@@ -93,6 +93,8 @@ def assess(group, account, cfg, logs):
             row["monthly_storage_usd_proxy"] = round(gib * rate, 6)
     if cls not in {"STANDARD", "INFREQUENT_ACCESS"}:
         row.update(status="UNSUPPORTED_CLASS", detail="Not changed; class requires separate review")
+    elif any(group["logGroupName"].startswith(p) for p in cfg["excludes"]):
+        row.update(status="EXCLUDED", detail="Matched EXCLUDE_LOG_GROUP_PREFIXES")
     elif before is None or before > cfg["days"]:
         if cfg["dry"]:
             row["status"] = "WOULD_CHANGE"
@@ -121,10 +123,52 @@ def csv_report(rows):
     return "\ufeff" + stream.getvalue()
 
 
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudWatch Logs Audit</title><style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;color:#172b4d;background:#f4f7fb}
+body{margin:0;padding:24px}main{max-width:1500px;margin:auto}h1{margin:0 0 8px}.muted{color:#526278}
+.cards{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.card{background:white;border:1px solid #dce3ec;border-radius:10px;padding:16px;min-width:155px;flex:1}
+.card strong{display:block;font-size:1.5rem;margin-top:6px}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}
+input,select,button{padding:10px;border:1px solid #bbc8d6;border-radius:6px;font:inherit;background:white}
+button{background:#1769aa;color:white;cursor:pointer}button:hover{background:#105182}
+.tablewrap{overflow:auto;background:white;border:1px solid #dce3ec;border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e8edf3;padding:10px;white-space:nowrap}
+th{background:#e9eff6;position:sticky;top:0}td:nth-child(3){max-width:460px;overflow:hidden;text-overflow:ellipsis}
+.warning{background:#fff7e6;border:1px solid #edcf8b;padding:12px;border-radius:8px;margin-top:18px}
+</style></head><body><main><h1>CloudWatch Logs – Retention Audit</h1>
+<div id="meta" class="muted"></div><div class="cards" id="cards"></div>
+<div class="toolbar"><select id="account" aria-label="Filter account"><option value="">All accounts</option></select>
+<select id="status" aria-label="Filter status"><option value="">All statuses</option></select>
+<input id="search" type="search" placeholder="Search log group or details" aria-label="Search log groups">
+<button id="export" type="button">Export filtered CSV</button></div>
+<div class="muted" id="count"></div><div class="tablewrap"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
+<div class="warning" id="caveat"></div></main><script id="audit-data" type="application/json">__AUDIT_DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('audit-data').textContent);
+const rows=data.rows,fields=data.fields,summary=data.summary;
+const account=document.getElementById('account'),status=document.getElementById('status'),search=document.getElementById('search');
+function node(tag,txt){const el=document.createElement(tag);el.textContent=String(txt??'');return el;}
+function addOptions(select,values){for(const v of [...new Set(values)].sort()){const o=node('option',v);o.value=v;select.appendChild(o);}}
+addOptions(account,rows.map(r=>r.account_id).filter(Boolean));addOptions(status,rows.map(r=>r.status).filter(Boolean));
+document.getElementById('meta').textContent=`Generated: ${summary.generated_utc} | Region: ${summary.region} | Retention: ${summary.retention_days} days | ${summary.dry_run?'DRY RUN':'ENFORCEMENT'} | ${summary.outcome}`;
+const cards=[['Accounts',summary.accounts.length],['Groups scanned',summary.groups_scanned],['Inventory complete',summary.inventory_complete?'Yes':'No'],['Retention changes',summary.statuses.UPDATED||0]];
+for(const [label,value] of cards){const c=document.createElement('div');c.className='card';c.append(node('span',label),node('strong',value));document.getElementById('cards').append(c);}
+document.getElementById('caveat').textContent=data.caveat;
+const tr=document.createElement('tr');for(const f of fields)tr.appendChild(node('th',f.replaceAll('_',' ')));document.getElementById('head').appendChild(tr);
+function selected(){const q=search.value.trim().toLowerCase();return rows.filter(r=>(!account.value||r.account_id===account.value)&&(!status.value||r.status===status.value)&&(!q||fields.some(f=>String(r[f]??'').toLowerCase().includes(q))));}
+function render(){const body=document.getElementById('body');body.replaceChildren();const result=selected();const fragment=document.createDocumentFragment();for(const r of result){const tr=document.createElement('tr');for(const f of fields)tr.appendChild(node('td',r[f]));fragment.appendChild(tr);}body.appendChild(fragment);document.getElementById('count').textContent=`Showing ${result.length} of ${rows.length} rows`;}
+for(const el of [account,status,search])el.addEventListener(el===search?'input':'change',render);render();
+function safeCell(v){let s=String(v??'');if(/^[\s]*[=+@-]/.test(s)||/^[\t\r\n]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
+document.getElementById('export').addEventListener('click',()=>{const csv='\ufeff'+[fields,...selected().map(r=>fields.map(f=>r[f]))].map(a=>a.map(safeCell).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='cloudwatch-filtered.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+</script></body></html>"""
+
+
 def html_report(rows, summary):
     payload = json.dumps(dict(rows=rows, fields=FIELDS, summary=summary, caveat=CAVEAT), ensure_ascii=True)
     payload = payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    return Path(__file__).with_name("report_template.html").read_text(encoding="utf-8").replace("__AUDIT_DATA__", payload)
+    return HTML_TEMPLATE.replace("__AUDIT_DATA__", payload)
 
 
 def audit(cfg, session, context=None):
