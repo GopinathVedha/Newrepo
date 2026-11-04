@@ -59,7 +59,7 @@ def metric(name, value=1):
 
 
 def notify(topic, subject, body, cycle):
-    message = f'EC2 AutoScheduler | Cycle: {cycle} | Region: {REGION}\n' + body
+    message = body
     try:
         res = sns.publish(TopicArn=topic, Subject=subject[:100], Message=message)
         log.info('SNS_SENT subject=%s id=%s cycle=%s', subject, res.get('MessageId'), cycle)
@@ -304,6 +304,26 @@ def server_line(name, iid, account, result):
     return f'- {account} | {name} | {iid} | {result}'
 
 
+def action_table(lines, mode):
+    # Each line is stored as: "- Account | Server | InstanceId | Description".
+    headers = ['Account', 'Server Name', 'Action'] if mode == 'stop' else ['Account', 'Server Name', 'Action', 'Status']
+    rows = []
+    for line in lines:
+        fields = [v.strip() for v in line.removeprefix('- ').split(' | ', 3)]
+        if len(fields) != 4:
+            continue
+        account, server, _instance, detail = fields
+        if mode == 'stop':
+            rows.append([account, server, 'Stopped'])
+        else:
+            role = detail.split(' | ')[0].replace('ROLE=', '').strip()
+            rows.append([account, server, f'Started ({role})', 'Requested'])
+    widths = [min(max(len(str(row[ix])) for row in [headers] + rows), 33) for ix in range(len(headers))]
+    def render(row):
+        return ' | '.join(str(val)[:widths[ix]].ljust(widths[ix]) for ix, val in enumerate(row))
+    return '\n'.join([render(headers), '-+-'.join('-' * w for w in widths)] + [render(row) for row in rows])
+
+
 def process_account(acct, trigger, now, skip_start, cycle, results, involved):
     aid, aname, role_arn = acct['account_id'], acct['name'], acct['role_arn']
     try:
@@ -317,7 +337,7 @@ def process_account(acct, trigger, now, skip_start, cycle, results, involved):
         results['account_errors'].append(f'{aname} ({aid}) | cannot inspect account: {exc}')
         metric('AccountFailures')
         return
-    started, stopped, pending_restore, names = [], [], [], {}
+    started, stopped, pending_restore, names, roles = [], [], [], {}, {}
     for instance in selected:
         iid = instance['InstanceId']
         tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
@@ -326,6 +346,7 @@ def process_account(acct, trigger, now, skip_start, cycle, results, involved):
         name = tags.get('Name', 'Unnamed')
         names[iid] = name
         role = tags.get(TAG_ROLE, 'unknown').strip().lower()
+        roles[iid] = role
         if trigger != 'all' and role != trigger:
             continue
         try:
@@ -344,25 +365,26 @@ def process_account(acct, trigger, now, skip_start, cycle, results, involved):
                 accepted, downgrade, error, pending = start_with_fallback(client, iid, name, aname, cycle)
                 if accepted:
                     started.append(iid)
-                    results['start'].append(server_line(name, iid, aname, 'START REQUEST ACCEPTED (verification pending)'))
+                    results['start'].append(server_line(name, iid, aname, f'ROLE={role.upper()} | START REQUEST ACCEPTED (verification pending)'))
                     if downgrade:
                         results['downgrade'].append(f'- {aname} | {name} | {iid} | {downgrade[3]} -> {downgrade[4]}')
                 else:
-                    results['start_failed'].append(server_line(name, iid, aname, f'START FAILED: {error}'))
+                    results['start_failed'].append(server_line(name, iid, aname, f'ROLE={role.upper()} | START FAILED: {error}'))
                     if pending:
                         pending_restore.append(iid)
         if stop_due and state == 'running' and exception != 'nonstop':
             try:
                 client.stop_instances(InstanceIds=[iid])
                 stopped.append(iid)
-                results['stop'].append(server_line(name, iid, aname, 'STOP REQUEST ACCEPTED (verification pending)'))
+                results['stop'].append(server_line(name, iid, aname, 'STOP REQUESTED'))
             except Exception as exc:
                 results['stop_failed'].append(server_line(name, iid, aname, f'STOP FAILED: {exc}'))
     if started or stopped or pending_restore:
         involved[aid] = {'name': aname, 'role_arn': role_arn,
                          'autostart_instance_ids': started, 'autostop_instance_ids': stopped,
                          'restore_instance_ids': list(dict.fromkeys(pending_restore)),
-                         'instance_names': {i: names.get(i, 'Unnamed') for i in set(started + stopped + pending_restore)}}
+                         'instance_names': {i: names.get(i, 'Unnamed') for i in set(started + stopped + pending_restore)},
+                         'instance_roles': {i: roles.get(i, 'unknown') for i in started}}
 
 
 def lambda_handler(event, context):
@@ -407,8 +429,9 @@ def lambda_handler(event, context):
     for name in ('start','stop'):
         if results[name]:
             label = 'START' if name == 'start' else 'STOP'
-            body = heading + f'\n{label} REQUESTS: {len(results[name])}\n' + '\n'.join(results[name])
-            body += '\n\nNote: EC2 state/health is checked by Status Lambda in a follow-up.'
+            body = heading + f'\n{label} REQUESTS: {len(results[name])}\n' + action_table(results[name], name)
+            if name == 'start':
+                body += '\n\nNote: Start requests are confirmed through the follow-up health report.'
             if name == 'start':
                 body += ('\n\nCapacity downgrades:\n' + '\n'.join(results['downgrade'])) if results['downgrade'] else ''
             notify(SNS_START if name == 'start' else SNS_STOP,
