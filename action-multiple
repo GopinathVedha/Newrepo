@@ -364,20 +364,25 @@ def process_account(acct, trigger, now, skip_start, cycle, results, involved):
             else:
                 accepted, downgrade, error, pending = start_with_fallback(client, iid, name, aname, cycle)
                 if accepted:
+                    log.info('START_REQUESTED account=%s server=%s instance=%s role=%s cycle=%s', aname, name, iid, role.upper(), cycle)
                     started.append(iid)
                     results['start'].append(server_line(name, iid, aname, f'ROLE={role.upper()} | START REQUEST ACCEPTED (verification pending)'))
                     if downgrade:
+                        log.info('CAPACITY_DOWNGRADE account=%s server=%s instance=%s original=%s selected=%s cycle=%s', aname, name, iid, downgrade[3], downgrade[4], cycle)
                         results['downgrade'].append(f'- {aname} | {name} | {iid} | {downgrade[3]} -> {downgrade[4]}')
                 else:
+                    log.error('START_FAILED account=%s server=%s instance=%s role=%s error=%s cycle=%s', aname, name, iid, role.upper(), error, cycle)
                     results['start_failed'].append(server_line(name, iid, aname, f'ROLE={role.upper()} | START FAILED: {error}'))
                     if pending:
                         pending_restore.append(iid)
         if stop_due and state == 'running' and exception != 'nonstop':
             try:
                 client.stop_instances(InstanceIds=[iid])
+                log.info('STOP_REQUESTED account=%s server=%s instance=%s cycle=%s', aname, name, iid, cycle)
                 stopped.append(iid)
                 results['stop'].append(server_line(name, iid, aname, 'STOP REQUESTED'))
             except Exception as exc:
+                log.exception('STOP_FAILED account=%s server=%s instance=%s cycle=%s', aname, name, iid, cycle)
                 results['stop_failed'].append(server_line(name, iid, aname, f'STOP FAILED: {exc}'))
     if started or stopped or pending_restore:
         involved[aid] = {'name': aname, 'role_arn': role_arn,
