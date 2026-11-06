@@ -158,9 +158,12 @@ def restore(ec2, acct, iid, name, cycle, attempt=0, verify_stop=False):
         if original and state == 'running' and current == original and not verify_stop:
             ec2.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
             return 'CLEANED', format_line(account_name, name, iid, 'Stale original-type tag removed; already original type')
-        if not original and state == 'stopped' and verify_stop:
-            return 'STOPPED', format_line(account_name, name, iid, 'STOP VERIFIED; no instance-type restore required')
-        if not original and not verify_stop:
+        # Ordinary stop operations do not require a restoration recheck.
+        # Only instances carrying the original-type tag need to be tracked
+        # until stopped, because the type can only be modified while stopped.
+        if not original:
+            log.info('RESTORE_NOT_REQUIRED account=%s server=%s instance=%s state=%s cycle=%s',
+                     account_name, name, iid, state, cycle)
             return 'NONE', ''
         if state == 'running' and not verify_stop:
             # Periodic reconciliation must not stop or resize running servers.
@@ -169,7 +172,8 @@ def restore(ec2, acct, iid, name, cycle, attempt=0, verify_stop=False):
             if attempt < MAX_RESTORE_ATTEMPTS:
                 create_recheck('restore', acct, iid, name, cycle, attempt + 1,
                                delay=RESTORE_RETRY_SECONDS)
-                return 'PENDING', format_line(account_name, name, iid, f'EC2 {state}; restore/stop recheck {attempt+1}/{MAX_RESTORE_ATTEMPTS} scheduled')
+                log.info('RESTORE_WAITING account=%s server=%s instance=%s state=%s retry=%s/%s cycle=%s', account_name, name, iid, state, attempt+1, MAX_RESTORE_ATTEMPTS, cycle)
+                return 'PENDING', format_line(account_name, name, iid, f'EC2 {state}; restore recheck {attempt+1}/{MAX_RESTORE_ATTEMPTS} scheduled')
             metric('RestoreFailures')
             return 'FAILED', format_line(account_name, name, iid, f'EC2 remained {state} after {attempt} retries; MANUAL ACTION')
         if not original:
@@ -181,8 +185,8 @@ def restore(ec2, acct, iid, name, cycle, attempt=0, verify_stop=False):
         verified = get_instance(ec2, iid)
         if verified['State']['Name'] != 'stopped' or verified['InstanceType'] != original:
             raise RuntimeError(f'Post-restore verification failed: state={verified["State"]["Name"]}, type={verified["InstanceType"]}')
-        log.info('RESTORE_VERIFIED instance=%s account=%s %s->%s cycle=%s',
-                 iid, acct['account_id'], current, original, cycle)
+        log.info('RESTORE_SUCCESS account=%s server=%s instance=%s previous_type=%s original_type=%s cycle=%s',
+                 account_name, name, iid, current, original, cycle)
         metric('RestorationsVerified')
         try:
             ec2.delete_tags(Resources=[iid], Tags=[{'Key': TAG_ORIGINAL}])
@@ -205,6 +209,7 @@ def restore(ec2, acct, iid, name, cycle, attempt=0, verify_stop=False):
             try:
                 create_recheck('restore', acct, iid, name, cycle, attempt + 1,
                                delay=RESTORE_RETRY_SECONDS)
+                log.warning('RESTORE_RETRY account=%s server=%s instance=%s retry=%s/%s reason=%s cycle=%s', account_name, name, iid, attempt+1, MAX_RESTORE_ATTEMPTS, exc, cycle)
                 return 'PENDING', format_line(account_name, name, iid, f'Restore error: {exc}; retry {attempt+1}/{MAX_RESTORE_ATTEMPTS} scheduled')
             except Exception as schedule_exc:
                 metric('SchedulerFailures')
@@ -366,18 +371,43 @@ def handle_recovery_recheck(ec2, acct, iid, name, cycle, kind, attempt):
         return f'MANUAL ACTION: recovery {kind} failed: {exc}'
 
 def send_restoration_report(outcomes, cycle):
-    report = [(status, line) for status, line in outcomes if status not in ('NONE',) and line]
-    if not report:
-        return
-    for kind, subject_status in (('VERIFIED', 'RESTORED'),
-                                 ('VERIFIED_CLEANUP_PENDING', 'RESTORED - TAG CLEANUP PENDING'),
-                                 ('PENDING', 'PENDING'),
-                                 ('FAILED', 'FAILED'), ('CLEANED', 'TAG CLEANUP')):
-        lines = [line for status, line in report if status == kind]
-        if lines:
-            notify(SNS_CAPACITY, f'[EC2 Scheduler][RESTORE][{subject_status}] {len(lines)} instance(s)',
-                   f'Original-instance-type restore result: {kind}\n' + '\n'.join(lines), cycle)
-    # Stop verification remains internal; no routine stop-status SNS message.
+    """Email only final verified restorations / actionable failures.
+
+    Ordinary stop checks, internal retries, and non-restoration tag cleanup
+    are excluded. Instance IDs stay in CloudWatch logs for diagnosis.
+    """
+    groups = {'VERIFIED': [], 'FAILED': [], 'VERIFIED_CLEANUP_PENDING': []}
+    for outcome, detail in outcomes:
+        if outcome not in groups or not detail:
+            continue
+        parts = [part.strip() for part in detail.removeprefix('- ').split(' | ', 3)]
+        if len(parts) != 4:
+            log.warning('RESTORE_REPORT_ROW_INVALID outcome=%s detail=%s', outcome, detail)
+            continue
+        account, server, instance_id, explanation = parts
+        if outcome == 'VERIFIED':
+            display = 'Restored original instance type'
+        elif outcome == 'VERIFIED_CLEANUP_PENDING':
+            display = 'Restored; tag cleanup requires attention'
+        else:
+            display = 'Restoration failed - manual action required'
+        groups[outcome].append((account, server, display))
+        log.info('RESTORE_REPORT_RESULT outcome=%s account=%s server=%s instance=%s detail=%s cycle=%s',
+                 outcome, account, server, instance_id, explanation, cycle)
+    for outcome, subject in [('VERIFIED', 'SUCCESS'),
+                             ('VERIFIED_CLEANUP_PENDING', 'ATTENTION'),
+                             ('FAILED', 'FAILED')]:
+        if not groups[outcome]:
+            continue
+        headers = ('Account', 'Server Name', 'Status')
+        rows = groups[outcome]
+        widths = [min(max(len(str(r[i])) for r in [headers] + rows), 46) for i in range(3)]
+        def fmt(r):
+            return ' | '.join(str(v)[:widths[i]].ljust(widths[i]) for i, v in enumerate(r))
+        table = '\n'.join([fmt(headers), '-+-'.join('-' * w for w in widths)] +
+                          [fmt(row) for row in rows])
+        notify(SNS_CAPACITY, f'[EC2 Scheduler][RESTORE][{subject}] {len(rows)} instance(s)',
+               table, cycle)
 
 
 def run_status(event, cycle):
@@ -409,6 +439,7 @@ def run_status(event, cycle):
             outcome = restore(ec2, account, iid, names.get(iid, 'Unnamed'), cycle,
                               verify_stop=iid in raw.get('autostop_instance_ids', []))
             all_restores.append(outcome)
+            log.info('STOP_FOLLOWUP account=%s server=%s instance=%s restore_outcome=%s cycle=%s', account['name'], names.get(iid, 'Unnamed'), iid, outcome[0], cycle)
         if start_ids:
             states, checks, api_errors = status_entries(ec2, start_ids)
             for iid in start_ids:
@@ -416,6 +447,7 @@ def run_status(event, cycle):
                     ec2, {**account, 'instance_role': roles.get(iid, 'unknown')}, iid, names.get(iid, 'Unnamed'), cycle,
                     state=states.get(iid, 'unknown'), check=checks.get(iid), error=api_errors.get(iid))
                 lines_health.append(line)
+                log.info('HEALTH_RESULT account=%s server=%s instance=%s role=%s outcome=%s detail=%s cycle=%s', account['name'], names.get(iid, 'Unnamed'), iid, roles.get(iid, 'unknown'), category, line, cycle)
                 if urgent_line:
                     urgent.append(urgent_line)
                 if category == 'recovering':
@@ -447,6 +479,7 @@ def run_recheck(event, cycle):
         ec2 = get_ec2(acct)
         if kind == 'restore':
             outcome = restore(ec2, acct, iid, name, cycle, attempt=attempt, verify_stop=True)
+            log.info('RESTORE_RECHECK_RESULT account=%s server=%s instance=%s attempt=%s outcome=%s cycle=%s', acct['name'], name, iid, attempt, outcome[0], cycle)
             send_restoration_report([outcome], cycle)
             return {'kind': kind, 'outcome': outcome[0]}
         if kind == 'recovery_stop':
