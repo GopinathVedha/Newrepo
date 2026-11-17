@@ -1,0 +1,1365 @@
+"""RHEL OS-only, three-phase, same-account EC2 upgrade performance reporting.
+
+Python 3.12/3.13 AWS Lambda. Dependency: boto3 (included in AWS Lambda Python runtime).
+Outputs four user-facing HTML reports (phase-1.html, phase-2.html, phase-3.html,
+final-summary.html). Every phase also publishes phase-N-status.json in the batch
+folder and .state/phase-N.json (historical data used in the final comparison).
+Uses EXACT renamed metric names from the supplied CWAgent configuration.
+
+Required Lambda environment variables:
+  REPORT_BUCKET, REPORT_PREFIX, KMS_KEY_ARN
+Optional:
+  CW_AGENT_NAMESPACE=CWAgent
+  SSM_WAIT_SECONDS=100
+  BASELINE_DAYS=15
+  MAX_HOSTS=20
+
+Run 1 Test event:
+{
+ "phase": 1, "batch_id": "nov26-wave01",
+ "hostnames": ["APP-SERVER-01", "DB-SERVER-01"],
+ "server_types": {"APP-SERVER-01":"app", "DB-SERVER-01":"db"},
+ "critical_services_by_host": {"APP-SERVER-01":["sshd","chronyd"],
+                               "DB-SERVER-01":["sshd","chronyd"]}
+}
+Run 2 / Run 3 Test event:
+{
+ "phase": 2, "batch_id": "nov26-wave01",
+ "upgrade_completed_at_utc": {
+   "APP-SERVER-01":"2026-11-20T03:30:00Z",
+   "DB-SERVER-01":"2026-11-21T05:15:00Z"
+ }
+}
+For Run 3 change phase to 3, and supply the second upgrade completion times.
+No automatic upgrade-time guess: last reboot is not a reliable upgrade timestamp.
+
+Important: CWAgent must have collected historical memory/disk/swap metrics in advance.
+SSM OS snapshots capture the state AT EACH RUN, not a 15-day retrospective.
+"""
+
+import csv
+import datetime as dt
+import hashlib
+import html
+import io
+import json
+import logging
+import math
+import os
+import re
+import statistics
+import time
+from collections import defaultdict
+
+import boto3
+from botocore.exceptions import ClientError
+
+VERSION = "2026-11-17-v2.0"
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+UTC = dt.timezone.utc
+PERIOD = 3600  # 1-hour complete bins; keeps 15-day baseline within retention.
+IGNORE_FSTYPES = {"tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup2", "devpts"}
+DEFAULT_SERVICES = ["sshd", "chronyd", "amazon-ssm-agent", "amazon-cloudwatch-agent"]
+
+EC2_METRICS = [
+    ("CPUUtilization", "CPU utilization", "%", "Average", "identity", "lower"),
+    ("NetworkIn", "Network received", "MiB/h", "Sum", "to_mib", "neutral"),
+    ("NetworkOut", "Network sent", "MiB/h", "Sum", "to_mib", "neutral"),
+    ("NetworkPacketsIn", "Network packets received", "packets/h", "Sum", "identity", "neutral"),
+    ("NetworkPacketsOut", "Network packets sent", "packets/h", "Sum", "identity", "neutral"),
+    ("StatusCheckFailed", "EC2 status-check failures", "count", "Maximum", "identity", "lower"),
+    ("StatusCheckFailed_Instance", "Instance status-check failures", "count", "Maximum", "identity", "lower"),
+    ("StatusCheckFailed_System", "System status-check failures", "count", "Maximum", "identity", "lower"),
+]
+# Names in the user's already-deployed CloudWatch Agent configuration. The
+# optional aliases support older/default CWAgent names if these still exist.
+# Each tuple: (ordered metric aliases, visible label, unit, direction, conversion).
+AGENT_SIMPLE = [
+    (("MemUsedPercent", "mem_used_percent"), "Memory used", "%", "lower", "identity"),
+    (("MemAvailableBytes", "mem_available"), "Available memory", "GiB", "higher", "to_gib"),
+    (("MemAvailablePercent", "mem_available_percent"), "Available memory", "%", "higher", "identity"),
+    (("SwapUsedPercent", "swap_used_percent"), "Swap used", "%", "lower", "identity"),
+    (("SwapUsedBytes", "swap_used"), "Swap used", "GiB", "lower", "to_gib"),
+    (("SwapFreeBytes", "swap_free"), "Swap free", "GiB", "higher", "to_gib"),
+    (("CpuUserPercent", "cpu_usage_user"), "CPU user", "%", "neutral", "identity"),
+    (("CpuSystemPercent", "cpu_usage_system"), "CPU system", "%", "neutral", "identity"),
+    (("CpuIOWaitPercent", "cpu_usage_iowait"), "CPU I/O wait", "%", "lower", "identity"),
+    (("CpuIdlePercent", "cpu_usage_idle"), "CPU idle", "%", "neutral", "identity"),
+    (("netstat_tcp_established",), "Established TCP connections", "count", "neutral", "identity"),
+    (("netstat_tcp_syn_sent",), "TCP SYN_SENT connections", "count", "neutral", "identity"),
+    (("netstat_tcp_close",), "TCP CLOSE connections", "count", "neutral", "identity"),
+    (("netstat_tcp_time_wait",), "TCP TIME_WAIT connections", "count", "neutral", "identity"),
+    (("netstat_tcp_close_wait",), "TCP CLOSE_WAIT connections", "count", "lower", "identity"),
+]
+AGENT_DISK = [
+    (("DiskUsedPercent", "disk_used_percent"), "Filesystem used", "%", "lower", "identity"),
+    (("DiskTotalBytes", "disk_total"), "Filesystem total", "GiB", "neutral", "to_gib"),
+    (("DiskUsedBytes", "disk_used"), "Filesystem used space", "GiB", "lower", "to_gib"),
+    (("DiskFreeBytes", "disk_free"), "Filesystem free space", "GiB", "higher", "to_gib"),
+]
+AGENT_NET_BYTES = [
+    (("NetBytesIn", "net_bytes_recv"), "Guest network received", "MiB/h", "to_mib"),
+    (("NetBytesOut", "net_bytes_sent"), "Guest network sent", "MiB/h", "to_mib"),
+]
+
+
+AGENT_DISKIO = [
+    ("diskio_io_time", "Disk I/O busy/queued time", "ms/h", "Sum", "identity", "lower"),
+    ("diskio_read_time", "Disk read wait time", "ms/h", "Sum", "identity", "neutral"),
+    ("diskio_write_time", "Disk write wait time", "ms/h", "Sum", "identity", "neutral"),
+    ("diskio_reads", "Guest disk reads", "IOPS", "Sum", "per_second", "neutral"),
+    ("diskio_writes", "Guest disk writes", "IOPS", "Sum", "per_second", "neutral"),
+    ("diskio_read_bytes", "Guest disk read throughput", "MiB/s", "Sum", "to_mib_second", "neutral"),
+    ("diskio_write_bytes", "Guest disk write throughput", "MiB/s", "Sum", "to_mib_second", "neutral"),
+    ("diskio_iops_in_progress", "Guest disk I/O in progress", "requests", "Average", "identity", "lower"),
+]
+AGENT_NETWORK = [
+    ("net_err_in", "Receive errors", "errors/h", "lower"),
+    ("net_err_out", "Transmit errors", "errors/h", "lower"),
+    ("net_drop_in", "Receive drops", "drops/h", "lower"),
+    ("net_drop_out", "Transmit drops", "drops/h", "lower"),
+]
+EBS_METRICS = [
+    ("VolumeReadOps", "EBS read IOPS", "IOPS", "Sum", "per_second", "neutral"),
+    ("VolumeWriteOps", "EBS write IOPS", "IOPS", "Sum", "per_second", "neutral"),
+    ("VolumeReadBytes", "EBS read throughput", "MiB/s", "Sum", "to_mib_second", "neutral"),
+    ("VolumeWriteBytes", "EBS write throughput", "MiB/s", "Sum", "to_mib_second", "neutral"),
+    ("VolumeQueueLength", "EBS queue length", "requests", "Average", "identity", "lower"),
+    ("VolumeTotalReadTime", "_read_seconds", "s", "Sum", "identity", "neutral"),
+    ("VolumeTotalWriteTime", "_write_seconds", "s", "Sum", "identity", "neutral"),
+]
+
+# A read-only agent script. Its single JSON line deliberately stays below SSM's
+# 24,000-character stdout limit; shell commands have independent timeouts.
+SSM_PY = r'''
+import datetime, json, os, subprocess
+SERVICES = __SERVICES__
+def cmd(argv, limit=700, timeout=8):
+    try:
+        x = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=timeout, check=False)
+        return {"rc": x.returncode, "out": x.stdout.strip()[:limit],
+                "err": x.stderr.strip()[:180]}
+    except Exception as e:
+        return {"rc": -1, "out": "", "err": str(e)[:180]}
+def release():
+    result = {}
+    try:
+        for line in open('/etc/os-release'):
+            if '=' in line:
+                k,v=line.rstrip().split('=',1)
+                result[k]=v.strip('"')
+    except Exception: pass
+    return result
+def mounts():
+    rows=[]
+    output=cmd(['df','-PT','-B1'], 15000)['out'].splitlines()
+    for line in output[1:]:
+        p=line.split(None,6)
+        if len(p)<7 or p[1] in ('tmpfs','devtmpfs','overlay','squashfs','proc','sysfs'): continue
+        try:
+            rows.append({'device':p[0], 'fstype':p[1], 'total_bytes':int(p[2]),
+                         'used_bytes':int(p[3]), 'free_bytes':int(p[4]),
+                         'used_pct':float(p[5].rstrip('%')), 'mount':p[6]})
+        except Exception: continue
+    return rows[:45]
+def inodes():
+    rows=[]
+    output=cmd(['df','-Pi'], 12000)['out'].splitlines()
+    for line in output[1:]:
+        p=line.split(None,5)
+        if len(p)<6:continue
+        try:
+            rows.append({'mount':p[5], 'inodes_total':int(p[1]),
+                         'inodes_used':int(p[2]), 'inodes_free':int(p[3]),
+                         'inodes_used_pct':float(p[4].rstrip('%'))})
+        except Exception:continue
+    return rows[:45]
+def meminfo():
+    result={}
+    try:
+        for line in open('/proc/meminfo'):
+            k,v=line.split(':',1)
+            if k in ('MemTotal','MemAvailable','SwapTotal','SwapFree'):
+                result[k+'_KiB']=int(v.strip().split()[0])
+    except Exception: pass
+    return result
+def netdev():
+    result=[]
+    try:
+        for line in open('/proc/net/dev').read().splitlines()[2:]:
+            if ':' not in line: continue
+            name,nums=line.split(':',1); n=nums.split(); name=name.strip()
+            if name=='lo' or len(n)<16: continue
+            result.append({'interface':name,'rx_bytes':int(n[0]),'rx_errors':int(n[2]),
+                           'rx_drops':int(n[3]),'tx_bytes':int(n[8]),
+                           'tx_errors':int(n[10]),'tx_drops':int(n[11])})
+    except Exception: pass
+    return result[:15]
+services={s:cmd(['systemctl','is-active',s],80)['out'] or 'unknown' for s in SERVICES}
+failed=cmd(['systemctl','--failed','--no-legend','--plain','--no-pager'],4200)['out']
+fstab=cmd(['findmnt','--verify','--tab-file','/etc/fstab'],600)
+clock=cmd(['timedatectl','show','-p','NTPSynchronized','--value'],50)
+try: uptime=round(float(open('/proc/uptime').read().split()[0]))
+except Exception: uptime=None
+try: loads=[round(x,2) for x in os.getloadavg()]
+except Exception: loads=[]
+snap={'captured_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+      'hostname_os':os.uname().nodename, 'os_release':release(),
+      'kernel':os.uname().release, 'uptime_seconds':uptime,
+      'cpu_count':os.cpu_count(), 'load_1_5_15':loads,
+      'memory':meminfo(), 'mounts':mounts(), 'inodes':inodes(), 'services':services,
+      'failed_units':failed.splitlines()[:25],
+      'fstab_verification':fstab, 'ntp_synchronized':clock['out'],
+      'selinux':cmd(['getenforce'],60)['out'],
+      'firewalld':cmd(['systemctl','is-active','firewalld'],70)['out'],
+      'default_route_v4':cmd(['ip','-4','route','show','default'],400)['out'],
+      'interface_addresses':cmd(['ip','-br','address','show'],750)['out'],
+      'dns_resolvers':cmd(['grep','-E','^nameserver[[:space:]]','/etc/resolv.conf'],350)['out'],
+      'sssd':cmd(['systemctl','is-active','sssd'],60)['out'],
+      'crond':cmd(['systemctl','is-active','crond'],60)['out'],
+      'network_interfaces':netdev(),
+      'socket_summary':cmd(['ss','-s'],500)['out'],
+      'boot_duration':cmd(['systemd-analyze','time','--no-pager'],220)['out'],
+      'journal_error_examples':cmd(['journalctl','-b','-p','err','-n','10','--no-pager','-q'],1800)['out'],
+      'kernel_error_examples':cmd(['journalctl','-k','-b','-p','err','-n','8','--no-pager','-q'],1200)['out'],
+      'packages':cmd(['rpm','-q','kernel-core','leapp','amazon-ssm-agent','amazon-cloudwatch-agent'],600)['out'],
+      'block_devices':cmd(['lsblk','-o','NAME,SIZE,FSTYPE,MOUNTPOINT','-n'],1000)['out']}
+print('RHEL_OS_REPORT_JSON='+json.dumps(snap, separators=(',',':')))
+'''
+
+
+def now_utc():
+    return dt.datetime.now(UTC)
+
+
+def fmt_time(d):
+    return d.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')
+
+
+def iso_time(d):
+    return d.astimezone(UTC).isoformat().replace('+00:00', 'Z')
+
+
+def parse_time(value):
+    if not isinstance(value, str):
+        raise ValueError('Upgrade completion time must be an ISO-8601 UTC string, ending in Z')
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+            raise ValueError()
+        return parsed.astimezone(UTC)
+    except (ValueError, TypeError):
+        raise ValueError('Invalid UTC timestamp %r; example: 2026-11-20T03:30:00Z' % value)
+
+
+def ceil_period(x):
+    ts = x.timestamp()
+    return dt.datetime.fromtimestamp(math.ceil(ts / PERIOD) * PERIOD, UTC)
+
+
+def floor_period(x):
+    ts = x.timestamp()
+    return dt.datetime.fromtimestamp(math.floor(ts / PERIOD) * PERIOD, UTC)
+
+
+def clean_batch(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', value):
+        raise ValueError('batch_id must be 1-80 letters/digits, _, - or .; first character alphanumeric')
+    return value
+
+
+def unique_hosts(values):
+    if not isinstance(values, list) or not values:
+        raise ValueError('Run 1 requires a nonempty hostnames JSON array')
+    if len(values) != len(set(values)):
+        raise ValueError('hostnames contains duplicate values')
+    limit = int(os.environ.get('MAX_HOSTS', '20'))
+    if len(values) > limit:
+        raise ValueError('Maximum %s hosts per batch; split into smaller batches' % limit)
+    for host in values:
+        if (not isinstance(host,str) or not host.strip() or len(host)>128
+                or not re.fullmatch(r'[^*?\x00-\x1f\x7f]{1,128}',host)):
+            raise ValueError('Invalid EC2 Name tag %r (1-128 visible characters; * and ? wildcards not allowed)' % host)
+    return values
+
+
+def setting(name, required=False, default=None):
+    value = os.environ.get(name, default)
+    if required and not value:
+        raise ValueError('Missing Lambda environment variable: ' + name)
+    return value
+
+
+def s3_args(body, content_type):
+    return {'Body': body, 'ContentType': content_type, 'ServerSideEncryption':'aws:kms',
+            'SSEKMSKeyId': setting('KMS_KEY_ARN', True)}
+
+
+def key_for(prefix, batch, filename):
+    return '/'.join(p for p in (prefix.strip('/'), batch, filename) if p)
+
+
+def s3_key_exists(s3, bucket, key):
+    # A targeted ListObjects avoids relying on HeadObject's 403-vs-404 behavior
+    # when s3:ListBucket permission is constrained by the bucket prefix.
+    response=s3.list_objects_v2(Bucket=bucket,Prefix=key,MaxKeys=1)
+    return any(obj.get('Key')==key for obj in response.get('Contents',[]))
+
+
+def read_state(s3, bucket, prefix, batch, phase):
+    key = key_for(prefix, batch, '.state/phase-%d.json' % phase)
+    try:
+        result = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(result['Body'].read())
+    except ClientError as e:
+        code = e.response.get('Error',{}).get('Code')
+        if code in ('NoSuchKey','404'):
+            raise ValueError('Missing preceding Phase %d. Run phases in order for batch %s' % (phase,batch))
+        raise
+
+
+def write(s3, bucket, key, data, typ):
+    payload = data.encode('utf-8') if isinstance(data,str) else data
+    s3.put_object(Bucket=bucket, Key=key, **s3_args(payload, typ))
+    LOG.info('Wrote S3 object s3://%s/%s', bucket, key)
+
+
+def resolve_instances(ec2, hostnames):
+    result = {}
+    all_found = defaultdict(list)
+    paginator = ec2.get_paginator('describe_instances')
+    for page in paginator.paginate(Filters=[{'Name':'tag:Name','Values':hostnames}]):
+        for r in page.get('Reservations',[]):
+            for inst in r.get('Instances',[]):
+                tags = {x['Key']:x['Value'] for x in inst.get('Tags',[])}
+                name = tags.get('Name')
+                if name in hostnames and inst.get('State',{}).get('Name') != 'terminated':
+                    all_found[name].append(inst)
+    for host in hostnames:
+        matches = all_found.get(host,[])
+        if len(matches) != 1:
+            raise ValueError('Name tag %r must match exactly one non-terminated EC2 instance; found %d' % (host,len(matches)))
+        inst = matches[0]
+        if inst['State']['Name'] != 'running':
+            raise ValueError('%s (%s) is %s, must be running for live OS checks' %
+                             (host,inst['InstanceId'],inst['State']['Name']))
+        result[host] = {'instance_id':inst['InstanceId'],
+                        'instance_type':inst.get('InstanceType',''),
+                        'state':inst['State']['Name'],
+                        'availability_zone':inst.get('Placement',{}).get('AvailabilityZone','')}
+    return result
+
+
+def volume_map(ec2, instance_id):
+    volumes=[]
+    paginator=ec2.get_paginator('describe_volumes')
+    for page in paginator.paginate(Filters=[{'Name':'attachment.instance-id','Values':[instance_id]}]):
+        for vol in page.get('Volumes',[]):
+            volumes.append({'volume_id':vol['VolumeId'], 'type':vol['VolumeType'],
+                            'size_gib':vol.get('Size'), 'iops':vol.get('Iops'),
+                            'throughput_mib_s':vol.get('Throughput')})
+    return sorted(volumes, key=lambda v:v['volume_id'])
+
+
+def query_os_snapshots(ssm, host_data, services_by_host):
+    commands={}
+    outputs={}
+    for host, info in host_data.items():
+        svcs = list(dict.fromkeys(DEFAULT_SERVICES + services_by_host.get(host, [])))
+        py=SSM_PY.replace('__SERVICES__', repr(svcs))
+        shell = ("PYBIN=$(command -v python3 || true)\n"
+                 "if [ -z \"$PYBIN\" ] && [ -x /usr/libexec/platform-python ]; then PYBIN=/usr/libexec/platform-python; fi\n"
+                 "if [ -z \"$PYBIN\" ]; then echo 'Python interpreter missing' >&2; exit 3; fi\n"
+                 "\"$PYBIN\" - <<'PY_RHEL_AUDIT'\n" + py + "\nPY_RHEL_AUDIT")
+        try:
+            res=ssm.send_command(InstanceIds=[info['instance_id']],
+                                 DocumentName='AWS-RunShellScript',
+                                 Comment='Read-only RHEL OS upgrade assessment',
+                                 Parameters={'commands':[shell]},
+                                 TimeoutSeconds=90)
+            commands[host]=res['Command']['CommandId']
+        except Exception as e:
+            outputs[host]={'status':'SSM_SEND_FAILED','error':str(e)[:450], 'snapshot':None}
+    deadline=time.monotonic()+min(240,max(10,int(setting('SSM_WAIT_SECONDS', default='100'))))
+    pending=set(commands)
+    while pending and time.monotonic()<deadline:
+        for host in list(pending):
+            try:
+                res=ssm.get_command_invocation(CommandId=commands[host],
+                                               InstanceId=host_data[host]['instance_id'])
+            except ClientError as e:
+                if e.response.get('Error',{}).get('Code')=='InvocationDoesNotExist':
+                    continue
+                outputs[host]={'status':'SSM_POLL_FAILED','error':str(e)[:450],'snapshot':None}
+                pending.remove(host)
+                continue
+            st=res.get('Status','Unknown')
+            if st in ('Pending','InProgress','Delayed','Cancelling'):
+                continue
+            pending.remove(host)
+            raw=res.get('StandardOutputContent','')
+            marker='RHEL_OS_REPORT_JSON='
+            pos=raw.find(marker)
+            if st=='Success' and pos>=0:
+                try:
+                    outputs[host]={'status':'Success',
+                                   'snapshot':json.loads(raw[pos+len(marker):].splitlines()[0])}
+                    continue
+                except (ValueError,IndexError) as e:
+                    err='Invalid/truncated SSM JSON: '+str(e)
+            else:
+                err=(res.get('StandardErrorContent') or 'No audit JSON returned')[:450]
+            outputs[host]={'status':st,'error':err,'snapshot':None}
+        if pending: time.sleep(3)
+    for host in pending:
+        outputs[host]={'status':'SSM_TIMEOUT','error':'SSM Run Command did not complete before polling deadline',
+                       'snapshot':None}
+    return outputs
+
+
+def list_agent_metrics(cw, namespace, instance_id):
+    results=[]
+    try:
+        pages=cw.get_paginator('list_metrics').paginate(
+            Namespace=namespace, Dimensions=[{'Name':'InstanceId','Value':instance_id}])
+        for page in pages:
+            for metric in page.get('Metrics',[]):
+                d={x['Name']:x['Value'] for x in metric.get('Dimensions',[])}
+                if d.get('InstanceId')==instance_id:
+                    results.append({'name':metric['MetricName'],'dimensions':d})
+                if len(results)>=3000:
+                    return results
+    except Exception as e:
+        LOG.warning('CWAgent ListMetrics failed for %s: %s',instance_id,e)
+    return results
+
+
+def spec(namespace,name,label,unit,stat,convert,direction,dimensions,category='CloudWatch'):
+    return {'namespace':namespace,'name':name,'label':label,'unit':unit,
+            'stat':stat,'convert':convert,'direction':direction,
+            'dimensions':dict(dimensions),'category':category}
+
+
+def choose_agent(entries, name, preference=None):
+    choices=[x for x in entries if x['name']==name]
+    if not choices: return None
+    def weight(x):
+        d=x['dimensions']
+        if preference=='cpu':
+            # Do NOT choose one of the per-core series as the system-wide CPU.
+            # 'cpu-total' is preferred over an InstanceId rollup and individual cores.
+            if d.get('cpu')=='cpu-total': penalty=0
+            elif 'cpu' not in d: penalty=40
+            else: penalty=500
+        else:
+            penalty=0
+        return penalty+len(d)
+    return min(choices,key=weight)['dimensions']
+
+
+def first_agent(discovered, aliases, preference=None):
+    for name in aliases:
+        dimensions=choose_agent(discovered,name,preference)
+        if dimensions:
+            return name, dimensions
+    return None, None
+
+
+def metric_specs(cw, iid, volumes, agent_ns):
+    specs=[]
+    for name,label,unit,stat,convert,direction in EC2_METRICS:
+        specs.append(spec('AWS/EC2',name,label,unit,stat,convert,direction,
+                          {'InstanceId':iid},'EC2'))
+    discovered=list_agent_metrics(cw,agent_ns,iid)
+    for aliases,label,unit,direction,convert in AGENT_SIMPLE:
+        pref='cpu' if aliases[0].startswith('Cpu') else None
+        name,dims=first_agent(discovered,aliases,pref)
+        if name:
+            specs.append(spec(agent_ns,name,label,unit,'Average',convert,
+                              direction,dims,'Guest OS'))
+    # Filesystem metrics MUST be the original path-specific series, not the
+    # InstanceId-only rollup. Otherwise an entire set of mounts can be summed.
+    for aliases,label,unit,direction,convert in AGENT_DISK:
+        bypath={}
+        for name in aliases:
+            candidates=[e for e in discovered if e['name']==name]
+            for e in candidates:
+                d=e['dimensions']; path=d.get('path')
+                if not path or d.get('fstype') in IGNORE_FSTYPES:continue
+                if path not in bypath or len(d)<len(bypath[path][1]):
+                    bypath[path]=(name,d)
+            if bypath:break
+        for path in sorted(bypath, key=lambda v:(v!='/','/'+v))[:35]:
+            real_name,dims=bypath[path]
+            specs.append(spec(agent_ns,real_name,label+': '+path,unit,
+                              'Average',convert,direction,dims,'Guest OS'))
+    for name,label,unit,stat,convert,direction in AGENT_DISKIO:
+        devices={}
+        for e in discovered:
+            if e['name']!=name:continue
+            d=e['dimensions'];dev=d.get('name') or d.get('device') or 'aggregate'
+            if dev not in devices or len(d)<len(devices[dev]): devices[dev]=d
+        for dev,dims in sorted(devices.items())[:12]:
+            specs.append(spec(agent_ns,name,label+' ['+dev+']',unit,stat,convert,
+                              direction,dims,'Guest disk I/O'))
+    for aliases,label,unit,convert in AGENT_NET_BYTES:
+        interfaces={}
+        for name in aliases:
+            for e in discovered:
+                if e['name']!=name:continue
+                d=e['dimensions'];nic=d.get('interface') or d.get('device') or 'aggregate'
+                if nic not in interfaces or len(d)<len(interfaces[nic][1]):
+                    interfaces[nic]=(name,d)
+            if interfaces:break
+        for nic,(real_name,dims) in sorted(interfaces.items())[:12]:
+            specs.append(spec(agent_ns,real_name,label+' ['+nic+']',unit,
+                              'Sum',convert,'neutral',dims,'Guest network'))
+    for name,label,unit,direction in AGENT_NETWORK:
+        devs={}
+        for e in discovered:
+            if e['name']!=name:continue
+            d=e['dimensions'];nic=d.get('interface') or d.get('device') or 'aggregate'
+            if nic not in devs or len(d)<len(devs[nic]):devs[nic]=d
+        for nic,dims in sorted(devs.items())[:12]:
+            specs.append(spec(agent_ns,name,label+' ['+nic+']',unit,
+                              'Sum','identity',direction,dims,'Guest network'))
+    for vol in volumes[:35]:
+        for name,label,unit,stat,convert,direction in EBS_METRICS:
+            specs.append(spec('AWS/EBS',name,label+' ['+vol['volume_id']+']',unit,
+                              stat,convert,direction,{'VolumeId':vol['volume_id']},'EBS'))
+    return specs, len(discovered)
+
+
+def scale(value, convert):
+    if convert=='to_mib': return value/(1024**2)
+    if convert=='to_mib_second': return value/(1024**2)/PERIOD
+    if convert=='to_gib': return value/(1024**3)
+    if convert=='per_second': return value/PERIOD
+    return value
+
+
+def fetch_metrics(cw, specs, start, end):
+    if start>=end:
+        return {}, ['Measurement window has no completed hourly interval; invoke again after >=1 hour']
+    raw={}
+    warnings=[]
+    for off in range(0,len(specs),50):
+        subset=specs[off:off+50]
+        queries=[]
+        for i,one in enumerate(subset):
+            queries.append({'Id':'m%d'%i,
+                'MetricStat':{'Metric':{'Namespace':one['namespace'],
+                                        'MetricName':one['name'],
+                                        'Dimensions':[{'Name':k,'Value':v}
+                                                      for k,v in sorted(one['dimensions'].items())]},
+                              'Period':PERIOD,'Stat':one['stat']},
+                'ReturnData':True})
+        token=None
+        data=defaultdict(dict)
+        try:
+            while True:
+                kwargs={'MetricDataQueries':queries,'StartTime':start,'EndTime':end,
+                        'ScanBy':'TimestampAscending', 'MaxDatapoints':100800}
+                if token: kwargs['NextToken']=token
+                response=cw.get_metric_data(**kwargs)
+                for res in response.get('MetricDataResults',[]):
+                    if res.get('StatusCode') in ('InternalError','Forbidden'):
+                        warnings.append('CloudWatch returned '+res['StatusCode']+' for '+res['Id'])
+                    for t,v in zip(res.get('Timestamps',[]),res.get('Values',[])):
+                        if isinstance(v,(int,float)) and math.isfinite(v):
+                            data[res['Id']][iso_time(t)]=float(v)
+                token=response.get('NextToken')
+                if not token: break
+        except Exception as e:
+            warnings.append('CloudWatch GetMetricData failed: '+str(e)[:350])
+        for i,one in enumerate(subset):
+            points=sorted([[t,v] for t,v in data.get('m%d'%i,{}).items()])
+            raw[off+i]=points
+    return raw, warnings
+
+
+def percentile(vals,p):
+    if not vals: return None
+    nums=sorted(vals)
+    position=(len(nums)-1)*p/100
+    a=int(position);b=min(a+1,len(nums)-1)
+    return nums[a]+(nums[b]-nums[a])*(position-a)
+
+
+def summarize_points(points,unit,start,end):
+    count=len(points)
+    values=[float(x[1]) for x in points]
+    expected=max(0,round((end-start).total_seconds()/PERIOD))
+    return {'unit':unit,'mean':round(statistics.mean(values),4) if values else None,
+            'min':round(min(values),4) if values else None,
+            'max':round(max(values),4) if values else None,
+            'p95':round(percentile(values,95),4) if values else None,
+            'latest':round(values[-1],4) if values else None,
+            'samples':count,'expected_samples':expected,
+            'coverage_pct':round(100*count/expected,1) if expected else 0,
+            'points':[[t,round(v,6)] for t,v in points]}
+
+
+def complete_metrics(cw,iid,volumes,start,end,agent_ns):
+    specs,discovered=metric_specs(cw,iid,volumes,agent_ns)
+    raw,warnings=fetch_metrics(cw,specs,start,end)
+    output=[]
+    by_vol=defaultdict(dict)
+    by_guest_disk=defaultdict(dict)
+    for i,s in enumerate(specs):
+        pts=raw.get(i,[])
+        if s['category']=='EBS':
+            vol=s['dimensions']['VolumeId']
+            by_vol[vol][s['name']]=pts
+        if s['category']=='Guest disk I/O':
+            dev=s['dimensions'].get('name') or s['dimensions'].get('device') or 'aggregate'
+            by_guest_disk[dev][s['name']]=pts
+        if s['name'] in ('VolumeTotalReadTime','VolumeTotalWriteTime'):
+            continue  # used to compute weighted operation latency, not a user-facing metric
+        scaled=[[t,scale(v,s['convert'])] for t,v in pts]
+        item={k:s[k] for k in ('name','label','unit','category','direction')}
+        item['metric_key']=s['namespace']+'|'+s['name']+'|'+json.dumps(s['dimensions'],sort_keys=True)
+        item.update(summarize_points(scaled,s['unit'],start,end))
+        output.append(item)
+    for device,d in by_guest_disk.items():
+        for side in ('read','write'):
+            ops_name='diskio_reads' if side=='read' else 'diskio_writes'
+            tm_name='diskio_'+side+'_time'
+            ops={t:v for t,v in d.get(ops_name,[])}
+            times={t:v for t,v in d.get(tm_name,[])}
+            latencies=[[t,times[t]/v] for t,v in sorted(ops.items()) if t in times and v>0]
+            if not latencies:continue
+            item={'name':'Guest'+side.title()+'Latency','label':'Guest '+side+' latency ['+device+']',
+                  'unit':'ms/op','category':'Guest disk I/O','direction':'lower',
+                  'metric_key':'DERIVED|Guest'+side.title()+'Latency|'+device}
+            item.update(summarize_points(latencies,'ms/op',start,end))
+            output.append(item)
+    for vol,d in by_vol.items():
+        for side in ('Read','Write'):
+            ops={t:v for t,v in d.get('Volume'+side+'Ops',[])}
+            durations={t:v for t,v in d.get('VolumeTotal'+side+'Time',[])}
+            latencies=[[t, 1000*durations[t]/v] for t,v in sorted(ops.items())
+                       if t in durations and v>0]
+            if not latencies: continue
+            item={'name':'EBS'+side+'Latency', 'label':'EBS '+side.lower()+' latency ['+vol+']',
+                  'unit':'ms/op','category':'EBS','direction':'lower',
+                  'metric_key':'DERIVED|EBS'+side+'Latency|'+vol}
+            item.update(summarize_points(latencies,'ms/op',start,end))
+            output.append(item)
+    return output,warnings,discovered
+
+
+def check(level, name, detail, group='OS'):
+    return {'status':level,'check':name,'detail':str(detail),'group':group}
+
+
+def expected_version(phase,server_type):
+    return {1:'8.8', 2:'9.2' if server_type=='app' else '8.10', 3:'9.6'}[phase]
+
+
+def validate_host(host, record, previous, baseline):
+    checks=[]
+    p=record['phase']; snap=record.get('snapshot');prev=(previous or {}).get('snapshot')
+    metrics=record.get('metrics',[])
+    exp=expected_version(p,record['server_type'])
+    if not snap:
+        checks.append(check('FAIL','SSM OS snapshot',record.get('ssm_error','SSM snapshot unavailable')))
+    else:
+        checks.append(check('PASS','SSM OS snapshot','Collected via Systems Manager'))
+        osinfo=snap.get('os_release',{})
+        ver=osinfo.get('VERSION_ID','unknown')
+        name=osinfo.get('ID','unknown')
+        checks.append(check('PASS' if name=='rhel' and ver==exp else 'FAIL',
+                            'Expected RHEL version','Detected %s %s; expected RHEL %s'%(name,ver,exp)))
+        services=snap.get('services',{})
+        for svc in record.get('critical_services',[]):
+            st=services.get(svc,'unknown')
+            checks.append(check('PASS' if st=='active' else 'FAIL','Required service: '+svc,
+                                'systemctl is-active: '+st))
+        failed=snap.get('failed_units',[])
+        checks.append(check('WARN' if failed else 'PASS','Failed systemd units',
+                            '%d failed; %s'%(len(failed),'; '.join(failed[:3])) if failed else 'None'))
+        ntp=snap.get('ntp_synchronized','')
+        checks.append(check('PASS' if ntp=='yes' else 'WARN','NTP time synchronization',ntp or 'unknown'))
+        fstab=snap.get('fstab_verification',{})
+        checks.append(check('PASS' if fstab.get('rc')==0 else 'WARN','/etc/fstab verification',
+                            fstab.get('out') or fstab.get('err') or 'No response'))
+        mounts=snap.get('mounts',[])
+        if not mounts:
+            checks.append(check('FAIL','Filesystem inventory','No filesystem entries collected'))
+        for mount in mounts:
+            used=mount.get('used_pct')
+            if used is None: continue
+            if used>=95: st='FAIL'
+            elif used>=85: st='WARN'
+            else: st='PASS'
+            checks.append(check(st,'Filesystem capacity: '+mount['mount'],'%.1f%% used, %.1f GiB free'%
+                                (used,mount.get('free_bytes',0)/1024**3),'Storage'))
+        for inode in snap.get('inodes',[]):
+            pct=inode.get('inodes_used_pct',0)
+            if pct>=95:severity='FAIL'
+            elif pct>=85:severity='WARN'
+            else:severity='PASS'
+            checks.append(check(severity,'Filesystem inode utilization: '+inode['mount'],
+                                '%.1f%% used, %s free inodes'%(pct,inode.get('inodes_free',0)),'Storage'))
+        if previous:
+            old_volumes={v['volume_id']:v for v in previous.get('volumes',[])}
+            new_volumes={v['volume_id']:v for v in record.get('volumes',[])}
+            for volume_id in sorted(set(old_volumes)-set(new_volumes)):
+                checks.append(check('WARN','Previously attached EBS volume missing: '+volume_id,
+                                    'Check whether storage was intentionally detached','Storage'))
+            for volume_id in sorted(set(new_volumes)-set(old_volumes)):
+                checks.append(check('WARN','New EBS volume attached: '+volume_id,
+                                    'Check whether the new volume is expected','Storage'))
+        if prev:
+            old_mounts={m['mount']:m for m in prev.get('mounts',[])}
+            new_mounts={m['mount']:m for m in mounts}
+            for mount,old in old_mounts.items():
+                if mount not in new_mounts:
+                    checks.append(check('FAIL','Previously mounted filesystem: '+mount,
+                                        'Missing in current snapshot','Storage'))
+                elif old.get('fstype')!=new_mounts[mount].get('fstype'):
+                    checks.append(check('WARN','Filesystem type changed: '+mount,
+                                        '%s -> %s'%(old.get('fstype'),new_mounts[mount].get('fstype')),'Storage'))
+            if snap.get('selinux')!=prev.get('selinux'):
+                checks.append(check('WARN','SELinux mode change','%s -> %s'%
+                                    (prev.get('selinux'),snap.get('selinux')),'Security'))
+            else:
+                checks.append(check('PASS','SELinux mode unchanged',snap.get('selinux','unknown'),'Security'))
+            if snap.get('firewalld')!=prev.get('firewalld'):
+                checks.append(check('WARN','firewalld service state changed',
+                                    '%s -> %s'%(prev.get('firewalld'),snap.get('firewalld')),'Security'))
+            for svc,prior in prev.get('services',{}).items():
+                latest=services.get(svc,'unknown')
+                if prior=='active' and latest!='active' and svc not in record.get('critical_services',[]):
+                    checks.append(check('WARN','Previously active service stopped: '+svc,
+                                        '%s -> %s'%(prior,latest),'OS'))
+            if snap.get('dns_resolvers')!=prev.get('dns_resolvers'):
+                checks.append(check('WARN','DNS resolver configuration changed',
+                                    'Compare /etc/resolv.conf and resolver reachability','Network'))
+            if bool(snap.get('default_route_v4'))!=bool(prev.get('default_route_v4')):
+                checks.append(check('WARN','IPv4 default route presence changed',
+                                    'Review network routing','Network'))
+        interfaces=snap.get('network_interfaces',[])
+        for nic in interfaces:
+            errs=sum(nic.get(f,0) for f in ('rx_errors','rx_drops','tx_errors','tx_drops'))
+            checks.append(check('WARN' if errs else 'PASS','NIC errors/drops since reboot: '+nic['interface'],
+                                'RX errors=%s, RX drops=%s, TX errors=%s, TX drops=%s (boot-reset counters)'%
+                                (nic['rx_errors'],nic['rx_drops'],nic['tx_errors'],nic['tx_drops']),'Network'))
+        if snap.get('kernel_error_examples'):
+            checks.append(check('WARN','Kernel boot errors','Kernel error-level messages exist; inspect excerpts','Logs'))
+        else:
+            checks.append(check('PASS','Kernel boot errors','No error-level messages found in sampled boot log','Logs'))
+        if snap.get('journal_error_examples'):
+            checks.append(check('WARN','System journal errors','Error-level messages exist; inspect excerpts','Logs'))
+        else:
+            checks.append(check('PASS','System journal errors','No error-level messages found in sampled boot log','Logs'))
+    index={m['name']:m for m in metrics if m.get('category')=='EC2'}
+    for name in ('StatusCheckFailed','StatusCheckFailed_Instance','StatusCheckFailed_System'):
+        m=index.get(name)
+        if m and m['max'] is not None:
+            checks.append(check('FAIL' if m['max']>0 else 'PASS',m['label'],
+                                'Maximum hourly check failure flag: '+str(m['max']),'CloudWatch'))
+    mandatory=[
+        (('CPUUtilization',), 'EC2 CPU utilization'),
+        (('MemUsedPercent','mem_used_percent'), 'CWAgent memory used'),
+        (('SwapUsedPercent','swap_used_percent'), 'CWAgent swap usage'),
+        (('DiskUsedPercent','disk_used_percent'), 'CWAgent filesystem used'),
+        (('CpuIOWaitPercent','cpu_usage_iowait'), 'CWAgent CPU I/O wait'),
+        (('diskio_reads',), 'CWAgent guest disk reads'),
+        (('diskio_writes',), 'CWAgent guest disk writes'),
+        (('NetBytesIn','net_bytes_recv'), 'CWAgent guest network received'),
+        (('NetBytesOut','net_bytes_sent'), 'CWAgent guest network sent'),
+        (('net_drop_in',), 'CWAgent inbound network drops'),
+        (('net_drop_out',), 'CWAgent outbound network drops'),
+    ]
+    for aliases,label in mandatory:
+        matches=[m for m in metrics if m['name'] in aliases]
+        if not matches or not any(m['samples']>0 for m in matches):
+            checks.append(check('WARN','Historical metric missing: '+label,
+                                'No hourly points for configured metric '+aliases[0]+
+                                '; check CWAgent dimensions and data collection','CloudWatch'))
+    if record['window']['hours']<1:
+        checks.append(check('WARN','Collection interval',
+                            'No completed hour of metrics is available; HTML is diagnostic only','CloudWatch'))
+    elif p>1 and record['window']['hours']<24:
+        checks.append(check('WARN','Post-upgrade observation window',
+                            '%d completed hours since upgrade; use >=24 h, ideally 5-7 days of normal workload'%record['window']['hours'],
+                            'Performance'))
+    for m in metrics:
+        if m['samples']==0: continue
+        if m['coverage_pct']<75:
+            checks.append(check('WARN','Metric coverage: '+m['label'],
+                                '%.1f%% of completed hourly periods have data'%m['coverage_pct'],'CloudWatch'))
+        if m['name'] in ('net_drop_in','net_drop_out','net_err_in','net_err_out') and m['mean'] is not None and m['mean']>0:
+            checks.append(check('WARN','Historical network errors/drops: '+m['label'],
+                                'Average %.2f errors/drops per hour'%m['mean'],'Network'))
+        if m['name'] in ('MemUsedPercent','mem_used_percent') and m['mean'] is not None and m['mean']>=90:
+            checks.append(check('WARN','High average memory utilization','%.1f%%'%m['mean'],'Performance'))
+        if m['name']=='CPUUtilization' and m['mean'] is not None and m['mean']>=85:
+            checks.append(check('WARN','High average CPU utilization','%.1f%%'%m['mean'],'Performance'))
+    if previous and p>1:
+        old_metrics={m['metric_key']:m for m in previous.get('metrics',[])}
+        compared=0
+        for m in metrics:
+            old=old_metrics.get(m['metric_key'])
+            if old and old.get('mean') is not None and m.get('mean') is not None:
+                compared+=1
+        if compared==0:
+            checks.append(check('WARN','Pre/post comparison coverage',
+                                'No common metric with datapoints across preceding phase and this phase',
+                                'Performance'))
+    if baseline and p==3:
+        b_metrics={m['metric_key']:m for m in baseline.get('metrics',[])}
+        for m in metrics:
+            ref=b_metrics.get(m['metric_key'])
+            if not ref or ref.get('mean') is None or m.get('mean') is None: continue
+            before=ref['mean']; after=m['mean']
+            if before<=0 or m.get('direction')=='neutral': continue
+            delta=(after-before)/abs(before)*100
+            unfavorable=delta if m['direction']=='lower' else -delta
+            limit=10 if m['name'] in ('MemUsedPercent','mem_used_percent') else 15 if m['name']=='CPUUtilization' else 20
+            if unfavorable>limit:
+                checks.append(check('WARN','Performance change: '+m['label'],
+                                    '%+.1f%% relative to Phase 1 (threshold %.0f%%; workload must match)'%
+                                    (delta,limit),'Performance'))
+    return checks
+
+
+def status_of(checks):
+    return 'FAIL' if any(c['status']=='FAIL' for c in checks) else ('WARN' if any(c['status']=='WARN' for c in checks) else 'PASS')
+
+
+def esc(v):
+    return html.escape(str(v if v is not None else '—'),quote=True)
+
+
+def num(x, places=2):
+    if x is None:return '—'
+    return '{:,.{}f}'.format(x,places)
+
+
+def sparkline(points):
+    if len(points)<2:return '<span class="muted">—</span>'
+    values=[v for _,v in points]
+    vmin=min(values);vmax=max(values);rng=vmax-vmin or 1.0
+    picked=points[::max(1,len(points)//64)]
+    last=points[-1]
+    if picked[-1]!=last:picked.append(last)
+    coords=['%.1f,%.1f'%(i*110/max(1,len(picked)-1),27-(v-vmin)/rng*24)
+            for i,(_,v) in enumerate(picked)]
+    return '<svg aria-label="Metric trend" viewBox="0 0 112 30" width="112" height="30"><polyline fill="none" stroke="#2563eb" stroke-width="1.7" points="%s"/></svg>'%(' '.join(coords))
+
+
+def table(headers,rows):
+    return '<div class="table-wrap"><table><thead><tr>'+''.join('<th>'+esc(x)+'</th>' for x in headers)+\
+           '</tr></thead><tbody>'+''.join('<tr>'+''.join('<td>'+cell+'</td>' for cell in row)+'</tr>' for row in rows)+\
+           '</tbody></table></div>'
+
+
+def badge(value):
+    v=value if value in ('PASS','WARN','FAIL') else 'WARN'
+    return '<span class="badge %s">%s</span>'%(v.lower(),esc(value))
+
+
+def html_layout(title,subtitle,body,exports):
+    # JSON is text, not executable JS; escape < so host-controlled values cannot close the element.
+    payload=json.dumps(exports,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+    return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>'''+esc(title)+'''</title>
+<style>
+:root{color-scheme:light;--bg:#f3f6fb;--ink:#17243b;--mute:#67768d;--line:#dfe5ed;--accent:#1d4ed8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.55 system-ui,-apple-system,Segoe UI,Arial,sans-serif;color:var(--ink)}
+header{background:linear-gradient(120deg,#0f2345,#1d4685);color:white;padding:28px 36px}header h1{margin:0;font-size:25px}
+header p{margin:7px 0 0;color:#d6e3f5}main{max-width:1450px;margin:22px auto;padding:0 20px 50px}
+.card{background:white;border:1px solid var(--line);border-radius:13px;padding:20px 22px;margin:16px 0;box-shadow:0 3px 13px #13233a08}
+h2{font-size:19px;margin:0 0 14px}h3{font-size:16px;margin:24px 0 10px}
+.summary{display:flex;flex-wrap:wrap;gap:11px}.stat{background:#f3f7ff;padding:13px 17px;border-radius:9px;min-width:160px}.stat strong{font-size:23px;display:block}
+.muted,small{color:var(--mute)}p{margin:8px 0}ul{margin:7px 0 10px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:9px 10px;border-bottom:1px solid #e8edf2;text-align:left;vertical-align:top;white-space:nowrap}td:nth-child(2){white-space:normal}th{background:#f0f4f9;position:sticky;top:0;font-size:12px}
+tr:hover td{background:#f9fbff}.badge{display:inline-block;border-radius:7px;padding:2px 7px;font-weight:700;font-size:11px}
+.pass{background:#def7e7;color:#136b3b}.warn{background:#fff1ca;color:#7e5204}.fail{background:#ffe4e4;color:#b42324}
+button{background:var(--accent);border:0;color:white;font:inherit;padding:9px 13px;border-radius:7px;cursor:pointer;margin:4px 7px 4px 0}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:12px;border-radius:8px;font-size:12px}
+details{border:1px solid var(--line);padding:11px;border-radius:8px;margin:8px 0}summary{cursor:pointer;font-weight:600}
+.toc a{margin-right:18px}a{color:#2257ac}.warning{border-left:4px solid #d49316;padding:9px 12px;background:#fff8e6}
+@media print{button{display:none}header{background:white;color:#111}main{max-width:none}.card{break-inside:avoid}}
+</style></head><body><header><h1>'''+esc(title)+'''</h1><p>'''+esc(subtitle)+'''</p></header><main>
+<div class="card"><strong>Export report data</strong><p class="muted">Self-contained HTML. CSV files are generated locally in your browser; no external service is required.</p>'''+''.join('<button type="button" onclick="exportCSV(\'%s\')">%s</button>'%(esc(k),esc(label)) for k,label in [('metrics','Metric summary CSV'),('hourly','Hourly metrics CSV'),('checks','OS validation CSV'),('comparison','Phase comparison CSV')] if exports.get(k))+'''</div>'''+body+'''
+<p class="muted">Timestamps are UTC. Hourly metrics are for completed hours only. Missing data is not treated as zero. OS snapshots are point-in-time readings; thresholds are advisory and require workload context.</p>
+</main><script type="application/json" id="report-data">'''+payload+'''</script><script>
+function csvEscape(v){let s=(v===null||v===undefined)?'':String(v);if(/^[=+@\\t\\r]/.test(s)||(s.startsWith('-')&&!/^-?\\d+(\\.\\d+)?$/.test(s)))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}
+function exportCSV(kind){const data=JSON.parse(document.getElementById('report-data').textContent);const rows=data[kind]||[];if(!rows.length){alert('No records for '+kind);return;}
+const keys=[...new Set(rows.flatMap(r=>Object.keys(r)))];let out=keys.map(csvEscape).join(',')+'\\r\\n';for(const row of rows)out+=keys.map(k=>csvEscape(row[k])).join(',')+'\\r\\n';
+const blob=new Blob([out],{type:'text/csv;charset=utf-8;'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='rhel-'+kind+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);}
+</script></body></html>'''
+
+
+def export_rows(host, record, exports):
+    iid=record['instance_id']; phase=record['phase']; typ=record['server_type']
+    for m in record.get('metrics',[]):
+        basic={'hostname':host,'instance_id':iid,'server_type':typ,'phase':phase,
+               'label':m['label'],'category':m['category'],'unit':m['unit']}
+        exports['metrics'].append({**basic,'mean':m['mean'],'p95':m['p95'],
+               'min':m['min'],'max':m['max'],'latest':m['latest'],
+               'samples':m['samples'],'coverage_pct':m['coverage_pct']})
+        for t,val in m.get('points',[]):
+            exports['hourly'].append({**basic,'timestamp_utc':t,'value':val})
+    for c in record.get('checks',[]):
+        exports['checks'].append({'hostname':host,'instance_id':iid,'phase':phase,**c})
+
+
+def host_snapshot_html(snap):
+    if not snap:return '<p class="warning">SSM snapshot unavailable. See validation failures.</p>'
+    fields=[
+      ('OS',snap.get('os_release',{}).get('PRETTY_NAME','—')),
+      ('Kernel',snap.get('kernel')),
+      ('OS hostname',snap.get('hostname_os')),
+      ('CPU cores',snap.get('cpu_count')),
+      ('Load average 1/5/15m',snap.get('load_1_5_15')),
+      ('Uptime (hours)',round(snap['uptime_seconds']/3600,1) if snap.get('uptime_seconds') is not None else None),
+      ('Memory available GiB',round(snap.get('memory',{}).get('MemAvailable_KiB',0)/1024**2,2)),
+      ('SELinux',snap.get('selinux')),('firewalld',snap.get('firewalld')),
+      ('SSSD status',snap.get('sssd')),('crond status',snap.get('crond')),
+      ('NTP synchronized',snap.get('ntp_synchronized')),('Boot duration',snap.get('boot_duration')),
+      ('Default IPv4 route',snap.get('default_route_v4')),
+      ('IP interfaces',snap.get('interface_addresses')),
+      ('DNS resolvers',snap.get('dns_resolvers')),
+      ('Package versions',snap.get('packages'))]
+    body=table(['OS observation','Value'],[[esc(a),esc(b)] for a,b in fields])
+    mounts=snap.get('mounts',[])
+    if mounts:
+        body+='<h3>Filesystem inventory (live OS snapshot)</h3>'+table(
+          ['Mount','Device','Type','Used %','Free GiB'],
+          [[esc(m['mount']),esc(m['device']),esc(m['fstype']),esc(m['used_pct']),
+            esc(num(m['free_bytes']/1024**3))] for m in mounts])
+    if snap.get('inodes'):
+        body+='<h3>Filesystem inodes (live OS snapshot)</h3>'+table(
+          ['Mount','Inodes used %','Free inodes'],
+          [[esc(x['mount']),esc(x.get('inodes_used_pct')),esc(x.get('inodes_free'))]
+            for x in snap['inodes']])
+    svcs=snap.get('services',{})
+    if svcs:
+        body+='<h3>Service status</h3>'+table(['Service','State'],
+                    [[esc(a),esc(b)] for a,b in svcs.items()])
+    if snap.get('network_interfaces'):
+        body+='<h3>Network interface counters (since last boot)</h3>'+table(
+          ['Interface','RX errors','RX drops','TX errors','TX drops'],
+          [[esc(n['interface']),esc(n['rx_errors']),esc(n['rx_drops']),
+            esc(n['tx_errors']),esc(n['tx_drops'])] for n in snap['network_interfaces']])
+    for label,key in [('System errors (sampled current boot)','journal_error_examples'),
+                      ('Kernel errors (sampled current boot)','kernel_error_examples'),
+                      ('Block devices','block_devices'),('Socket summary','socket_summary')]:
+        value=snap.get(key,'')
+        if value:body+='<details><summary>'+esc(label)+'</summary><pre>'+esc(value)+'</pre></details>'
+    return body
+
+
+def phase_html(state):
+    phase=state['phase'];batch=state['batch_id']
+    title='RHEL OS upgrade — Phase %d'%phase
+    subtitle='Batch %s | AWS account %s | Region %s | Run %s | Script %s'%(batch,state['account_id'],state['region'],state['generated_at_utc'],VERSION)
+    counts=defaultdict(int)
+    for rec in state['hosts'].values():counts[status_of(rec['checks'])]+=1
+    body='<div class="card"><h2>Executive summary</h2><div class="summary">'+''.join(
+        '<div class="stat"><strong>%s</strong>%s</div>'%(v,esc(label))
+        for v,label in [(len(state['hosts']),'EC2 instances'),(counts['PASS'],'PASS'),
+                        (counts['WARN'],'WARN'),(counts['FAIL'],'FAIL')])+\
+        '</div><p>'+esc('Phase %d; expected OS versions: app=%s, db=%s'%
+        (phase,expected_version(phase,'app'),expected_version(phase,'db')))+\
+        '. Values are hourly series over each host-specific window.</p></div>'
+    # Top-level triage is particularly useful after Phase 2 when the OS was upgraded.
+    issues=[]
+    for host,rec in state['hosts'].items():
+        for c in rec['checks']:
+            if c['status'] in ('WARN','FAIL'):
+                issues.append([esc(host),badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])])
+    body+='<section class="card"><h2>Phase %d validation / action required</h2>'%phase
+    if issues:
+        body+='<p>Investigate the issues below before proceeding to the next upgrade phase.</p>'+table(
+            ['Hostname','Severity','Area','Validation','Finding'],issues)
+    else:
+        body+='<p>No checks currently flagged WARN or FAIL.</p>'
+    body+='</section>'
+    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[]}
+    for host,rec in state['hosts'].items():
+        export_rows(host,rec,exports)
+        window=rec['window']
+        body+='<section class="card"><h2>'+esc(host)+' '+badge(status_of(rec['checks']))+'</h2>'
+        body+='<p class="muted">'+esc(rec['instance_id'])+' | '+esc(rec['server_type'].upper())+\
+              ' | '+esc(rec['instance_type'])+' | '+esc(window['start'])+' to '+esc(window['end'])+\
+              ' | '+esc(window['hours'])+' complete hours</p>'
+        if rec.get('upgrade_completed_at_utc'):
+            body+='<p>Declared upgrade completed: <strong>'+esc(rec['upgrade_completed_at_utc'])+'</strong></p>'
+        if rec.get('warnings'):
+            body+='<div class="warning"><strong>Collection notes</strong><ul>'+''.join(
+                '<li>'+esc(x)+'</li>' for x in rec['warnings'])+'</ul></div>'
+        rows=[]
+        for m in rec['metrics']:
+            rows.append([esc(m['category']),esc(m['label']),esc(m['unit']),
+                         esc(num(m['mean'])),esc(num(m['p95'])),esc(num(m['min'])),
+                         esc(num(m['max'])),esc(m['samples']),
+                         esc(str(m['coverage_pct'])+'%'),sparkline(m['points'])])
+        body+='<h3>Hourly CloudWatch performance metrics</h3>'+table(
+            ['Category','Metric','Unit','Average','P95','Min','Max','Hours','Coverage','Trend'],rows)
+        prior=rec.get('prior_comparison',[])
+        if prior:
+            pr=[]
+            for x in prior:
+                change=x.get('change_pct')
+                pr.append([esc(x['metric']),esc(x['unit']),esc(num(x.get('before'))),
+                           esc(num(x.get('after'))),
+                           esc(('%+.1f%%'%change) if change is not None else '—'),
+                           badge(x['status']) if x['status'] in ('PASS','WARN','FAIL') else esc(x['status'])])
+            body+='<h3>Change from previous phase (hourly means)</h3>'+table(
+                ['Metric','Unit','Previous','Current','Change','Review'],pr)
+        checks=rec['checks']
+        body+='<h3>OS validation results</h3>'+table(['Status','Group','Check','Evidence / observation'],
+             [[badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])] for c in checks])
+        body+='<details><summary>Complete live OS snapshot</summary>'+host_snapshot_html(rec.get('snapshot'))+'</details>'
+        body+='</section>'
+    return html_layout(title,subtitle,body,exports)
+
+
+def phase_metric_diff(a,b):
+    if not a or not b:return None
+    x=a.get('mean');y=b.get('mean')
+    if x is None or y is None or x==0:return None
+    return round(100*(y-x)/abs(x),2)
+
+
+def final_html(phase_states):
+    first=phase_states[0];batch=first['batch_id']
+    title='RHEL OS upgrade — Three-phase final summary'
+    subtitle='Batch %s | Account %s | Region %s | Generated %s | Script %s'%(
+        batch,first['account_id'],first['region'],iso_time(now_utc()),VERSION)
+    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[]}
+    body='<div class="card"><h2>Detailed executive summary</h2>'
+    all_hosts=list(first['hosts'])
+    pass_hosts=[];warn_hosts=[];fail_hosts=[]
+    perhost=[]
+    for host in all_hosts:
+        h=[st['hosts'][host] for st in phase_states]
+        allchecks=[c for r in h for c in r['checks']]
+        status=status_of(allchecks)
+        if status=='FAIL':fail_hosts.append(host)
+        elif status=='WARN':warn_hosts.append(host)
+        else:pass_hosts.append(host)
+        vers=[]
+        for rec in h:
+            release=(rec.get('snapshot') or {}).get('os_release',{})
+            vers.append(release.get('VERSION_ID','not verified'))
+        missing=sum(1 for c in allchecks if c['status']=='WARN')
+        failures=sum(1 for c in allchecks if c['status']=='FAIL')
+        perhost.append([esc(host),esc(h[0]['instance_id']),esc(h[0]['server_type'].upper()),
+                        *[esc(v) for v in vers],badge(status),esc(failures),esc(missing)])
+        for rec in h:export_rows(host,rec,exports)
+    body+='<div class="summary">'+''.join(
+        '<div class="stat"><strong>%s</strong>%s</div>'%(v,esc(label))
+        for v,label in [(len(all_hosts),'Servers'),(len(pass_hosts),'Fully PASS'),
+                        (len(warn_hosts),'With warnings'),(len(fail_hosts),'With failures')])+\
+        '</div><p><strong>Overall result:</strong> '+badge('FAIL' if fail_hosts else 'WARN' if warn_hosts else 'PASS')+\
+        '. PASS requires every OS check across all three phases to pass. WARN indicates observations or data gaps, not necessarily upgrade failure.</p>'
+    body+='<p>Data collection covers: OS version and kernel, boot/uptime, CPU and memory, swap, filesystems and mount continuity, disk capacity, EBS IOPS/throughput/latency when available, network throughput and interface errors, failed units, required services, SELinux, firewalld, NTP, fstab, system/kernel logs, EC2 status checks and CWAgent coverage. Each phase includes a live SSM snapshot and historical hourly CloudWatch data.</p>'
+    body+='<h3>Three-phase outcome by instance</h3>'+table(
+        ['Hostname','Instance ID','Role','8.8 baseline','Intermediate','9.6 final','Overall','FAIL checks','WARN checks'],perhost)
+    body+='<p class="warning"><strong>Interpretation:</strong> Phase windows are not necessarily equal in length or business workload. Trends are evidence for investigation, not automatic proof that the OS caused a change. Network error counters from SSM reset after reboot. No application/database performance validation is included.</p></div>'
+    for host in all_hosts:
+        h=[st['hosts'][host] for st in phase_states]
+        title_status=status_of([c for r in h for c in r['checks']])
+        body+='<section class="card"><h2>'+esc(host)+' '+badge(title_status)+'</h2>'
+        body+='<p class="muted">'+esc(h[0]['instance_id'])+' | '+esc(h[0]['server_type'].upper())+\
+              ' | Metric comparison is on hourly mean, not matched workload.</p>'
+        rows=[]
+        metric_keys=[]
+        byphase=[]
+        for r in h:
+            d={m['metric_key']:m for m in r['metrics']};byphase.append(d)
+            metric_keys.extend(d)
+        for key in dict.fromkeys(metric_keys):
+            ms=[d.get(key) for d in byphase]
+            m=next((x for x in ms if x),None)
+            vals=[x.get('mean') if x else None for x in ms]
+            diffs=[phase_metric_diff(ms[a],ms[b]) for a,b in ((0,1),(1,2),(0,2))]
+            rows.append([esc(m['category']),esc(m['label']),esc(m['unit'])]+
+                        [esc(num(v)) for v in vals]+[esc(('%+.1f%%'%d) if d is not None else '—') for d in diffs])
+            exports['comparison'].append({'hostname':host,'instance_id':h[0]['instance_id'],
+                'server_type':h[0]['server_type'],'category':m['category'],
+                'metric':m['label'],'unit':m['unit'],
+                'phase1_avg':vals[0],'phase2_avg':vals[1],'phase3_avg':vals[2],
+                'change_1_to_2_pct':diffs[0], 'change_2_to_3_pct':diffs[1],
+                'change_1_to_3_pct':diffs[2],
+                'phase1_coverage_pct':ms[0]['coverage_pct'] if ms[0] else None,
+                'phase2_coverage_pct':ms[1]['coverage_pct'] if ms[1] else None,
+                'phase3_coverage_pct':ms[2]['coverage_pct'] if ms[2] else None})
+        body+='<h3>All OS metrics: baseline vs intermediate vs final</h3>'+table(
+          ['Area','Metric','Unit','Phase 1 avg','Phase 2 avg','Phase 3 avg','1→2 %','2→3 %','1→3 %'],rows)
+        osrows=[]
+        for label,fn in [
+           ('OS version',lambda s:s.get('os_release',{}).get('PRETTY_NAME')),
+           ('Kernel version',lambda s:s.get('kernel')),
+           ('Uptime hours',lambda s:round(s['uptime_seconds']/3600,1) if s.get('uptime_seconds') is not None else None),
+           ('CPU cores',lambda s:s.get('cpu_count')),
+           ('Load 1/5/15',lambda s:s.get('load_1_5_15')),
+           ('Memory available GiB',lambda s:round(s.get('memory',{}).get('MemAvailable_KiB',0)/1024**2,2)),
+           ('SELinux',lambda s:s.get('selinux')),
+           ('firewalld',lambda s:s.get('firewalld')),
+           ('SSSD status',lambda s:s.get('sssd')),
+           ('crond status',lambda s:s.get('crond')),
+           ('DNS resolvers',lambda s:s.get('dns_resolvers')),
+           ('Package versions',lambda s:s.get('packages')),
+           ('NTP synchronized',lambda s:s.get('ntp_synchronized')),
+           ('Failed units',lambda s:len(s.get('failed_units',[]))),
+           ('Mounted filesystems',lambda s:len(s.get('mounts',[]))),
+           ('Filesystem inode inventories',lambda s:len(s.get('inodes',[]))),
+           ('Boot duration',lambda s:s.get('boot_duration')),
+           ('SSM Agent',lambda s:s.get('services',{}).get('amazon-ssm-agent')),
+           ('CW Agent',lambda s:s.get('services',{}).get('amazon-cloudwatch-agent')),
+           ('fstab verify status',lambda s:s.get('fstab_verification',{}).get('rc')),
+           ('IPv4 default route',lambda s:'present' if s.get('default_route_v4') else 'absent')]:
+            osrows.append([esc(label)]+[esc(fn(r['snapshot'])) if r.get('snapshot') else 'not captured' for r in h])
+        body+='<h3>Full OS health comparison</h3>'+table(['OS validation item','Phase 1','Phase 2','Phase 3'],osrows)
+        for n,r in enumerate(h,1):
+            checkrows=[[badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])]
+                       for c in r['checks']]
+            body+='<details><summary>Phase %d: %s checks, collection notes, and audit details</summary>'%(n,len(r['checks']))
+            if r.get('warnings'):body+='<p>'+esc('; '.join(r['warnings']))+'</p>'
+            body+=table(['Result','Area','Check','Evidence'],checkrows)
+            body+='<details><summary>OS evidence from Phase %d</summary>'%n+host_snapshot_html(r.get('snapshot'))+'</details></details>'
+        body+='</section>'
+    return html_layout(title,subtitle,body,exports)
+
+
+
+
+def calculate_prior_changes(record, previous):
+    if not previous:return []
+    old_by_key={m['metric_key']:m for m in previous.get('metrics',[])}
+    rows=[]
+    for new in record.get('metrics',[]):
+        old=old_by_key.get(new['metric_key'])
+        if not old:continue
+        before=old.get('mean');after=new.get('mean')
+        if before is None or after is None:continue
+        change=(after-before)/abs(before)*100 if before!=0 else None
+        direction=new.get('direction')
+        unfavorable=(change if direction=='lower' else -change) if change is not None else None
+        lim=10 if new['name'] in ('MemUsedPercent','mem_used_percent') else 15 if new['name']=='CPUUtilization' else 20
+        severity='WARN' if direction!='neutral' and unfavorable is not None and unfavorable>lim else 'PASS'
+        rows.append({'metric':new['label'],'unit':new['unit'],'before':before,
+                     'after':after,'change_pct':round(change,2) if change is not None else None,
+                     'status':severity})
+    return rows
+
+
+def phase_diagnostic(state, report_key, state_key):
+    data={'tool_version':VERSION,'batch_id':state['batch_id'],'phase':state['phase'],
+          'account_id':state['account_id'],'region':state['region'],
+          'generated_at_utc':state['generated_at_utc'],
+          'execution_status':'COMPLETED_WITH_FINDINGS',
+          'html_s3_key':report_key,'state_s3_key':state_key,
+          'host_statuses':{},'hosts':{},'summary':{'pass':0,'warn':0,'fail':0}}
+    for host,rec in state['hosts'].items():
+        checks=rec['checks'];status=status_of(checks)
+        data['summary'][status.lower()]+=1
+        data['host_statuses'][host]=status
+        guest=[m for m in rec['metrics'] if m['category'] in ('Guest OS','Guest network','Guest disk I/O')]
+        data['hosts'][host]={
+            'instance_id':rec['instance_id'],'type':rec['server_type'],
+            'os_detected':(rec.get('snapshot') or {}).get('os_release',{}).get('VERSION_ID'),
+            'os_expected':expected_version(state['phase'],rec['server_type']),
+            'ssm_status':rec['ssm_status'], 'metric_window_utc':rec['window'],
+            'agent_metrics_discovered':rec.get('agent_metric_count',0),
+            'guest_metrics_with_data':sum(1 for m in guest if m['samples']>0),
+            'cw_metrics_with_data':sum(1 for m in rec['metrics'] if m['samples']>0),
+            'critical_findings':[c for c in checks if c['status'] in ('WARN','FAIL')],
+            'collection_warnings':rec.get('warnings',[]),
+            'prior_stage_changes_flagged':[x for x in rec.get('prior_comparison',[]) if x['status']=='WARN'],
+        }
+    if data['summary']['fail']:data['execution_status']='COMPLETED_WITH_FAILURES'
+    elif data['summary']['warn']:data['execution_status']='COMPLETED_WITH_WARNINGS'
+    else:data['execution_status']='COMPLETED_PASS'
+    return data
+
+
+def has_state(s3,bucket,prefix,batch,phase):
+    return s3_key_exists(s3,bucket,key_for(prefix,batch,'.state/phase-%d.json'%phase))
+
+
+def _run_phase(event, context):
+    """Invoke through Lambda Test JSON; invocation returns S3 keys and validation status."""
+    if not isinstance(event,dict):raise ValueError('Lambda test event must be a JSON object')
+    bucket=setting('REPORT_BUCKET',True)
+    prefix=setting('REPORT_PREFIX',default='rhel-upgrade-reports').strip('/')
+    setting('KMS_KEY_ARN',True)
+    agent_ns=setting('CW_AGENT_NAMESPACE',default='CWAgent')
+    batch=clean_batch(event.get('batch_id'))
+    try:phase=int(event.get('phase'))
+    except (TypeError,ValueError):raise ValueError('phase must be 1, 2 or 3')
+    if phase not in (1,2,3):raise ValueError('phase must be 1, 2 or 3')
+    baseline_days=int(event.get('baseline_days',setting('BASELINE_DAYS',default='15')))
+    if baseline_days<1 or baseline_days>30:raise ValueError('baseline_days must be 1-30')
+    session=boto3.session.Session()
+    region=session.region_name
+    if not region:raise ValueError('Lambda region cannot be determined')
+    s3=session.client('s3');ec2=session.client('ec2');ssm=session.client('ssm');cw=session.client('cloudwatch')
+    sts=session.client('sts')
+    account=sts.get_caller_identity()['Account']
+    before={};state1=None
+    if phase==1:
+        hostnames=unique_hosts(event.get('hostnames'))
+        kinds=event.get('server_types',{})
+        if set(kinds)!=set(hostnames) or any(str(x).lower() not in ('app','db') for x in kinds.values()):
+            raise ValueError('Run 1 requires server_types mapping for every exact hostname: app or db')
+        types={h:str(kinds[h]).lower() for h in hostnames}
+        svcs=event.get('critical_services_by_host',{})
+        if not isinstance(svcs,dict):raise ValueError('critical_services_by_host must be a JSON object')
+        checked_services={}
+        for host in hostnames:
+            extra=svcs.get(host,[])
+            if not isinstance(extra,list) or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9@_.-]{1,100}',x) for x in extra):
+                raise ValueError('Invalid critical_services_by_host for %s'%host)
+            checked_services[host]=list(dict.fromkeys(['sshd','chronyd']+extra))
+        # Do not silently overwrite historical comparison evidence.
+        phase1_key=key_for(prefix,batch,'.state/phase-1.json')
+        if s3_key_exists(s3,bucket,phase1_key):
+            if event.get('replace_existing') is not True:
+                raise ValueError('Phase 1 already exists for %s. Use a new batch_id or set replace_existing=true deliberately'%batch)
+            for later in (2,3):
+                key=key_for(prefix,batch,'.state/phase-%d.json'%later)
+                if s3_key_exists(s3,bucket,key):
+                    raise ValueError('Cannot replace Phase 1 because Phase %d exists. Use a NEW batch_id'%later)
+    else:
+        state1=read_state(s3,bucket,prefix,batch,1)
+        if state1.get('region')!=region or state1.get('account_id')!=account:
+            raise ValueError('Phase 1 belongs to another AWS account or region')
+        hostnames=list(state1['hosts'])
+        if event.get('hostnames') is not None and set(unique_hosts(event['hostnames']))!=set(hostnames):
+            raise ValueError('Hostnames differ from Phase 1; use same batch_id and hostnames')
+        types={h:state1['hosts'][h]['server_type'] for h in hostnames}
+        checked_services={h:state1['hosts'][h]['critical_services'] for h in hostnames}
+        if has_state(s3,bucket,prefix,batch,phase) and event.get('replace_existing') is not True:
+            raise ValueError('Phase %d already exists for batch %s; set replace_existing=true only to intentionally refresh this phase'%(phase,batch))
+        if phase==2 and has_state(s3,bucket,prefix,batch,3):
+            raise ValueError('Cannot update Phase 2 after Phase 3 was generated; use a NEW batch_id')
+        prior_state=state1 if phase==2 else read_state(s3,bucket,prefix,batch,2)
+        before=prior_state['hosts']
+        if set(before)!=set(hostnames):raise ValueError('Saved phase hostnames do not match')
+    if phase in (2,3):
+        times=event.get('upgrade_completed_at_utc')
+        if not isinstance(times,dict) or set(times)!=set(hostnames):
+            raise ValueError('Run %d requires upgrade_completed_at_utc mapping for every hostname'%phase)
+        start_by_host={h:parse_time(times[h]) for h in hostnames}
+    else:
+        start_by_host={}
+    host_data=resolve_instances(ec2,hostnames)
+    if phase>1:
+        for h in hostnames:
+            if host_data[h]['instance_id']!=state1['hosts'][h]['instance_id']:
+                raise ValueError('%s Name tag now resolves to a different EC2 instance ID'%h)
+    t=now_utc()
+    for host,start in start_by_host.items():
+        if start>=t:raise ValueError('%s upgrade completion timestamp is in the future'%host)
+        preceding_report_time=parse_time(prior_state['generated_at_utc'])
+        if start<=preceding_report_time:
+            raise ValueError('%s upgrade completion must occur AFTER preceding phase report was generated'%host)
+        if (t-start).days>455:
+            raise ValueError('%s upgrade completion is beyond 455-day hourly CloudWatch retention'%host)
+        if phase==3:
+            last=datetime_from_state(before[host].get('upgrade_completed_at_utc'))
+            if last and start<=last:
+                raise ValueError('%s Phase 3 completion time must be later than Phase 2 completion'%host)
+    LOG.info('Starting RHEL OS report batch=%s phase=%d region=%s hosts=%s',batch,phase,region,hostnames)
+    snapshot_results=query_os_snapshots(ssm,host_data,checked_services)
+    state={'schema_version':1,'batch_id':batch,'phase':phase,'account_id':account,
+           'region':region,'generated_at_utc':iso_time(t),'hosts':{}}
+    for host in hostnames:
+        info=host_data[host]
+        start_raw=t-dt.timedelta(days=baseline_days) if phase==1 else start_by_host[host]
+        start=ceil_period(start_raw);end=floor_period(t)
+        vols=volume_map(ec2,info['instance_id'])
+        metrics,warnings,discovered=complete_metrics(cw,info['instance_id'],vols,start,end,agent_ns)
+        ss=snapshot_results[host]
+        if discovered==0:
+            warnings.append('No CWAgent metrics discovered by InstanceId. Verify CWAgent is installed, running and includes append_dimensions InstanceId; historical guest metrics may be absent.')
+        if phase>1 and (t-start_raw)<dt.timedelta(hours=24):
+            warnings.append('Less than 24 hours after upgrade: performance comparisons may be unreliable; rerun when enough normal-load data exists.')
+        if not any(m['samples'] for m in metrics):
+            warnings.append('No CloudWatch points returned in this phase window')
+        rec={'hostname':host,'instance_id':info['instance_id'],
+             'instance_type':info['instance_type'],'availability_zone':info['availability_zone'],
+             'server_type':types[host],'phase':phase,'critical_services':checked_services[host],
+             'volumes':vols,'upgrade_completed_at_utc':iso_time(start_raw) if phase>1 else None,
+             'window':{'start':iso_time(start),'end':iso_time(end),
+                       'hours':max(0,int((end-start).total_seconds()/PERIOD))},
+             'ssm_status':ss['status'],'ssm_error':ss.get('error'),
+             'agent_metric_count':discovered,
+             'snapshot':ss.get('snapshot'),'metrics':metrics,'warnings':warnings}
+        baseline=state1['hosts'][host] if state1 is not None else None
+        rec['checks']=validate_host(host,rec,before.get(host),baseline)
+        if phase>1:
+            rec['prior_comparison']=calculate_prior_changes(rec,before.get(host))
+            regressions=[x for x in rec['prior_comparison'] if x['status']=='WARN']
+            for item in regressions:
+                rec['checks'].append(check('WARN','Regression vs previous phase: '+item['metric'],
+                    'Hourly mean %+.1f%% from previous stage; check workload comparability'%item['change_pct'],
+                    'Performance'))
+        else:rec['prior_comparison']=[]
+        state['hosts'][host]=rec
+    # Persist report first; data-state is not a user-facing report.
+    report_key=key_for(prefix,batch,'phase-%d.html'%phase)
+    write(s3,bucket,report_key,phase_html(state),'text/html; charset=utf-8')
+    data_key=key_for(prefix,batch,'.state/phase-%d.json'%phase)
+    write(s3,bucket,data_key,json.dumps(state,ensure_ascii=False,separators=(',',':')),'application/json')
+    status_key=key_for(prefix,batch,'phase-%d-status.json'%phase)
+    result={'batch_id':batch,'phase':phase,'account_id':account,'region':region,'script_version':VERSION,
+            'report':'s3://%s/%s'%(bucket,report_key),
+            'status_json':'s3://%s/%s'%(bucket,status_key),
+            'host_statuses':{
+                 host:status_of(rec['checks']) for host,rec in state['hosts'].items()}}
+    if phase==3:
+        phase2=read_state(s3,bucket,prefix,batch,2)
+        summary_key=key_for(prefix,batch,'final-summary.html')
+        write(s3,bucket,summary_key,final_html([state1,phase2,state]),'text/html; charset=utf-8')
+        result['final_summary']='s3://%s/%s'%(bucket,summary_key)
+    diagnostic=phase_diagnostic(state,report_key,data_key)
+    diagnostic['final_summary_s3_key']=summary_key if phase==3 else None
+    write(s3,bucket,status_key,json.dumps(diagnostic,ensure_ascii=False,indent=2),'application/json')
+    result['execution_status']=diagnostic['execution_status']
+    return result
+
+
+def datetime_from_state(value):
+    return parse_time(value) if value else None
+
+
+def lambda_handler(event, context):
+    try:
+        return _run_phase(event, context)
+    except Exception as error:
+        LOG.exception('RHEL OS report invocation failed')
+        try:
+            if isinstance(event,dict):
+                phase=int(event.get('phase',0))
+                batch=clean_batch(event.get('batch_id'))
+                if phase in (1,2,3):
+                    bucket=setting('REPORT_BUCKET',True)
+                    prefix=setting('REPORT_PREFIX',default='rhel-upgrade-reports').strip('/')
+                    key=key_for(prefix,batch,'phase-%d-execution-error-%s.json'%(phase,now_utc().strftime('%Y%m%dT%H%M%S%fZ')))
+                    body={'tool_version':VERSION,'batch_id':batch,'phase':phase,
+                          'generated_at_utc':iso_time(now_utc()),'execution_status':'ERROR',
+                          'exception_type':type(error).__name__,
+                          'error':str(error)[:1500],
+                          'note':'Lambda failed before a successful phase report. See CloudWatch Lambda logs. Existing success state has not been deleted.'}
+                    client=boto3.client('s3')
+                    write(client,bucket,key,json.dumps(body,indent=2),'application/json')
+                    html_key=key[:-5]+'.html'
+                    error_body='<section class="card"><h2>Phase execution failed</h2><p>This is an execution diagnostic, not a successful phase report. No upgrade action was performed.</p><p><strong>Exception:</strong> '+esc(type(error).__name__)+'</p><pre>'+esc(str(error)[:1500])+'</pre><p>Correct the issue, then invoke the phase again. If an earlier successful phase already exists, do not overwrite it unless explicitly intended.</p></section>'
+                    write(client,bucket,html_key,
+                          html_layout('RHEL OS report — Phase %d execution error'%phase,
+                                      'Batch %s | %s'%(batch,VERSION),error_body,{}),
+                          'text/html; charset=utf-8')
+        except Exception:
+            LOG.warning('Unable to write the best-effort phase execution error JSON',exc_info=True)
+        raise
