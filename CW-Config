@@ -1,0 +1,231 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+  },
+
+  "metrics": {
+    "namespace": "CWAgent",
+
+    "append_dimensions": {
+      "ImageId": "${aws:ImageId}",
+      "InstanceId": "${aws:InstanceId}",
+      "InstanceType": "${aws:InstanceType}"
+    },
+
+    "aggregation_dimensions": [
+      ["InstanceId"],
+      ["ImageId", "InstanceType"]
+    ],
+
+    "metrics_collected": {
+      "cpu": {
+        "resources": ["*"],
+        "measurement": [
+          { "name": "usage_user",   "rename": "CpuUserPercent",   "unit": "Percent" },
+          { "name": "usage_system", "rename": "CpuSystemPercent", "unit": "Percent" },
+          { "name": "usage_iowait", "rename": "CpuIOWaitPercent", "unit": "Percent" },
+          { "name": "usage_idle",   "rename": "CpuIdlePercent",   "unit": "Percent" }
+        ],
+        "totalcpu": true,
+        "metrics_collection_interval": 60
+      },
+
+      "mem": {
+        "measurement": [
+          { "name": "mem_used_percent",      "rename": "MemUsedPercent",      "unit": "Percent" },
+          { "name": "available",             "rename": "MemAvailableBytes",   "unit": "Bytes" },
+          { "name": "available_percent",     "rename": "MemAvailablePercent", "unit": "Percent" }
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "disk": {
+        "resources": ["*"],
+        "measurement": [
+          { "name": "used_percent", "rename": "DiskUsedPercent", "unit": "Percent" },
+          { "name": "total",        "rename": "DiskTotalBytes",  "unit": "Bytes" },
+          { "name": "used",         "rename": "DiskUsedBytes",   "unit": "Bytes" },
+          { "name": "free",         "rename": "DiskFreeBytes",   "unit": "Bytes" }
+
+        ],
+        "ignore_file_system_types": ["sysfs", "devtmpfs", "proc", "devpts", "tmpfs", "overlay"],
+        "metrics_collection_interval": 120
+      },
+
+      "diskio": {
+        "resources": ["*"],
+        "measurement": ["reads","writes","read_time","write_time","io_time"],
+        "metrics_collection_interval": 120
+      },
+
+      "swap": {
+        "measurement": [
+          { "name": "swap_used",         "rename": "SwapUsedBytes",   "unit": "Bytes" },
+          { "name": "swap_free",         "rename": "SwapFreeBytes",   "unit": "Bytes" },
+          { "name": "swap_used_percent", "rename": "SwapUsedPercent", "unit": "Percent" }
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "net": {
+        "resources": ["eth0", "*"],
+        "measurement": [
+          { "name": "bytes_sent", "rename": "NetBytesOut", "unit": "Bytes" },
+          { "name": "bytes_recv", "rename": "NetBytesIn",  "unit": "Bytes" },
+          "drop_in",
+          "drop_out"
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "netstat": {
+        "measurement": [
+          "tcp_established",
+          "tcp_syn_sent",
+          "tcp_close",
+          "tcp_time_wait",
+          "tcp_close_wait"
+        ],
+        "metrics_collection_interval": 120
+      }
+    }
+  },
+
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+            "log_group_name": "/prod/linux/cw-agent",
+            "log_stream_name": "agent/{instance_id}",
+            "timezone": "UTC",
+            "retention_in_days": 30
+          },
+          {
+            "file_path": "/var/log/messages",
+            "log_group_name": "equip-cw-ec2-system-messages-logs",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC",
+            "retention_in_days": 90
+          },
+          {
+            "file_path": "/var/log/secure*",
+            "log_group_name": "equip-cw-ec2-system-secure-logs",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC",
+            "retention_in_days": 90
+          }
+        ]
+      }
+    }
+  }
+}
+
+
+
+
+Widnows:
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "logfile": "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\Logs\\amazon-cloudwatch-agent.log"
+  },
+
+  "metrics": {
+    "namespace": "Windows System",
+
+    "append_dimensions": {
+      "ImageId": "${aws:ImageId}",
+      "InstanceId": "${aws:InstanceId}",
+      "InstanceType": "${aws:InstanceType}"
+    },
+
+    "aggregation_dimensions": [
+      ["InstanceId"],
+      ["ImageId", "InstanceType"]
+    ],
+
+    "metrics_collected": {
+      "Processor": {
+        "resources": ["_Total"],
+        "measurement": [
+          { "name": "% Processor Time", "rename": "CpuUtilizationPercent", "unit": "Percent" },
+          { "name": "% User Time",      "rename": "CpuUserPercent",        "unit": "Percent" }
+        ],
+        "metrics_collection_interval": 60
+      },
+
+      "Memory": {
+        "measurement": [
+          { "name": "Available MBytes",            "rename": "MemoryAvailableMB", "unit": "Megabytes" },
+          { "name": "% Committed Bytes In Use",    "rename": "MemoryUsedPercent", "unit": "Percent" }
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "LogicalDisk": {
+        "resources": ["C:", "D:", "*"],
+        "measurement": [
+          { "name": "% Free Space",   "rename": "DiskFreePercent", "unit": "Percent" },
+          { "name": "Free Megabytes", "rename": "DiskFreeMB",      "unit": "Megabytes" }
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "Network Interface": {
+        "resources": ["*"],
+        "measurement": [
+          { "name": "Bytes Received/sec", "rename": "NetBytesInPerSec" },
+          { "name": "Bytes Sent/sec",     "rename": "NetBytesOutPerSec" }
+        ],
+        "metrics_collection_interval": 120
+      },
+
+      "System": {
+        "measurement": [
+          { "name": "System Up Time", "rename": "SystemUptime" }
+        ],
+        "metrics_collection_interval": 300
+      }
+    }
+  },
+
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\Logs\\amazon-cloudwatch-agent.log",
+            "log_group_name": "/prod/windows/cw-agent",
+            "log_stream_name": "agent/{instance_id}",
+            "timezone": "Local",
+            "retention_in_days": 30
+          }
+        ]
+      }
+    }
+  },
+
+  "windows_events": {
+    "collect_list": [
+      {
+        "event_name": "System",
+        "event_levels": ["WARNING", "ERROR"],
+        "event_format": "xml",
+        "log_group_name": "equip-cw-ec2-system-messages-logs",
+        "log_stream_name": "win_system/{instance_id}",
+        "retention_in_days": 90
+      },
+      {
+        "event_name": "Security",
+        "event_levels": ["ERROR", "CRITICAL"],
+        "event_format": "xml",
+        "log_group_name": "equip-cw-ec2-system-secure-logs",
+        "log_stream_name": "win_security/{instance_id}",
+        "retention_in_days": 90
+      }
+    ]
+  }
+}
