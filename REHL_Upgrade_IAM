@@ -1,0 +1,371 @@
+RHEL OS UPGRADE PERFORMANCE REPORTING — v2.0
+Standalone same-account Python Lambda | 3 invocations -> 4 standard HTML reports
+Last reviewed: 2026-11-17
+
+WHAT CHANGED IN V2
+==================
+- Works with the CloudWatch Agent configuration you supplied, including the
+  renamed metric names: CpuUserPercent, CpuSystemPercent, CpuIOWaitPercent,
+  CpuIdlePercent, MemUsedPercent, MemAvailableBytes, MemAvailablePercent,
+  DiskUsedPercent, DiskTotalBytes, DiskUsedBytes, DiskFreeBytes,
+  SwapUsedBytes, SwapFreeBytes, SwapUsedPercent, NetBytesIn, NetBytesOut.
+- Also reads the configured unrenamed metrics: diskio_reads/writes,
+  diskio_read_time/write_time/io_time, net_drop_in/out, and netstat_*.
+- Selects per-device/per-filesystem/per-interface metrics where appropriate.
+- Phase N generates phase-N.html AND phase-N-status.json under one S3 batch path.
+- Phase 3 ALSO generates the final-summary.html (four standard HTML reports).
+- The phase-N-status.json provides software version, OS version, SSM status,
+  metrics available, expected hours, WARN/FAIL findings, and comparisons.
+- FATAL phase invocation problems generate best-effort timestamped error .html
+  and .json diagnostics without replacing earlier successful phase HTML.
+- No OS changes; SSM executes a read-only inspection script.
+
+REPLACE THESE PLACEHOLDERS
+==========================
+ACCOUNT_ID      = 12-digit AWS account ID
+REGION          = same AWS region as the EC2 instances (e.g. ap-southeast-2)
+BUCKET_NAME     = existing S3 report bucket
+EXISTING_PREFIX = chosen existing bucket prefix without leading/trailing slash
+KMS_KEY_ARN     = ARN of customer-managed key protecting the S3 objects
+ROLE_NAME       = RhelOsUpgradeReportLambdaRole
+
+1. LAMBDA EXECUTION ROLE — IAM
+==============================
+AWS Console -> IAM -> Roles -> Create role -> AWS service -> Lambda.
+
+Trust policy:
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "lambda.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}
+
+Attach AWS-managed: AWSLambdaBasicExecutionRole
+
+Add this INLINE policy, replacing every placeholder:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadEC2InstancesAndEBSVolumes",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeVolumes"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadEC2AndCWAgentMetrics",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:ListMetrics", "cloudwatch:GetMetricData"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ExecuteReadOnlyShellAuditWithSSM",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:REGION::document/AWS-RunShellScript",
+        "arn:aws:ec2:REGION:ACCOUNT_ID:instance/*"
+      ]
+    },
+    {
+      "Sid": "GetSSMAuditResults",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadWriteEncryptedReportsUnderExistingPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::BUCKET_NAME/EXISTING_PREFIX/*"
+    },
+    {
+      "Sid": "ListExistingReportBatchState",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET_NAME",
+      "Condition": {"StringLike": {"s3:prefix": [
+        "EXISTING_PREFIX", "EXISTING_PREFIX/*"
+      ]}}
+    },
+    {
+      "Sid": "UseExistingCustomerManagedKmsKeyViaS3",
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": "KMS_KEY_ARN",
+      "Condition": {"StringEquals": {
+        "kms:ViaService": "s3.REGION.amazonaws.com"
+      }}
+    }
+  ]
+}
+
+IAM SECURITY NOTE
+-----------------
+ssm:SendCommand with AWS-RunShellScript is a powerful permission even when this
+Lambda only sends a read-only command. Scope the EC2 instance resource to a
+well-defined inventory/tag or use a dedicated SSM document for tighter control.
+The function does not require CloudWatch Logs read permissions; it only queries
+CloudWatch METRICS and takes a limited current-boot journal snapshot via SSM.
+AWSLambdaBasicExecutionRole writes *Lambda function* execution logs.
+
+2. EXISTING S3 CUSTOMER-MANAGED KMS KEY POLICY
+===============================================
+The Lambda role must be able to write and read S3 objects encrypted with this
+key. If the key policy does not delegate access to IAM for this account,
+request the KMS key owner to ADD the following statement to the EXISTING key
+policy (never replace the existing key admin/recovery statements):
+{
+  "Sid": "AllowRhelOsUpgradeReportingLambdaViaS3",
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME"
+  },
+  "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+  "Resource": "*",
+  "Condition": {"StringEquals": {
+    "kms:ViaService": "s3.REGION.amazonaws.com"
+  }}
+}
+
+If the S3 bucket policy has an explicit Deny or restricts encryption-key ARNs
+or encryption contexts, update/check it separately with your security team.
+Use the same-region KMS key required by your bucket policy.
+Your own IAM principal also needs s3:GetObject and kms:Decrypt to download the
+reports. A role with access only to the bucket will NOT automatically be able
+to decrypt SSE-KMS objects.
+
+3. EC2 SIDE PREREQUISITES
+========================
+- Instances running, Name tag unique and matching event JSON exactly.
+- SSM managed node Online; EC2 instance profile with AmazonSSMManagedInstanceCore.
+- CloudWatch Agent installed, working, publishing in namespace CWAgent.
+- Existing CloudWatch Agent config supplied by you has:
+     append_dimensions: InstanceId, ImageId, InstanceType
+     aggregation_dimensions: [InstanceId], [ImageId,InstanceType]
+- Agent metrics are case-sensitive. V2 looks for renamed metrics as supplied.
+- No changes to the existing CWAgent configuration are required for the metrics
+  listed above. HOWEVER, unconfigured guest metrics (e.g. diskio_read_bytes,
+  diskio_write_bytes, net_err_in/out, disk_inodes_free) cannot be reconstructed
+  historically. Inodes are checked from live SSM snapshots, and EBS throughput
+  is read from AWS/EBS metrics if published.
+- Your CloudWatch log groups are already receiving logs (as configured):
+     /prod/linux/cw-agent
+     equip-cw-ec2-system-messages-logs
+     equip-cw-ec2-system-secure-logs
+  This version deliberately DOES NOT scan those log groups. It collects a
+  limited current-boot journal/kernel error excerpt from SSM at each phase.
+- To check actual published metrics manually: CloudWatch -> Metrics ->
+  All metrics -> CWAgent -> InstanceId -> choose an instance's renamed metric.
+
+4. DEPLOY AND CONFIGURE LAMBDA
+==============================
+1. Open AWS account and REGION containing the target EC2 instances.
+2. Lambda -> Create function -> Author from scratch.
+   Name: RhelOsUpgradePerformanceReport
+   Runtime: Python 3.12
+   Execution role: the role created above
+   Timeout: 15 min. Memory: initially 1024 MB.
+3. Upload the ZIP containing ONLY rhel_os_upgrade_report_lambda.py at ZIP root,
+   or paste that file's contents into the Lambda editor and click Deploy.
+   Handler must be:
+      rhel_os_upgrade_report_lambda.lambda_handler
+4. Lambda -> Configuration -> Environment variables:
+      REPORT_BUCKET=BUCKET_NAME
+      REPORT_PREFIX=EXISTING_PREFIX
+      KMS_KEY_ARN=KMS_KEY_ARN
+      CW_AGENT_NAMESPACE=CWAgent       [optional; default CWAgent]
+      BASELINE_DAYS=15                [optional]
+      SSM_WAIT_SECONDS=100           [optional]
+      MAX_HOSTS=20                   [optional]
+5. Lambda -> Test -> Create test event -> paste the JSON below.
+6. Verify in the Lambda RETURN JSON:
+      script_version: "2026-11-17-v2.0"
+      report: "s3://.../phase-1.html"
+      status_json: "s3://.../phase-1-status.json"
+      execution_status: COMPLETED_PASS | COMPLETED_WITH_WARNINGS |
+                        COMPLETED_WITH_FAILURES
+   A returned COMPLETED_WITH_FAILURES means Lambda finished writing the HTML,
+   but one or more server checks FAILED. It is not a Lambda execution crash.
+   Check CloudWatch -> Lambda -> Monitor -> View CloudWatch Logs for crashes.
+7. For S3 HTML, select the .html object in S3 -> Download -> open the local
+   .html file in a browser. The CSV buttons work offline. S3 Console Open may
+   download an HTML object rather than render it; that is normal.
+
+If the Lambda is attached to a VPC it needs NAT or suitable endpoints for the
+AWS services it calls (EC2, CloudWatch Monitoring, SSM, S3, STS as relevant).
+For normal operation, the Lambda does NOT need to be attached to the EC2 VPC.
+
+5. HOW TO INVOKE ALL THREE PHASES
+=================================
+Run 1 BEFORE first upgrade (Name-tag values are supplied HERE):
+{
+  "phase": 1,
+  "batch_id": "nov26-wave01",
+  "hostnames": ["APP-SERVER-01", "DB-SERVER-01"],
+  "server_types": {"APP-SERVER-01": "app", "DB-SERVER-01": "db"},
+  "critical_services_by_host": {
+    "APP-SERVER-01": ["sshd", "chronyd"],
+    "DB-SERVER-01": ["sshd", "chronyd"]
+  },
+  "baseline_days": 15
+}
+
+Run 2 AFTER the first upgrade (ONE UTC completion timestamp PER hostname):
+{
+  "phase": 2,
+  "batch_id": "nov26-wave01",
+  "upgrade_completed_at_utc": {
+    "APP-SERVER-01": "2026-11-20T03:30:00Z",
+    "DB-SERVER-01": "2026-11-21T05:15:00Z"
+  }
+}
+
+Run 3 AFTER final upgrade (again give completion time for EACH server):
+{
+  "phase": 3,
+  "batch_id": "nov26-wave01",
+  "upgrade_completed_at_utc": {
+    "APP-SERVER-01": "2026-12-02T04:15:00Z",
+    "DB-SERVER-01": "2026-12-03T02:45:00Z"
+  }
+}
+
+The events for runs 2 and 3 DO NOT need to repeat hostnames. Each run looks
+up Phase 1 state by matching batch_id, and checks that the InstanceId still
+matches the Name tag in the account. Expected OS releases:
+  APP: 8.8 -> 9.2 -> 9.6
+  DB : 8.8 -> 8.10 -> 9.6
+Verify your actual Red Hat vendor-supported upgrade sequence separately.
+Lambda only REPORTS status; it NEVER upgrades or reboots the EC2 instances.
+
+IMPORTANT TIMING: Lambda cannot reliably infer when an in-place OS upgrade
+finished just from the last reboot or EC2 launch time. Specify the actual UTC
+completion time from your change record. Each post-upgrade metric window starts
+at the FIRST COMPLETE HOUR after that timestamp and ends at the last full
+hour before the Lambda invocation. If you run immediately after an upgrade,
+the HTML still generates, but the report flags missing/insufficient data.
+Recommend at least 24 hours, ideally 5-7 days of typical workload, before
+accepting performance comparisons.
+
+6. EXACT S3 OUTPUT TREE
+=======================
+s3://BUCKET_NAME/EXISTING_PREFIX/nov26-wave01/
+    phase-1.html              [HTML baseline validation; 15 days metrics]
+    phase-1-status.json       [quick phase 1 run/health diagnostic]
+    phase-2.html              [HTML Phase 2; delta vs Phase 1; OS checks]
+    phase-2-status.json       [quick phase 2 run/health diagnostic]
+    phase-3.html              [HTML Phase 3; delta vs Phase 2; OS checks]
+    phase-3-status.json       [quick phase 3 run/health diagnostic]
+    final-summary.html        [full three-phase comparison, generated Run 3]
+    .state/phase-1.json       [INTERNAL complete metric data, NOT a report]
+    .state/phase-2.json
+    .state/phase-3.json
+
+This is FOUR STANDARD HTML REPORTS, plus diagnostic JSON and internal state.
+All S3 objects are uploaded with aws:kms + the configured KMS_KEY_ARN.
+If a Lambda call fails before a normal report, a best-effort diagnostic pair
+named phase-N-execution-error-YYYYMMDDTHHMMSS*.json/.html will be written.
+It may not be written if the S3 bucket/KMS/IAM permission itself is the reason
+for failure. In that case, use the Lambda CloudWatch execution logs.
+
+7. WHAT IS INSIDE EACH HTML REPORT?
+===================================
+Each individual phase HTML has:
+- Batch/account/region/script_version, per-host OS version, instance ID/type.
+- Start/end of metric window (UTC); number of complete hourly bins.
+- Top-level PASS/WARN/FAIL summary and prioritized ACTION REQUIRED table.
+- For Phase 2 / 3: before vs after metric table with relative percentage delta,
+  plus PASS/WARN flags for unfavorable CPU/memory/disk/network deviations.
+- Guest CPU user/system/idle/iowait, memory, swap, filesystems, disk reads,
+  writes, read/write guest latencies, network bytes, drops, TCP states where
+  data is available; AWS/EC2 CPU/status/network and AWS/EBS disk performance.
+- All service, fstab, file mount, inode, SELinux, DNS, NTP, journal and kernel
+  checks available from an SSM snapshot during each phase.
+- All metric rows show hourly MEAN, P95 of hourly values, min, max, samples,
+  coverage and a trend sparkline. Missing series are NOT treated as zero.
+- CSV export buttons for summary metrics, hourly metrics, validations.
+
+Phase 3 also builds final-summary.html, covering:
+- Every instance's three OS versions, final PASS/WARN/FAIL, exceptions.
+- Every supported metric's hourly average at each stage and % changes:
+  Phase 1 -> Phase 2, Phase 2 -> Phase 3, Phase 1 -> Phase 3.
+- OS configuration and service comparison across all three phases.
+- Full individual OS validation evidence for each phase; CSV export for
+  all comparisons, validations, and metrics.
+
+Phase-N-status.json provides short machine-readable diagnostics:
+  script_version, execution_status, phase, date, html_s3_key, host_statuses,
+  detected/expected RHEL version, SSM status, metric collection window, count
+  of discovered agent metrics, metrics actually containing points, all WARN/
+  FAIL findings and flagged deviations since the previous upgrade phase.
+This file is not a substitute for the detailed HTML report.
+
+8. METRIC COVERAGE AND IMPORTANT LIMITATIONS
+============================================
+- CloudWatch metric namespace and names are case-sensitive. The supplied
+  configuration uses CWAgent and the renamed values above.
+- Historical performance cannot be reconstructed for measurements that were
+  never published. The Lambda does not modify agent configuration.
+- diskio read_bytes/write_bytes, net_err_in/out and historical inode usage
+  are not in the supplied agent config. EBS byte throughput is reported from
+  AWS/EBS when available; live inode usage is captured by SSM.
+- The agent logs /prod/linux/cw-agent, /var/log/messages and /var/log/secure*
+  are not queried. Limited recent log evidence comes from current-boot SSM.
+- Status-check failures and high disk usage are FAIL/WARN; snapshot or
+  necessary service failures are FAIL; missing configured metrics are WARN.
+- Example performance regression WARN thresholds: CPU +15%, memory +10%,
+  other unfavorable directional metrics +20% relative to comparison window.
+  This is screening evidence, not proof the OS caused the change. Compare
+  matching workload periods before formally accepting the upgrade.
+- Completed hourly CloudWatch metrics are retained up to 455 days by AWS;
+  the baseline window uses 15 days. Agent metrics from 60/120-second samples
+  are aggregated into hourly report bins.
+- CloudWatch ListMetrics does not return metrics inactive for the last ~2
+  weeks. If retired metrics do not appear, they will be reported as missing.
+- The original phase data is saved in S3 for later comparisons. NEVER delete
+  the .state folder before Phase 3.
+- Use a NEW batch_id for each upgrade wave. Runs must be sequential, not
+  overlapping. An existing completed phase will be blocked from overwrite by
+  default. To intentionally rerun Phase 2 before Phase 3 or Phase 3 itself,
+  set "replace_existing": true. After Phase 3, Phase 2 can no longer be
+  overwritten. Prefer fresh batch IDs for tests.
+
+9. TROUBLESHOOTING
+=================
+Only JSON, no phase HTML visible:
+  - Check the S3 path used by Lambda, including /<batch_id>/.
+  - .state/phase-N.json is INTERNAL and not the report.
+  - Check script_version in Lambda result or phase-N-status.json; it MUST be
+    2026-11-17-v2.0 if you deployed this updated file.
+  - Check Lambda handler points to rhel_os_upgrade_report_lambda.lambda_handler,
+    save code changes, click Deploy, and run with a NEW batch_id.
+  - Check Lambda execution logs for S3 PutObject error and KMS permission.
+
+No memory / disk / swap / guest network data:
+  - Check CWAgent metrics by InstanceId and exact renamed metric names.
+  - Check the metric has 1-hour points in the requested time range.
+  - Check CW_AGENT_NAMESPACE=CWAgent.
+  - Review phase-N-status.json's guest_metrics_with_data, and the HTML
+    ACTION REQUIRED section; look for 'Historical metric missing'.
+
+Phase 2 version mismatch (e.g. DB still 8.8):
+  - Lambda reports FAIL for expected RHEL release and highlights the current
+    OS version and required version in phase-2.html and phase-2-status.json.
+  - Fix upgrade issue with your OS team before proceeding; rerun Phase 2 with
+    replace_existing=true if it is safe and Phase 3 has not yet been run.
+  - If rebuilding/replacing EC2 instance changed InstanceId, use new batch.
+
+Phase 2 has no historical hourly points:
+  - You may have invoked too soon after upgrade. Wait until enough complete
+    hourly points are in CloudWatch and rerun Phase 2 deliberately.
+  - Confirm the supplied timestamp is accurate in UTC and follows the
+    preceding phase's report time.
+
+Fatal invocation error:
+  - Check Lambda Test result and CloudWatch Lambda logs.
+  - The function tries to write phase-N-execution-error-<timestamp>.html and
+    .json. This cannot work if its S3 permissions or KMS key are broken.
