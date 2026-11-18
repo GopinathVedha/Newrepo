@@ -13,14 +13,14 @@ Optional:
   SSM_WAIT_SECONDS=100
   BASELINE_DAYS=15
   MAX_HOSTS=20
+  MAX_DISCOVERED_SERVICES=80
 
 Run 1 Test event:
 {
  "phase": 1, "batch_id": "nov26-wave01",
  "hostnames": ["APP-SERVER-01", "DB-SERVER-01"],
  "server_types": {"APP-SERVER-01":"app", "DB-SERVER-01":"db"},
- "critical_services_by_host": {"APP-SERVER-01":["sshd","chronyd"],
-                               "DB-SERVER-01":["sshd","chronyd"]}
+ "service_exclusions_by_host": {"APP-SERVER-01": ["custom-one-off.service"]}
 }
 Run 2 / Run 3 Test event:
 {
@@ -32,11 +32,16 @@ Run 2 / Run 3 Test event:
 }
 For Run 3 change phase to 3, and supply the second upgrade completion times.
 No automatic upgrade-time guess: last reboot is not a reliable upgrade timestamp.
+Non-core systemd services (custom/vendor/monitoring/application service units)
+are auto-discovered in Phase 1 and compared after upgrades. Discovery filters
+common RHEL OS services by name; the classification is best-effort and can be
+refined with service_exclusions_by_host at Phase 1.
 
 Important: CWAgent must have collected historical memory/disk/swap metrics in advance.
 SSM OS snapshots capture the state AT EACH RUN, not a 15-day retrospective.
 """
 
+import base64
 import csv
 import datetime as dt
 import hashlib
@@ -49,12 +54,13 @@ import os
 import re
 import statistics
 import time
+import zlib
 from collections import defaultdict
 
 import boto3
 from botocore.exceptions import ClientError
 
-VERSION = "2026-11-17-v2.0"
+VERSION = "2026-11-18-v3.0"
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
 UTC = dt.timezone.utc
@@ -135,6 +141,99 @@ EBS_METRICS = [
 SSM_PY = r'''
 import datetime, json, os, subprocess
 SERVICES = __SERVICES__
+FORCE_INCLUDE = __INCLUDES__
+MANUAL_EXCLUDE = __EXCLUDES__
+TRACKED_SERVICES = __TRACKED__
+MAX_DISCOVERED = min(120,max(10,__MAX_DISCOVERED__))
+# Base RHEL services are separately covered by the OS health checks.
+# Keep this a conservative exact-name denylist: optional services like
+# httpd, nginx, postgresql, mysql, SAP, and security agents must remain.
+OS_BASE_UNITS = set('accounts-daemon acpid alsa-restore alsa-state atd auditd abrtd abrt-ccpp abrt-oops abrt-vmcore abrt-xorg avahi-daemon bolt chronyd colord crond cups dbus dbus-broker dnf-automatic dnf-makecache dnf-makecache-refresh dracut-shutdown ebtables emergency firewalld fstrim getty gssproxy grub-boot-indeterminate irqbalance kdump kmod-static-nodes ldconfig lm_sensors lvm2-lvmpolld lvm2-monitor mcelog microcode modprobe@ ModemManager multipathd NetworkManager NetworkManager-dispatcher NetworkManager-wait-online network nm-cloud-setup nm-cloud-setup-timer nscd nss-lookup.target nss-user-lookup.target packagekit polkit psacct rngd rpcbind rpc-gssd rpc-statd rpc-statd-notify rsyslog rtkit-daemon selinux-autorelabel-mark smartd sshd sssd sssd-autofs sssd-kcm sssd-nss sssd-pac sssd-pam sssd-ssh sssd-sudo systemd-fsck-root systemd-journal-flush systemd-journald systemd-logind systemd-machined systemd-modules-load systemd-networkd systemd-random-seed systemd-remount-fs systemd-resolved systemd-sysctl systemd-timedated systemd-timesyncd systemd-tmpfiles-clean systemd-tmpfiles-setup systemd-udevd systemd-update-utmp systemd-user-sessions tuned udisks2 upower user-runtime-dir user@ wpa_supplicant getty@ serial-getty@ rhsmcertd rhsm-facts rhel-autorelabel-mark initrd-cleanup initrd-switch-root initrd-udevadm-cleanup plymouth-start plymouth-read-write plymouth-quit plymouth-quit-wait man-db-cache-update systemd-ask-password-console systemd-ask-password-wall'.split())
+# Pattern rules apply only to recognized OS internals; avoid broad matches
+# such as mysql*, java*, or nginx*, which are workload services.
+OS_BASE_PREFIXES = ('systemd-', 'dracut-', 'lvm2-', 'dbus-', 'getty@',
+                    'serial-getty@', 'sssd-', 'rhel-', 'dnf-',
+                    'initrd-', 'plymouth-', 'selinux-', 'rhsm-')
+def norm_service(name):
+    return name if name.endswith('.service') else name+'.service'
+def is_os_service(unit):
+    n=unit[:-8] if unit.endswith('.service') else unit
+    return n in OS_BASE_UNITS or n.lower() in {x.lower() for x in OS_BASE_UNITS} or n.lower().startswith(tuple(x.lower() for x in OS_BASE_PREFIXES))
+def discover_services():
+    result={'services':[], 'info':{'method':'systemctl unit files + active units',
+       'matched_units':0,'filtered_core_os':0,'filtered_manual':0,
+       'max_services':MAX_DISCOVERED, 'truncated':False,'errors':[]}}
+    info=result['info']
+    files=cmd(['systemctl','list-unit-files','--type=service','--no-legend','--no-pager','--plain'],50000,12)
+    loaded=cmd(['systemctl','list-units','--type=service','--all','--no-legend','--no-pager','--plain'],50000,12)
+    if files['rc']!=0:info['errors'].append('list-unit-files: '+str(files['err'] or files['out'])[:150])
+    if loaded['rc']!=0:info['errors'].append('list-units: '+str(loaded['err'] or loaded['out'])[:150])
+    if files['rc']!=0 and loaded['rc']!=0:return result
+    unitfiles={}
+    states={}
+    for line in files['out'].splitlines():
+        cols=line.split()
+        if len(cols)>1 and cols[0].endswith('.service'):
+            unitfiles[cols[0]]=cols[1]
+    for line in loaded['out'].splitlines():
+        cols=line.lstrip('● ').split(None,4)
+        if len(cols)>=4 and cols[0].endswith('.service'):
+            states[cols[0]]={'active':cols[2], 'sub':cols[3]}
+    tracked={norm_service(x) for x in TRACKED_SERVICES}
+    forced={norm_service(x) for x in FORCE_INCLUDE}
+    excluded={norm_service(x) for x in MANUAL_EXCLUDE}
+    units=set()
+    for name in set(unitfiles)|set(states):
+        fs=unitfiles.get(name,'')
+        active=states.get(name,{}).get('active','')
+        if fs in ('enabled','enabled-runtime','linked','linked-runtime') or active in ('active','failed','activating','reloading'):
+            units.add(name)
+    units|=tracked|forced
+    info['matched_units']=len(units)
+    candidates=[]
+    for name in units:
+        if name in excluded:
+            info['filtered_manual']+=1
+        elif is_os_service(name) and name not in forced and name not in tracked:
+            info['filtered_core_os']+=1
+        elif name.endswith('@.service') and name not in forced and name not in tracked:
+            continue
+        else:candidates.append(name)
+    # Prefer previously running services, preserve the baseline even if missing.
+    candidates.sort(key=lambda n:(0 if n in tracked else 1 if n in forced else
+                                    2 if states.get(n,{}).get('active')=='active' else 3, n))
+    if len(candidates)>MAX_DISCOVERED:
+        info['truncated']=True
+        info['errors'].append('Non-OS inventory capped at %s of %s entries' % (MAX_DISCOVERED,len(candidates)))
+    chosen=candidates[:MAX_DISCOVERED]
+    if not chosen:return result
+    props='Id,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,Type'
+    # Batch querying prevents many sequential systemctl calls.
+    details=cmd(['systemctl','show','--no-pager','--property='+props,'--']+chosen,65000,17)
+    byname={}
+    for block in details['out'].split('\n\n'):
+        vals={}
+        for line in block.splitlines():
+            if '=' in line:
+                k,v=line.split('=',1);vals[k]=v
+        if vals.get('Id'):byname[vals['Id']]=vals
+    if details['rc']!=0:info['errors'].append('systemctl show: '+str(details['err'])[:150])
+    for name in chosen:
+        x=byname.get(name,{})
+        path=x.get('FragmentPath','')
+        package=''
+        if path and os.path.exists(path):
+            own=cmd(['rpm','-qf','--qf','%{NAME}',path],100,3)
+            package=own['out'] if own['rc']==0 else 'unowned'
+        origin='custom-local' if path.startswith('/etc/systemd/system/') else 'package' if package not in ('','unowned') else 'unknown'
+        result['services'].append({'name':name,'active_state':x.get('ActiveState',states.get(name,{}).get('active','unknown')),
+            'sub_state':x.get('SubState',states.get(name,{}).get('sub','')),
+            'enablement':x.get('UnitFileState',unitfiles.get(name,'unknown')),
+            'load_state':x.get('LoadState','unknown'),
+            'unit_type':x.get('Type',''), 'unit_path':path[:180],
+            'rpm_package':package[:100], 'origin':origin,
+            'classification':'baseline-tracked' if name in tracked else 'manual-include' if name in forced else 'auto-discovered'})
+    return result
 def cmd(argv, limit=700, timeout=8):
     try:
         x = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -198,6 +297,7 @@ def netdev():
     except Exception: pass
     return result[:15]
 services={s:cmd(['systemctl','is-active',s],80)['out'] or 'unknown' for s in SERVICES}
+non_os=discover_services()
 failed=cmd(['systemctl','--failed','--no-legend','--plain','--no-pager'],4200)['out']
 fstab=cmd(['findmnt','--verify','--tab-file','/etc/fstab'],600)
 clock=cmd(['timedatectl','show','-p','NTPSynchronized','--value'],50)
@@ -210,6 +310,7 @@ snap={'captured_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()
       'kernel':os.uname().release, 'uptime_seconds':uptime,
       'cpu_count':os.cpu_count(), 'load_1_5_15':loads,
       'memory':meminfo(), 'mounts':mounts(), 'inodes':inodes(), 'services':services,
+      'non_os_services':non_os['services'], 'service_discovery':non_os['info'],
       'failed_units':failed.splitlines()[:25],
       'fstab_verification':fstab, 'ntp_synchronized':clock['out'],
       'selinux':cmd(['getenforce'],60)['out'],
@@ -226,7 +327,8 @@ snap={'captured_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()
       'kernel_error_examples':cmd(['journalctl','-k','-b','-p','err','-n','8','--no-pager','-q'],1200)['out'],
       'packages':cmd(['rpm','-q','kernel-core','leapp','amazon-ssm-agent','amazon-cloudwatch-agent'],600)['out'],
       'block_devices':cmd(['lsblk','-o','NAME,SIZE,FSTYPE,MOUNTPOINT','-n'],1000)['out']}
-print('RHEL_OS_REPORT_JSON='+json.dumps(snap, separators=(',',':')))
+import base64, zlib
+print('RHEL_OS_REPORT_ZLIB='+base64.b64encode(zlib.compress(json.dumps(snap,separators=(',',':')).encode('utf-8'),9)).decode('ascii'))
 '''
 
 
@@ -363,12 +465,19 @@ def volume_map(ec2, instance_id):
     return sorted(volumes, key=lambda v:v['volume_id'])
 
 
-def query_os_snapshots(ssm, host_data, services_by_host):
+def query_os_snapshots(ssm, host_data, services_by_host, includes_by_host=None, excludes_by_host=None, tracked_by_host=None):
+    includes_by_host=includes_by_host or {}
+    excludes_by_host=excludes_by_host or {}
+    tracked_by_host=tracked_by_host or {}
     commands={}
     outputs={}
     for host, info in host_data.items():
         svcs = list(dict.fromkeys(DEFAULT_SERVICES + services_by_host.get(host, [])))
-        py=SSM_PY.replace('__SERVICES__', repr(svcs))
+        py=(SSM_PY.replace('__SERVICES__', repr(svcs))
+                .replace('__INCLUDES__',repr(includes_by_host.get(host,[])))
+                .replace('__EXCLUDES__',repr(excludes_by_host.get(host,[])))
+                .replace('__TRACKED__',repr(tracked_by_host.get(host,[])))
+                .replace('__MAX_DISCOVERED__',str(int(setting('MAX_DISCOVERED_SERVICES',default='80')))))
         shell = ("PYBIN=$(command -v python3 || true)\n"
                  "if [ -z \"$PYBIN\" ] && [ -x /usr/libexec/platform-python ]; then PYBIN=/usr/libexec/platform-python; fi\n"
                  "if [ -z \"$PYBIN\" ]; then echo 'Python interpreter missing' >&2; exit 3; fi\n"
@@ -400,17 +509,21 @@ def query_os_snapshots(ssm, host_data, services_by_host):
                 continue
             pending.remove(host)
             raw=res.get('StandardOutputContent','')
-            marker='RHEL_OS_REPORT_JSON='
+            marker='RHEL_OS_REPORT_ZLIB='
             pos=raw.find(marker)
             if st=='Success' and pos>=0:
                 try:
-                    outputs[host]={'status':'Success',
-                                   'snapshot':json.loads(raw[pos+len(marker):].splitlines()[0])}
+                    packed=base64.b64decode(raw[pos+len(marker):].splitlines()[0],validate=True)
+                    inflater=zlib.decompressobj()
+                    decoded=inflater.decompress(packed,400000)
+                    if not inflater.eof or len(decoded)>390000:
+                        raise ValueError('Compressed inventory exceeds safe limits or is incomplete')
+                    outputs[host]={'status':'Success','snapshot':json.loads(decoded)}
                     continue
-                except (ValueError,IndexError) as e:
-                    err='Invalid/truncated SSM JSON: '+str(e)
+                except (ValueError,IndexError,zlib.error) as e:
+                    err='Invalid/truncated compressed SSM snapshot: '+str(e)
             else:
-                err=(res.get('StandardErrorContent') or 'No audit JSON returned')[:450]
+                err=(res.get('StandardErrorContent') or 'No audit ZLIB JSON returned')[:450]
             outputs[host]={'status':st,'error':err,'snapshot':None}
         if pending: time.sleep(3)
     for host in pending:
@@ -659,6 +772,70 @@ def expected_version(phase,server_type):
     return {1:'8.8', 2:'9.2' if server_type=='app' else '8.10', 3:'9.6'}[phase]
 
 
+def non_os_byname(snap):
+    return {x.get('name'):x for x in (snap or {}).get('non_os_services',[])
+            if isinstance(x,dict) and x.get('name')}
+
+
+def validate_non_os_services(snap, previous, baseline, phase):
+    """Read-only status checks; a Phase-1 active service becomes a required baseline."""
+    checks=[]
+    inventory=(snap or {}).get('service_discovery',{})
+    if not inventory:
+        return [check('WARN','Non-default service discovery','Inventory unavailable','Non-OS Services')]
+    errors=inventory.get('errors') or []
+    if errors or inventory.get('truncated'):
+        checks.append(check('WARN','Service inventory completeness',
+            '; '.join(errors) or 'Discovery inventory was truncated','Non-OS Services'))
+    else:
+        checks.append(check('PASS','Automatic non-OS service discovery',
+            '%d non-core services found; %d common RHEL services filtered out'%(
+            len((snap or {}).get('non_os_services',[])),inventory.get('filtered_core_os',0)),
+            'Non-OS Services'))
+    current=non_os_byname(snap)
+    if not current and not errors:
+        checks.append(check('WARN','Non-OS service inventory empty',
+           'No non-core running or enabled units found; verify service discovery is expected','Non-OS Services'))
+    for name,svc in current.items():
+        st=svc.get('active_state','unknown')
+        if st=='failed':
+            checks.append(check('FAIL','Non-OS service failed: '+name,
+                    'systemd state=failed; unit package='+str(svc.get('rpm_package','')), 'Non-OS Services'))
+        elif phase==1 and st!='active' and svc.get('enablement','').startswith('enabled') and svc.get('unit_type')!='oneshot':
+            checks.append(check('WARN','Enabled non-OS service not running: '+name,
+                    'systemd state='+st+'; confirm it is expected to run continuously','Non-OS Services'))
+    if phase>1:
+        base=non_os_byname(baseline)
+        prior=non_os_byname(previous)
+        for name,svc in sorted(base.items()):
+            if svc.get('active_state')!='active' or svc.get('unit_type')=='oneshot':continue
+            newest=current.get(name)
+            status=newest.get('active_state','missing') if newest else 'missing'
+            if status!='active':
+                checks.append(check('FAIL','Baseline non-OS service stopped/missing: '+name,
+                    'Phase 1=active; current='+status+'; verify before approving upgrade','Non-OS Services'))
+            else:
+                checks.append(check('PASS','Baseline non-OS service running: '+name,
+                    'Active in Phase 1 and Phase '+str(phase),'Non-OS Services'))
+            if newest and svc.get('enablement','').startswith('enabled') and not newest.get('enablement','').startswith('enabled'):
+                checks.append(check('WARN','Non-OS service startup state changed: '+name,
+                    'Phase 1='+svc.get('enablement','')+'; current='+newest.get('enablement',''), 'Non-OS Services'))
+        if phase==3:
+            for name,svc in sorted(prior.items()):
+                if name in base or svc.get('active_state')!='active' or svc.get('unit_type')=='oneshot':continue
+                newest=current.get(name)
+                status=newest.get('active_state','missing') if newest else 'missing'
+                if status!='active':
+                    checks.append(check('WARN','Phase 2 service no longer active: '+name,
+                        'Phase 2=active; Phase 3='+status,'Non-OS Services'))
+        # Newly appearing packages can be legitimate, but warrant review.
+        added=sorted(set(current)-set(base))
+        if added:
+            checks.append(check('WARN','New non-OS services since Phase 1',
+                   ', '.join(added[:20])+' (verify expected additions)','Non-OS Services'))
+    return checks
+
+
 def validate_host(host, record, previous, baseline):
     checks=[]
     p=record['phase']; snap=record.get('snapshot');prev=(previous or {}).get('snapshot')
@@ -674,6 +851,7 @@ def validate_host(host, record, previous, baseline):
         checks.append(check('PASS' if name=='rhel' and ver==exp else 'FAIL',
                             'Expected RHEL version','Detected %s %s; expected RHEL %s'%(name,ver,exp)))
         services=snap.get('services',{})
+        checks.extend(validate_non_os_services(snap,prev,(baseline or {}).get('snapshot'),p))
         for svc in record.get('critical_services',[]):
             st=services.get(svc,'unknown')
             checks.append(check('PASS' if st=='active' else 'FAIL','Required service: '+svc,
@@ -886,7 +1064,7 @@ details{border:1px solid var(--line);padding:11px;border-radius:8px;margin:8px 0
 .toc a{margin-right:18px}a{color:#2257ac}.warning{border-left:4px solid #d49316;padding:9px 12px;background:#fff8e6}
 @media print{button{display:none}header{background:white;color:#111}main{max-width:none}.card{break-inside:avoid}}
 </style></head><body><header><h1>'''+esc(title)+'''</h1><p>'''+esc(subtitle)+'''</p></header><main>
-<div class="card"><strong>Export report data</strong><p class="muted">Self-contained HTML. CSV files are generated locally in your browser; no external service is required.</p>'''+''.join('<button type="button" onclick="exportCSV(\'%s\')">%s</button>'%(esc(k),esc(label)) for k,label in [('metrics','Metric summary CSV'),('hourly','Hourly metrics CSV'),('checks','OS validation CSV'),('comparison','Phase comparison CSV')] if exports.get(k))+'''</div>'''+body+'''
+<div class="card"><strong>Export report data</strong><p class="muted">Self-contained HTML. CSV files are generated locally in your browser; no external service is required.</p>'''+''.join('<button type="button" onclick="exportCSV(\'%s\')">%s</button>'%(esc(k),esc(label)) for k,label in [('metrics','Metric summary CSV'),('hourly','Hourly metrics CSV'),('checks','OS validation CSV'),('comparison','Phase comparison CSV'),('services','Non-OS service CSV')] if exports.get(k))+'''</div>'''+body+'''
 <p class="muted">Timestamps are UTC. Hourly metrics are for completed hours only. Missing data is not treated as zero. OS snapshots are point-in-time readings; thresholds are advisory and require workload context.</p>
 </main><script type="application/json" id="report-data">'''+payload+'''</script><script>
 function csvEscape(v){let s=(v===null||v===undefined)?'':String(v);if(/^[=+@\\t\\r]/.test(s)||(s.startsWith('-')&&!/^-?\\d+(\\.\\d+)?$/.test(s)))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}
@@ -908,6 +1086,8 @@ def export_rows(host, record, exports):
             exports['hourly'].append({**basic,'timestamp_utc':t,'value':val})
     for c in record.get('checks',[]):
         exports['checks'].append({'hostname':host,'instance_id':iid,'phase':phase,**c})
+    for x in (record.get('snapshot') or {}).get('non_os_services',[]):
+        exports['services'].append({'hostname':host,'instance_id':iid,'phase':phase,**x})
 
 
 def host_snapshot_html(snap):
@@ -941,8 +1121,17 @@ def host_snapshot_html(snap):
             for x in snap['inodes']])
     svcs=snap.get('services',{})
     if svcs:
-        body+='<h3>Service status</h3>'+table(['Service','State'],
+        body+='<h3>OS platform/monitoring agent service checks (separate from discovered services)</h3>'+table(['Service','State'],
                     [[esc(a),esc(b)] for a,b in svcs.items()])
+    svcinfo=snap.get('service_discovery',{})
+    extras=snap.get('non_os_services',[])
+    if svcinfo:
+        body+='<h3>Automatically discovered non-default services (RHEL core services excluded)</h3>'
+        body+='<p class="muted">Selected by systemd active/enabled units and filtered against known core RHEL units. Classification is best-effort; customer-added service exclusions can refine it.</p>'
+        body+=table(['Unit','Active','Startup','Source','RPM package','Unit path'],
+            [[esc(x.get(k,'')) for k in ('name','active_state','enablement','origin','rpm_package','unit_path')] for x in extras])
+        if not extras:body+='<p>No non-core running/enabled services detected in this snapshot.</p>'
+        if svcinfo.get('errors'):body+='<p class="warning">Inventory notes: '+esc('; '.join(svcinfo['errors']))+'</p>'
     if snap.get('network_interfaces'):
         body+='<h3>Network interface counters (since last boot)</h3>'+table(
           ['Interface','RX errors','RX drops','TX errors','TX drops'],
@@ -982,7 +1171,7 @@ def phase_html(state):
     else:
         body+='<p>No checks currently flagged WARN or FAIL.</p>'
     body+='</section>'
-    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[]}
+    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[],'services':[]}
     for host,rec in state['hosts'].items():
         export_rows(host,rec,exports)
         window=rec['window']
@@ -990,6 +1179,11 @@ def phase_html(state):
         body+='<p class="muted">'+esc(rec['instance_id'])+' | '+esc(rec['server_type'].upper())+\
               ' | '+esc(rec['instance_type'])+' | '+esc(window['start'])+' to '+esc(window['end'])+\
               ' | '+esc(window['hours'])+' complete hours</p>'
+        svcs=(rec.get('snapshot') or {}).get('non_os_services',[])
+        body+='<h3>Non-default service inventory (auto-discovered)</h3>'
+        body+=table(['Service','State','Startup','RPM package','Classification'],
+          [[esc(x.get(k,'')) for k in ('name','active_state','enablement','rpm_package','classification')] for x in svcs])
+        if not svcs:body+='<p>No non-core service units detected, or SSM inventory is unavailable.</p>'
         if rec.get('upgrade_completed_at_utc'):
             body+='<p>Declared upgrade completed: <strong>'+esc(rec['upgrade_completed_at_utc'])+'</strong></p>'
         if rec.get('warnings'):
@@ -1034,7 +1228,7 @@ def final_html(phase_states):
     title='RHEL OS upgrade — Three-phase final summary'
     subtitle='Batch %s | Account %s | Region %s | Generated %s | Script %s'%(
         batch,first['account_id'],first['region'],iso_time(now_utc()),VERSION)
-    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[]}
+    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[],'services':[]}
     body='<div class="card"><h2>Detailed executive summary</h2>'
     all_hosts=list(first['hosts'])
     pass_hosts=[];warn_hosts=[];fail_hosts=[]
@@ -1061,7 +1255,7 @@ def final_html(phase_states):
                         (len(warn_hosts),'With warnings'),(len(fail_hosts),'With failures')])+\
         '</div><p><strong>Overall result:</strong> '+badge('FAIL' if fail_hosts else 'WARN' if warn_hosts else 'PASS')+\
         '. PASS requires every OS check across all three phases to pass. WARN indicates observations or data gaps, not necessarily upgrade failure.</p>'
-    body+='<p>Data collection covers: OS version and kernel, boot/uptime, CPU and memory, swap, filesystems and mount continuity, disk capacity, EBS IOPS/throughput/latency when available, network throughput and interface errors, failed units, required services, SELinux, firewalld, NTP, fstab, system/kernel logs, EC2 status checks and CWAgent coverage. Each phase includes a live SSM snapshot and historical hourly CloudWatch data.</p>'
+    body+='<p>Data collection covers: OS version and kernel, boot/uptime, CPU and memory, swap, filesystems and mount continuity, disk capacity, EBS IOPS/throughput/latency when available, network throughput and interface errors, failed units, automatically discovered non-OS service continuity, required platform services, SELinux, firewalld, NTP, fstab, system/kernel logs, EC2 status checks and CWAgent coverage. Each phase includes a live SSM snapshot and historical hourly CloudWatch data.</p>'
     body+='<h3>Three-phase outcome by instance</h3>'+table(
         ['Hostname','Instance ID','Role','8.8 baseline','Intermediate','9.6 final','Overall','FAIL checks','WARN checks'],perhost)
     body+='<p class="warning"><strong>Interpretation:</strong> Phase windows are not necessarily equal in length or business workload. Trends are evidence for investigation, not automatic proof that the OS caused a change. Network error counters from SSM reset after reboot. No application/database performance validation is included.</p></div>'
@@ -1120,6 +1314,21 @@ def final_html(phase_states):
            ('IPv4 default route',lambda s:'present' if s.get('default_route_v4') else 'absent')]:
             osrows.append([esc(label)]+[esc(fn(r['snapshot'])) if r.get('snapshot') else 'not captured' for r in h])
         body+='<h3>Full OS health comparison</h3>'+table(['OS validation item','Phase 1','Phase 2','Phase 3'],osrows)
+        service_maps=[non_os_byname((r.get('snapshot') or {})) for r in h]
+        all_svc=sorted(set().union(*[set(m) for m in service_maps]))
+        if all_svc:
+            svcrows=[]
+            for svc in all_svc:
+                row=[esc(svc)]
+                for d in service_maps:
+                    obj=d.get(svc)
+                    row.append(esc((obj.get('active_state','unknown')+' / '+obj.get('enablement','unknown')) if obj else 'missing'))
+                svcrows.append(row)
+            body+='<h3>Non-default services: Phase 1 / Phase 2 / Phase 3</h3>'+table(
+                 ['Service','Phase 1 state/startup','Phase 2 state/startup','Phase 3 state/startup'],svcrows)
+        else:
+            body+='<p>No non-core services present in the collected snapshots.</p>'
+
         for n,r in enumerate(h,1):
             checkrows=[[badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])]
                        for c in r['checks']]
@@ -1174,6 +1383,9 @@ def phase_diagnostic(state, report_key, state_key):
             'guest_metrics_with_data':sum(1 for m in guest if m['samples']>0),
             'cw_metrics_with_data':sum(1 for m in rec['metrics'] if m['samples']>0),
             'critical_findings':[c for c in checks if c['status'] in ('WARN','FAIL')],
+            'discovered_non_os_services':[(x.get('name'),x.get('active_state')) for x in (rec.get('snapshot') or {}).get('non_os_services',[])],
+            'non_os_service_findings':[c for c in checks if c['group']=='Non-OS Services' and c['status'] in ('WARN','FAIL')],
+            'service_discovery':(rec.get('snapshot') or {}).get('service_discovery',{}),
             'collection_warnings':rec.get('warnings',[]),
             'prior_stage_changes_flagged':[x for x in rec.get('prior_comparison',[]) if x['status']=='WARN'],
         }
@@ -1221,6 +1433,17 @@ def _run_phase(event, context):
             if not isinstance(extra,list) or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9@_.-]{1,100}',x) for x in extra):
                 raise ValueError('Invalid critical_services_by_host for %s'%host)
             checked_services[host]=list(dict.fromkeys(['sshd','chronyd']+extra))
+        service_exclusions={}
+        service_inclusions={}
+        for field,target in [('service_exclusions_by_host',service_exclusions),('service_inclusions_by_host',service_inclusions)]:
+            values=event.get(field,{})
+            if not isinstance(values,dict) or any(h not in hostnames for h in values):
+                raise ValueError(field+' must map only the provided hostnames to service name lists')
+            for h in hostnames:
+                arr=values.get(h,[])
+                if not isinstance(arr,list) or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9@_.-]{1,100}',x) for x in arr):
+                    raise ValueError('Invalid '+field+' for '+h)
+                target[h]=list(dict.fromkeys(x if x.endswith('.service') else x+'.service' for x in arr))
         # Do not silently overwrite historical comparison evidence.
         phase1_key=key_for(prefix,batch,'.state/phase-1.json')
         if s3_key_exists(s3,bucket,phase1_key):
@@ -1232,6 +1455,8 @@ def _run_phase(event, context):
                     raise ValueError('Cannot replace Phase 1 because Phase %d exists. Use a NEW batch_id'%later)
     else:
         state1=read_state(s3,bucket,prefix,batch,1)
+        if state1.get('schema_version')!=2:
+            raise ValueError('This batch was created by an older Lambda version without a non-OS service baseline. Start a NEW batch_id with v3 Phase 1 before upgrading.')
         if state1.get('region')!=region or state1.get('account_id')!=account:
             raise ValueError('Phase 1 belongs to another AWS account or region')
         hostnames=list(state1['hosts'])
@@ -1239,6 +1464,8 @@ def _run_phase(event, context):
             raise ValueError('Hostnames differ from Phase 1; use same batch_id and hostnames')
         types={h:state1['hosts'][h]['server_type'] for h in hostnames}
         checked_services={h:state1['hosts'][h]['critical_services'] for h in hostnames}
+        service_exclusions={h:state1['hosts'][h].get('service_exclusions',[]) for h in hostnames}
+        service_inclusions={h:state1['hosts'][h].get('service_inclusions',[]) for h in hostnames}
         if has_state(s3,bucket,prefix,batch,phase) and event.get('replace_existing') is not True:
             raise ValueError('Phase %d already exists for batch %s; set replace_existing=true only to intentionally refresh this phase'%(phase,batch))
         if phase==2 and has_state(s3,bucket,prefix,batch,3):
@@ -1271,8 +1498,14 @@ def _run_phase(event, context):
             if last and start<=last:
                 raise ValueError('%s Phase 3 completion time must be later than Phase 2 completion'%host)
     LOG.info('Starting RHEL OS report batch=%s phase=%d region=%s hosts=%s',batch,phase,region,hostnames)
-    snapshot_results=query_os_snapshots(ssm,host_data,checked_services)
-    state={'schema_version':1,'batch_id':batch,'phase':phase,'account_id':account,
+    tracked_by_host={}
+    if phase>1:
+        for h in hostnames:
+            saved=[state1['hosts'][h]]
+            if phase==3:saved.append(before[h])
+            tracked_by_host[h]=sorted({svc.get('name') for old in saved for svc in (old.get('snapshot') or {}).get('non_os_services',[]) if svc.get('name')})
+    snapshot_results=query_os_snapshots(ssm,host_data,checked_services,service_inclusions,service_exclusions,tracked_by_host)
+    state={'schema_version':2,'batch_id':batch,'phase':phase,'account_id':account,
            'region':region,'generated_at_utc':iso_time(t),'hosts':{}}
     for host in hostnames:
         info=host_data[host]
@@ -1290,6 +1523,7 @@ def _run_phase(event, context):
         rec={'hostname':host,'instance_id':info['instance_id'],
              'instance_type':info['instance_type'],'availability_zone':info['availability_zone'],
              'server_type':types[host],'phase':phase,'critical_services':checked_services[host],
+             'service_exclusions':service_exclusions[host], 'service_inclusions':service_inclusions[host],
              'volumes':vols,'upgrade_completed_at_utc':iso_time(start_raw) if phase>1 else None,
              'window':{'start':iso_time(start),'end':iso_time(end),
                        'hours':max(0,int((end-start).total_seconds()/PERIOD))},
