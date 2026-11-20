@@ -1,44 +1,25 @@
-"""RHEL OS-only, three-phase, same-account EC2 upgrade performance reporting.
+"""RHEL OS-only, two-phase, same-account EC2 upgrade performance reporting.
 
-Python 3.12/3.13 AWS Lambda. Dependency: boto3 (included in AWS Lambda Python runtime).
-Outputs four user-facing HTML reports (phase-1.html, phase-2.html, phase-3.html,
-final-summary.html). Every phase also publishes phase-N-status.json in the batch
-folder and .state/phase-N.json (historical data used in the final comparison).
-Uses EXACT renamed metric names from the supplied CWAgent configuration.
+Phase 1: RHEL 8.8 baseline (default 15-day CloudWatch window).
+Phase 2: post-final-upgrade RHEL 9.6 (from each host's supplied Sydney completion time).
+Phase 2 also creates final-summary.html comparing the two phases.
+Every phase creates HTML, CSV export controls, a status JSON and internal state JSON.
 
-Required Lambda environment variables:
-  REPORT_BUCKET, REPORT_PREFIX, KMS_KEY_ARN
-Optional:
-  CW_AGENT_NAMESPACE=CWAgent
-  SSM_WAIT_SECONDS=100
-  BASELINE_DAYS=15
-  MAX_HOSTS=20
-  MAX_DISCOVERED_SERVICES=80
+Upgrade completion timestamps are entered in Australia/Sydney local time. ZoneInfo
+resolves AEDT/AEST from the calendar date; UTC is stored internally for CloudWatch.
+No reboot-time guess is used because a reboot is not proof of an OS upgrade.
 
-Run 1 Test event:
-{
- "phase": 1, "batch_id": "nov26-wave01",
- "hostnames": ["APP-SERVER-01", "DB-SERVER-01"],
- "server_types": {"APP-SERVER-01":"app", "DB-SERVER-01":"db"},
- "service_exclusions_by_host": {"APP-SERVER-01": ["custom-one-off.service"]}
-}
-Run 2 / Run 3 Test event:
-{
- "phase": 2, "batch_id": "nov26-wave01",
- "upgrade_completed_at_utc": {
-   "APP-SERVER-01":"2026-11-20T03:30:00Z",
-   "DB-SERVER-01":"2026-11-21T05:15:00Z"
- }
-}
-For Run 3 change phase to 3, and supply the second upgrade completion times.
-No automatic upgrade-time guess: last reboot is not a reliable upgrade timestamp.
-Non-core systemd services (custom/vendor/monitoring/application service units)
-are auto-discovered in Phase 1 and compared after upgrades. Discovery filters
-common RHEL OS services by name; the classification is best-effort and can be
-refined with service_exclusions_by_host at Phase 1.
+Python 3.12/3.13 AWS Lambda. Dependency: boto3 (included in AWS Lambda runtime).
+Required environment variables: REPORT_BUCKET, REPORT_PREFIX, KMS_KEY_ARN.
+Optional: CW_AGENT_NAMESPACE=CWAgent, SSM_WAIT_SECONDS=100, BASELINE_DAYS=15,
+MAX_HOSTS=20, MAX_DISCOVERED_SERVICES=80.
 
-Important: CWAgent must have collected historical memory/disk/swap metrics in advance.
-SSM OS snapshots capture the state AT EACH RUN, not a 15-day retrospective.
+Phase 1 event: hostnames + server_types (app/db).
+Phase 2 event: same batch_id + upgrade_completed_at_sydney mapping for every hostname.
+
+Non-core systemd services are auto-discovered in Phase 1 and compared after upgrade.
+Historical CWAgent memory/disk/swap metrics must have been collected in advance.
+SSM OS snapshots are live readings at each run, not retrospective history.
 """
 
 import base64
@@ -56,14 +37,19 @@ import statistics
 import time
 import zlib
 from collections import defaultdict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 from botocore.exceptions import ClientError
 
-VERSION = "2026-11-18-v3.0"
+VERSION = "2026-11-20-v4.0"
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
 UTC = dt.timezone.utc
+try:
+    SYDNEY = ZoneInfo("Australia/Sydney")
+except ZoneInfoNotFoundError as exc:
+    raise RuntimeError("Australia/Sydney timezone database is unavailable in this Lambda runtime") from exc
 PERIOD = 3600  # 1-hour complete bins; keeps 15-day baseline within retention.
 IGNORE_FSTYPES = {"tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup2", "devpts"}
 DEFAULT_SERVICES = ["sshd", "chronyd", "amazon-ssm-agent", "amazon-cloudwatch-agent"]
@@ -344,16 +330,71 @@ def iso_time(d):
     return d.astimezone(UTC).isoformat().replace('+00:00', 'Z')
 
 
+def format_sydney_time(value):
+    """Format an aware datetime in Australia/Sydney, showing AEDT/AEST and offset."""
+    return value.astimezone(SYDNEY).strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')
+
+
+def iso_sydney_time(value):
+    return value.astimezone(SYDNEY).isoformat(timespec='seconds')
+
+
 def parse_time(value):
+    """Parse an internally stored ISO-8601 UTC timestamp."""
     if not isinstance(value, str):
-        raise ValueError('Upgrade completion time must be an ISO-8601 UTC string, ending in Z')
+        raise ValueError('Stored timestamp must be an ISO-8601 UTC string')
     try:
         parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
         if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
             raise ValueError()
         return parsed.astimezone(UTC)
     except (ValueError, TypeError):
-        raise ValueError('Invalid UTC timestamp %r; example: 2026-11-20T03:30:00Z' % value)
+        raise ValueError('Invalid stored UTC timestamp %r' % value)
+
+
+def parse_sydney_time(value):
+    """Return (UTC datetime, Sydney-aware datetime) for a Sydney wall-clock input.
+
+    Accepts e.g. 2026-11-20T14:30:00 (timezone inferred as AEDT) or an explicit
+    Sydney offset e.g. 2026-11-20T14:30:00+11:00. Rejects UTC/Z input, invalid
+    offsets, nonexistent DST wall times, and ambiguous fall-back wall times.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('Upgrade completion time must be a Sydney local ISO-8601 timestamp')
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        raise ValueError('Invalid Sydney time %r; example: 2026-11-20T14:30:00' % value)
+
+    if parsed.tzinfo is not None:
+        # An explicit offset is accepted only if it describes that same Sydney
+        # wall-clock time on that date. A UTC Z suffix is therefore rejected.
+        local = parsed.astimezone(SYDNEY)
+        if local.replace(tzinfo=None) != parsed.replace(tzinfo=None):
+            raise ValueError(
+                'Timestamp %r is not expressed as Australia/Sydney local time. '
+                'Use local time without Z, or the correct Sydney offset (+11:00 AEDT / +10:00 AEST).' % value)
+        return local.astimezone(UTC), local
+
+    # A naive value is a Sydney wall-clock time. Round-trip both fold values to
+    # detect daylight-saving gaps and repeated times during the autumn transition.
+    candidates = []
+    for fold in (0, 1):
+        candidate = parsed.replace(tzinfo=SYDNEY, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(SYDNEY)
+        if round_trip.replace(tzinfo=None) == parsed:
+            if not any(existing.utcoffset() == candidate.utcoffset() for existing in candidates):
+                candidates.append(candidate)
+    if not candidates:
+        raise ValueError(
+            'Sydney local time %r does not exist because clocks move forward for daylight saving. '
+            'Choose a valid local time.' % value)
+    if len(candidates) > 1:
+        raise ValueError(
+            'Sydney local time %r is ambiguous because clocks move back from AEDT to AEST. '
+            'Provide the correct explicit Sydney offset (+11:00 or +10:00).' % value)
+    local = candidates[0]
+    return local.astimezone(UTC), local
 
 
 def ceil_period(x):
@@ -769,7 +810,7 @@ def check(level, name, detail, group='OS'):
 
 
 def expected_version(phase,server_type):
-    return {1:'8.8', 2:'9.2' if server_type=='app' else '8.10', 3:'9.6'}[phase]
+    return {1:'8.8', 2:'9.6'}[phase]
 
 
 def non_os_byname(snap):
@@ -820,14 +861,6 @@ def validate_non_os_services(snap, previous, baseline, phase):
             if newest and svc.get('enablement','').startswith('enabled') and not newest.get('enablement','').startswith('enabled'):
                 checks.append(check('WARN','Non-OS service startup state changed: '+name,
                     'Phase 1='+svc.get('enablement','')+'; current='+newest.get('enablement',''), 'Non-OS Services'))
-        if phase==3:
-            for name,svc in sorted(prior.items()):
-                if name in base or svc.get('active_state')!='active' or svc.get('unit_type')=='oneshot':continue
-                newest=current.get(name)
-                status=newest.get('active_state','missing') if newest else 'missing'
-                if status!='active':
-                    checks.append(check('WARN','Phase 2 service no longer active: '+name,
-                        'Phase 2=active; Phase 3='+status,'Non-OS Services'))
         # Newly appearing packages can be legitimate, but warrant review.
         added=sorted(set(current)-set(base))
         if added:
@@ -1043,8 +1076,19 @@ def badge(value):
 
 
 def html_layout(title,subtitle,body,exports):
-    # JSON is text, not executable JS; escape < so host-controlled values cannot close the element.
+    # All report types get a combined CSV button. Individual buttons remain
+    # visible on phase reports even when a category has no rows; the JS gives
+    # a clear message instead of silently omitting the export control.
     payload=json.dumps(exports,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+    button_specs=[
+        ('all','Export all report data (CSV)'),
+        ('metrics','Metric summary CSV'),
+        ('hourly','Hourly metrics CSV'),
+        ('checks','OS validation CSV'),
+        ('services','Non-default service CSV'),
+        ('comparison','Before/after comparison CSV')]
+    buttons=''.join("<button type=\"button\" onclick=\"exportCSV('%s')\">%s</button>"%(esc(k),esc(label))
+                    for k,label in button_specs if k=='all' or k in exports)
     return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>'''+esc(title)+'''</title>
 <style>
 :root{color-scheme:light;--bg:#f3f6fb;--ink:#17243b;--mute:#67768d;--line:#dfe5ed;--accent:#1d4ed8}
@@ -1064,13 +1108,16 @@ details{border:1px solid var(--line);padding:11px;border-radius:8px;margin:8px 0
 .toc a{margin-right:18px}a{color:#2257ac}.warning{border-left:4px solid #d49316;padding:9px 12px;background:#fff8e6}
 @media print{button{display:none}header{background:white;color:#111}main{max-width:none}.card{break-inside:avoid}}
 </style></head><body><header><h1>'''+esc(title)+'''</h1><p>'''+esc(subtitle)+'''</p></header><main>
-<div class="card"><strong>Export report data</strong><p class="muted">Self-contained HTML. CSV files are generated locally in your browser; no external service is required.</p>'''+''.join('<button type="button" onclick="exportCSV(\'%s\')">%s</button>'%(esc(k),esc(label)) for k,label in [('metrics','Metric summary CSV'),('hourly','Hourly metrics CSV'),('checks','OS validation CSV'),('comparison','Phase comparison CSV'),('services','Non-OS service CSV')] if exports.get(k))+'''</div>'''+body+'''
-<p class="muted">Timestamps are UTC. Hourly metrics are for completed hours only. Missing data is not treated as zero. OS snapshots are point-in-time readings; thresholds are advisory and require workload context.</p>
+<div class="card"><strong>Export report data</strong><p class="muted">CSV files are generated locally in your browser; no external service is required. The combined export includes every available data section in this report.</p>'''+buttons+'''</div>'''+body+'''
+<p class="muted">CloudWatch metric windows and stored timestamps are normalized to UTC. Upgrade completion input is interpreted in Australia/Sydney; AEDT/AEST is selected automatically from the date. Hourly metrics include completed hours only. Missing data is not treated as zero. OS snapshots are point-in-time readings; thresholds are advisory and require workload context.</p>
 </main><script type="application/json" id="report-data">'''+payload+'''</script><script>
 function csvEscape(v){let s=(v===null||v===undefined)?'':String(v);if(/^[=+@\\t\\r]/.test(s)||(s.startsWith('-')&&!/^-?\\d+(\\.\\d+)?$/.test(s)))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}
-function exportCSV(kind){const data=JSON.parse(document.getElementById('report-data').textContent);const rows=data[kind]||[];if(!rows.length){alert('No records for '+kind);return;}
+function exportCSV(kind){const data=JSON.parse(document.getElementById('report-data').textContent);let rows=[];
+if(kind==='all'){for(const k of ['metrics','hourly','checks','comparison','services']){for(const r of (data[k]||[]))rows.push({record_type:k,...r});}}
+else{rows=data[kind]||[];}
+if(!rows.length){alert('No records are available for '+kind+' in this report.');return;}
 const keys=[...new Set(rows.flatMap(r=>Object.keys(r)))];let out=keys.map(csvEscape).join(',')+'\\r\\n';for(const row of rows)out+=keys.map(k=>csvEscape(row[k])).join(',')+'\\r\\n';
-const blob=new Blob([out],{type:'text/csv;charset=utf-8;'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='rhel-'+kind+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);}
+const blob=new Blob(['\\ufeff',out],{type:'text/csv;charset=utf-8;'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='rhel-'+kind+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);}
 </script></body></html>'''
 
 
@@ -1147,18 +1194,19 @@ def host_snapshot_html(snap):
 
 def phase_html(state):
     phase=state['phase'];batch=state['batch_id']
-    title='RHEL OS upgrade — Phase %d'%phase
-    subtitle='Batch %s | AWS account %s | Region %s | Run %s | Script %s'%(batch,state['account_id'],state['region'],state['generated_at_utc'],VERSION)
+    phase_label='Before upgrade — RHEL 8.8 baseline' if phase==1 else 'After upgrade — RHEL 9.6'
+    title='RHEL OS upgrade — Phase %d: %s'%(phase,phase_label)
+    generated=parse_time(state['generated_at_utc'])
+    subtitle='Batch %s | AWS account %s | Region %s | Generated %s | Script %s'%(
+        batch,state['account_id'],state['region'],format_sydney_time(generated),VERSION)
     counts=defaultdict(int)
     for rec in state['hosts'].values():counts[status_of(rec['checks'])]+=1
     body='<div class="card"><h2>Executive summary</h2><div class="summary">'+''.join(
         '<div class="stat"><strong>%s</strong>%s</div>'%(v,esc(label))
         for v,label in [(len(state['hosts']),'EC2 instances'),(counts['PASS'],'PASS'),
                         (counts['WARN'],'WARN'),(counts['FAIL'],'FAIL')])+\
-        '</div><p>'+esc('Phase %d; expected OS versions: app=%s, db=%s'%
-        (phase,expected_version(phase,'app'),expected_version(phase,'db')))+\
-        '. Values are hourly series over each host-specific window.</p></div>'
-    # Top-level triage is particularly useful after Phase 2 when the OS was upgraded.
+        '</div><p>'+esc('Phase %d — %s. Expected RHEL version is 8.8 before upgrade and 9.6 after upgrade.'%(phase,phase_label))+\
+        '</p></div>'
     issues=[]
     for host,rec in state['hosts'].items():
         for c in rec['checks']:
@@ -1166,14 +1214,21 @@ def phase_html(state):
                 issues.append([esc(host),badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])])
     body+='<section class="card"><h2>Phase %d validation / action required</h2>'%phase
     if issues:
-        body+='<p>Investigate the issues below before proceeding to the next upgrade phase.</p>'+table(
+        body+='<p>Investigate the issues below. For Phase 2, review all FAIL/WARN findings before accepting the RHEL 9.6 upgrade.</p>'+table(
             ['Hostname','Severity','Area','Validation','Finding'],issues)
     else:
         body+='<p>No checks currently flagged WARN or FAIL.</p>'
     body+='</section>'
-    exports={'metrics':[],'hourly':[],'checks':[],'comparison':[],'services':[]}
+    exports={'metrics':[],'hourly':[],'checks':[],'services':[]}
+    if phase==2:
+        exports['comparison']=[]
     for host,rec in state['hosts'].items():
         export_rows(host,rec,exports)
+        if phase==2:
+            for item in rec.get('prior_comparison',[]):
+                exports['comparison'].append({
+                    'hostname':host,'instance_id':rec['instance_id'],
+                    'server_type':rec['server_type'],**item})
         window=rec['window']
         body+='<section class="card"><h2>'+esc(host)+' '+badge(status_of(rec['checks']))+'</h2>'
         body+='<p class="muted">'+esc(rec['instance_id'])+' | '+esc(rec['server_type'].upper())+\
@@ -1184,8 +1239,9 @@ def phase_html(state):
         body+=table(['Service','State','Startup','RPM package','Classification'],
           [[esc(x.get(k,'')) for k in ('name','active_state','enablement','rpm_package','classification')] for x in svcs])
         if not svcs:body+='<p>No non-core service units detected, or SSM inventory is unavailable.</p>'
-        if rec.get('upgrade_completed_at_utc'):
-            body+='<p>Declared upgrade completed: <strong>'+esc(rec['upgrade_completed_at_utc'])+'</strong></p>'
+        if rec.get('upgrade_completed_at_sydney'):
+            body+='<p>Declared final upgrade completion (Sydney): <strong>'+esc(format_sydney_time(parse_sydney_time(rec['upgrade_completed_at_sydney'])[0]))+'</strong>'
+            body+=' | Stored/query time (UTC): '+esc(rec.get('upgrade_completed_at_utc'))+'</p>'
         if rec.get('warnings'):
             body+='<div class="warning"><strong>Collection notes</strong><ul>'+''.join(
                 '<li>'+esc(x)+'</li>' for x in rec['warnings'])+'</ul></div>'
@@ -1206,8 +1262,8 @@ def phase_html(state):
                            esc(num(x.get('after'))),
                            esc(('%+.1f%%'%change) if change is not None else '—'),
                            badge(x['status']) if x['status'] in ('PASS','WARN','FAIL') else esc(x['status'])])
-            body+='<h3>Change from previous phase (hourly means)</h3>'+table(
-                ['Metric','Unit','Previous','Current','Change','Review'],pr)
+            body+='<h3>Change from RHEL 8.8 baseline (hourly means)</h3>'+table(
+                ['Metric','Unit','Before','After','Change','Review'],pr)
         checks=rec['checks']
         body+='<h3>OS validation results</h3>'+table(['Status','Group','Check','Evidence / observation'],
              [[badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])] for c in checks])
@@ -1224,71 +1280,83 @@ def phase_metric_diff(a,b):
 
 
 def final_html(phase_states):
-    first=phase_states[0];batch=first['batch_id']
-    title='RHEL OS upgrade — Three-phase final summary'
+    if len(phase_states)!=2:
+        raise ValueError('Final summary requires exactly Phase 1 baseline and Phase 2 post-upgrade states')
+    baseline,after=phase_states
+    batch=baseline['batch_id']
+    title='RHEL OS upgrade — RHEL 8.8 before vs RHEL 9.6 after summary'
+    generated=now_utc()
     subtitle='Batch %s | Account %s | Region %s | Generated %s | Script %s'%(
-        batch,first['account_id'],first['region'],iso_time(now_utc()),VERSION)
+        batch,baseline['account_id'],baseline['region'],format_sydney_time(generated),VERSION)
     exports={'metrics':[],'hourly':[],'checks':[],'comparison':[],'services':[]}
     body='<div class="card"><h2>Detailed executive summary</h2>'
-    all_hosts=list(first['hosts'])
+    all_hosts=list(baseline['hosts'])
     pass_hosts=[];warn_hosts=[];fail_hosts=[]
     perhost=[]
     for host in all_hosts:
-        h=[st['hosts'][host] for st in phase_states]
+        h=[baseline['hosts'][host],after['hosts'][host]]
         allchecks=[c for r in h for c in r['checks']]
         status=status_of(allchecks)
         if status=='FAIL':fail_hosts.append(host)
         elif status=='WARN':warn_hosts.append(host)
         else:pass_hosts.append(host)
-        vers=[]
+        versions=[]
         for rec in h:
             release=(rec.get('snapshot') or {}).get('os_release',{})
-            vers.append(release.get('VERSION_ID','not verified'))
-        missing=sum(1 for c in allchecks if c['status']=='WARN')
-        failures=sum(1 for c in allchecks if c['status']=='FAIL')
+            versions.append(release.get('VERSION_ID','not verified'))
+        warn_count=sum(1 for c in allchecks if c['status']=='WARN')
+        fail_count=sum(1 for c in allchecks if c['status']=='FAIL')
         perhost.append([esc(host),esc(h[0]['instance_id']),esc(h[0]['server_type'].upper()),
-                        *[esc(v) for v in vers],badge(status),esc(failures),esc(missing)])
+                        esc(versions[0]),esc(versions[1]),badge(status),esc(fail_count),esc(warn_count)])
         for rec in h:export_rows(host,rec,exports)
+    overall='FAIL' if fail_hosts else 'WARN' if warn_hosts else 'PASS'
     body+='<div class="summary">'+''.join(
         '<div class="stat"><strong>%s</strong>%s</div>'%(v,esc(label))
         for v,label in [(len(all_hosts),'Servers'),(len(pass_hosts),'Fully PASS'),
                         (len(warn_hosts),'With warnings'),(len(fail_hosts),'With failures')])+\
-        '</div><p><strong>Overall result:</strong> '+badge('FAIL' if fail_hosts else 'WARN' if warn_hosts else 'PASS')+\
-        '. PASS requires every OS check across all three phases to pass. WARN indicates observations or data gaps, not necessarily upgrade failure.</p>'
-    body+='<p>Data collection covers: OS version and kernel, boot/uptime, CPU and memory, swap, filesystems and mount continuity, disk capacity, EBS IOPS/throughput/latency when available, network throughput and interface errors, failed units, automatically discovered non-OS service continuity, required platform services, SELinux, firewalld, NTP, fstab, system/kernel logs, EC2 status checks and CWAgent coverage. Each phase includes a live SSM snapshot and historical hourly CloudWatch data.</p>'
-    body+='<h3>Three-phase outcome by instance</h3>'+table(
-        ['Hostname','Instance ID','Role','8.8 baseline','Intermediate','9.6 final','Overall','FAIL checks','WARN checks'],perhost)
-    body+='<p class="warning"><strong>Interpretation:</strong> Phase windows are not necessarily equal in length or business workload. Trends are evidence for investigation, not automatic proof that the OS caused a change. Network error counters from SSM reset after reboot. No application/database performance validation is included.</p></div>'
+        '</div><p><strong>Overall result:</strong> '+badge(overall)+\
+        '. PASS requires all OS checks in both phases to pass. WARN indicates observations or data gaps, not necessarily upgrade failure.</p>'
+    body+='<p>Scope: RHEL 8.8 baseline versus final RHEL 9.6. This report covers OS version/kernel, boot/uptime, CPU, memory, swap, filesystems and mounts, disk capacity, EBS IOPS/throughput/latency when available, network throughput and interface errors, failed systemd units, automatically discovered non-default service continuity, platform agents, SELinux, firewalld, NTP, fstab, system/kernel logs, EC2 status checks and CloudWatch Agent coverage. It does not include application or database tests.</p>'
+    body+='<h3>Before/after outcome by instance</h3>'+table(
+        ['Hostname','Instance ID','Role','Before (RHEL 8.8)','After (RHEL 9.6)','Overall','FAIL checks','WARN checks'],perhost)
+    body+='<p class="warning"><strong>Interpretation:</strong> The baseline window is the 15 days before Phase 1. The post-upgrade window starts at the declared per-host final-upgrade completion time and ends when Phase 2 runs. Windows and workloads may differ. Trends are evidence for investigation, not automatic proof that the OS caused a change. No application/database performance validation is included.</p></div>'
+
     for host in all_hosts:
-        h=[st['hosts'][host] for st in phase_states]
+        h=[baseline['hosts'][host],after['hosts'][host]]
         title_status=status_of([c for r in h for c in r['checks']])
         body+='<section class="card"><h2>'+esc(host)+' '+badge(title_status)+'</h2>'
-        body+='<p class="muted">'+esc(h[0]['instance_id'])+' | '+esc(h[0]['server_type'].upper())+\
-              ' | Metric comparison is on hourly mean, not matched workload.</p>'
-        rows=[]
+        body+='<p class="muted">'+esc(h[0]['instance_id'])+' | '+esc(h[0]['server_type'].upper())+' | Metric comparison uses hourly means, not matched workload.</p>'
+        if h[1].get('upgrade_completed_at_sydney'):
+            try:
+                local_start=parse_sydney_time(h[1]['upgrade_completed_at_sydney'])[0]
+                body+='<p><strong>Final RHEL 9.6 upgrade completion:</strong> '+esc(format_sydney_time(local_start))+' | UTC '+esc(iso_time(local_start))+'</p>'
+            except Exception:
+                body+='<p><strong>Final upgrade completion (Sydney input):</strong> '+esc(h[1].get('upgrade_completed_at_sydney'))+'</p>'
+        metric_maps=[]
         metric_keys=[]
-        byphase=[]
-        for r in h:
-            d={m['metric_key']:m for m in r['metrics']};byphase.append(d)
-            metric_keys.extend(d)
+        for rec in h:
+            d={m['metric_key']:m for m in rec['metrics']};metric_maps.append(d);metric_keys.extend(d)
+        metric_rows=[]
         for key in dict.fromkeys(metric_keys):
-            ms=[d.get(key) for d in byphase]
-            m=next((x for x in ms if x),None)
-            vals=[x.get('mean') if x else None for x in ms]
-            diffs=[phase_metric_diff(ms[a],ms[b]) for a,b in ((0,1),(1,2),(0,2))]
-            rows.append([esc(m['category']),esc(m['label']),esc(m['unit'])]+
-                        [esc(num(v)) for v in vals]+[esc(('%+.1f%%'%d) if d is not None else '—') for d in diffs])
+            m1=metric_maps[0].get(key);m2=metric_maps[1].get(key)
+            m=m1 or m2
+            before=m1.get('mean') if m1 else None
+            post=m2.get('mean') if m2 else None
+            change=phase_metric_diff(m1,m2)
+            metric_rows.append([esc(m['category']),esc(m['label']),esc(m['unit']),
+                                esc(num(before)),esc(num(post)),
+                                esc(('%+.1f%%'%change) if change is not None else '—'),
+                                esc(m1.get('coverage_pct') if m1 else '—'),
+                                esc(m2.get('coverage_pct') if m2 else '—')])
             exports['comparison'].append({'hostname':host,'instance_id':h[0]['instance_id'],
-                'server_type':h[0]['server_type'],'category':m['category'],
-                'metric':m['label'],'unit':m['unit'],
-                'phase1_avg':vals[0],'phase2_avg':vals[1],'phase3_avg':vals[2],
-                'change_1_to_2_pct':diffs[0], 'change_2_to_3_pct':diffs[1],
-                'change_1_to_3_pct':diffs[2],
-                'phase1_coverage_pct':ms[0]['coverage_pct'] if ms[0] else None,
-                'phase2_coverage_pct':ms[1]['coverage_pct'] if ms[1] else None,
-                'phase3_coverage_pct':ms[2]['coverage_pct'] if ms[2] else None})
-        body+='<h3>All OS metrics: baseline vs intermediate vs final</h3>'+table(
-          ['Area','Metric','Unit','Phase 1 avg','Phase 2 avg','Phase 3 avg','1→2 %','2→3 %','1→3 %'],rows)
+                'server_type':h[0]['server_type'],'category':m['category'],'metric':m['label'],'unit':m['unit'],
+                'before_rhel_8_8_mean':before,'after_rhel_9_6_mean':post,
+                'change_pct':change,
+                'before_coverage_pct':m1.get('coverage_pct') if m1 else None,
+                'after_coverage_pct':m2.get('coverage_pct') if m2 else None})
+        body+='<h3>OS performance metrics: before vs after</h3>'+table(
+            ['Area','Metric','Unit','Before average','After average','Change','Before coverage %','After coverage %'],metric_rows)
+
         osrows=[]
         for label,fn in [
            ('OS version',lambda s:s.get('os_release',{}).get('PRETTY_NAME')),
@@ -1313,7 +1381,8 @@ def final_html(phase_states):
            ('fstab verify status',lambda s:s.get('fstab_verification',{}).get('rc')),
            ('IPv4 default route',lambda s:'present' if s.get('default_route_v4') else 'absent')]:
             osrows.append([esc(label)]+[esc(fn(r['snapshot'])) if r.get('snapshot') else 'not captured' for r in h])
-        body+='<h3>Full OS health comparison</h3>'+table(['OS validation item','Phase 1','Phase 2','Phase 3'],osrows)
+        body+='<h3>Full OS health comparison</h3>'+table(['OS validation item','Before upgrade','After RHEL 9.6'],osrows)
+
         service_maps=[non_os_byname((r.get('snapshot') or {})) for r in h]
         all_svc=sorted(set().union(*[set(m) for m in service_maps]))
         if all_svc:
@@ -1324,22 +1393,21 @@ def final_html(phase_states):
                     obj=d.get(svc)
                     row.append(esc((obj.get('active_state','unknown')+' / '+obj.get('enablement','unknown')) if obj else 'missing'))
                 svcrows.append(row)
-            body+='<h3>Non-default services: Phase 1 / Phase 2 / Phase 3</h3>'+table(
-                 ['Service','Phase 1 state/startup','Phase 2 state/startup','Phase 3 state/startup'],svcrows)
+            body+='<h3>Non-default services: before vs after</h3>'+table(
+                 ['Service','Before state/startup','After state/startup'],svcrows)
         else:
             body+='<p>No non-core services present in the collected snapshots.</p>'
 
-        for n,r in enumerate(h,1):
+        for phase_num,rec in ((1,h[0]),(2,h[1])):
             checkrows=[[badge(c['status']),esc(c['group']),esc(c['check']),esc(c['detail'])]
-                       for c in r['checks']]
-            body+='<details><summary>Phase %d: %s checks, collection notes, and audit details</summary>'%(n,len(r['checks']))
-            if r.get('warnings'):body+='<p>'+esc('; '.join(r['warnings']))+'</p>'
+                       for c in rec['checks']]
+            body+='<details><summary>Phase %d (%s): %s checks, collection notes, and audit details</summary>'%(
+                phase_num,'before upgrade' if phase_num==1 else 'after RHEL 9.6',len(rec['checks']))
+            if rec.get('warnings'):body+='<p>'+esc('; '.join(rec['warnings']))+'</p>'
             body+=table(['Result','Area','Check','Evidence'],checkrows)
-            body+='<details><summary>OS evidence from Phase %d</summary>'%n+host_snapshot_html(r.get('snapshot'))+'</details></details>'
+            body+='<details><summary>OS evidence from Phase %d</summary>'%phase_num+host_snapshot_html(rec.get('snapshot'))+'</details></details>'
         body+='</section>'
     return html_layout(title,subtitle,body,exports)
-
-
 
 
 def calculate_prior_changes(record, previous):
@@ -1379,6 +1447,8 @@ def phase_diagnostic(state, report_key, state_key):
             'os_detected':(rec.get('snapshot') or {}).get('os_release',{}).get('VERSION_ID'),
             'os_expected':expected_version(state['phase'],rec['server_type']),
             'ssm_status':rec['ssm_status'], 'metric_window_utc':rec['window'],
+            'upgrade_completed_at_sydney':rec.get('upgrade_completed_at_sydney'),
+            'upgrade_completed_at_utc':rec.get('upgrade_completed_at_utc'),
             'agent_metrics_discovered':rec.get('agent_metric_count',0),
             'guest_metrics_with_data':sum(1 for m in guest if m['samples']>0),
             'cw_metrics_with_data':sum(1 for m in rec['metrics'] if m['samples']>0),
@@ -1400,7 +1470,7 @@ def has_state(s3,bucket,prefix,batch,phase):
 
 
 def _run_phase(event, context):
-    """Invoke through Lambda Test JSON; invocation returns S3 keys and validation status."""
+    """Run Phase 1 baseline or Phase 2 final RHEL 9.6 post-upgrade report."""
     if not isinstance(event,dict):raise ValueError('Lambda test event must be a JSON object')
     bucket=setting('REPORT_BUCKET',True)
     prefix=setting('REPORT_PREFIX',default='rhel-upgrade-reports').strip('/')
@@ -1408,8 +1478,8 @@ def _run_phase(event, context):
     agent_ns=setting('CW_AGENT_NAMESPACE',default='CWAgent')
     batch=clean_batch(event.get('batch_id'))
     try:phase=int(event.get('phase'))
-    except (TypeError,ValueError):raise ValueError('phase must be 1, 2 or 3')
-    if phase not in (1,2,3):raise ValueError('phase must be 1, 2 or 3')
+    except (TypeError,ValueError):raise ValueError('phase must be 1 or 2')
+    if phase not in (1,2):raise ValueError('Only phase 1 (before) and phase 2 (after RHEL 9.6) are supported')
     baseline_days=int(event.get('baseline_days',setting('BASELINE_DAYS',default='15')))
     if baseline_days<1 or baseline_days>30:raise ValueError('baseline_days must be 1-30')
     session=boto3.session.Session()
@@ -1418,12 +1488,12 @@ def _run_phase(event, context):
     s3=session.client('s3');ec2=session.client('ec2');ssm=session.client('ssm');cw=session.client('cloudwatch')
     sts=session.client('sts')
     account=sts.get_caller_identity()['Account']
-    before={};state1=None
+    before={};state1=None;prior_state=None
     if phase==1:
         hostnames=unique_hosts(event.get('hostnames'))
         kinds=event.get('server_types',{})
         if set(kinds)!=set(hostnames) or any(str(x).lower() not in ('app','db') for x in kinds.values()):
-            raise ValueError('Run 1 requires server_types mapping for every exact hostname: app or db')
+            raise ValueError('Phase 1 requires server_types mapping for every exact hostname: app or db')
         types={h:str(kinds[h]).lower() for h in hostnames}
         svcs=event.get('critical_services_by_host',{})
         if not isinstance(svcs,dict):raise ValueError('critical_services_by_host must be a JSON object')
@@ -1433,8 +1503,7 @@ def _run_phase(event, context):
             if not isinstance(extra,list) or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9@_.-]{1,100}',x) for x in extra):
                 raise ValueError('Invalid critical_services_by_host for %s'%host)
             checked_services[host]=list(dict.fromkeys(['sshd','chronyd']+extra))
-        service_exclusions={}
-        service_inclusions={}
+        service_exclusions={};service_inclusions={}
         for field,target in [('service_exclusions_by_host',service_exclusions),('service_inclusions_by_host',service_inclusions)]:
             values=event.get(field,{})
             if not isinstance(values,dict) or any(h not in hostnames for h in values):
@@ -1448,40 +1517,45 @@ def _run_phase(event, context):
         phase1_key=key_for(prefix,batch,'.state/phase-1.json')
         if s3_key_exists(s3,bucket,phase1_key):
             if event.get('replace_existing') is not True:
-                raise ValueError('Phase 1 already exists for %s. Use a new batch_id or set replace_existing=true deliberately'%batch)
-            for later in (2,3):
-                key=key_for(prefix,batch,'.state/phase-%d.json'%later)
-                if s3_key_exists(s3,bucket,key):
-                    raise ValueError('Cannot replace Phase 1 because Phase %d exists. Use a NEW batch_id'%later)
+                raise ValueError('Phase 1 already exists for %s. Use a NEW batch_id or set replace_existing=true deliberately'%batch)
+            phase2_key=key_for(prefix,batch,'.state/phase-2.json')
+            if s3_key_exists(s3,bucket,phase2_key):
+                raise ValueError('Cannot replace Phase 1 because Phase 2 exists. Use a NEW batch_id')
     else:
         state1=read_state(s3,bucket,prefix,batch,1)
-        if state1.get('schema_version')!=2:
-            raise ValueError('This batch was created by an older Lambda version without a non-OS service baseline. Start a NEW batch_id with v3 Phase 1 before upgrading.')
+        if state1.get('schema_version') not in (2,3):
+            raise ValueError('This batch does not contain a compatible V3/V4 Phase 1 baseline. Run Phase 1 before upgrading, using this code or the supported V3 baseline format.')
         if state1.get('region')!=region or state1.get('account_id')!=account:
             raise ValueError('Phase 1 belongs to another AWS account or region')
         hostnames=list(state1['hosts'])
         if event.get('hostnames') is not None and set(unique_hosts(event['hostnames']))!=set(hostnames):
-            raise ValueError('Hostnames differ from Phase 1; use same batch_id and hostnames')
+            raise ValueError('Hostnames differ from Phase 1; use the same batch_id and hostnames')
         types={h:state1['hosts'][h]['server_type'] for h in hostnames}
         checked_services={h:state1['hosts'][h]['critical_services'] for h in hostnames}
         service_exclusions={h:state1['hosts'][h].get('service_exclusions',[]) for h in hostnames}
         service_inclusions={h:state1['hosts'][h].get('service_inclusions',[]) for h in hostnames}
-        if has_state(s3,bucket,prefix,batch,phase) and event.get('replace_existing') is not True:
-            raise ValueError('Phase %d already exists for batch %s; set replace_existing=true only to intentionally refresh this phase'%(phase,batch))
-        if phase==2 and has_state(s3,bucket,prefix,batch,3):
-            raise ValueError('Cannot update Phase 2 after Phase 3 was generated; use a NEW batch_id')
-        prior_state=state1 if phase==2 else read_state(s3,bucket,prefix,batch,2)
-        before=prior_state['hosts']
-        if set(before)!=set(hostnames):raise ValueError('Saved phase hostnames do not match')
-    if phase in (2,3):
-        times=event.get('upgrade_completed_at_utc')
+        if has_state(s3,bucket,prefix,batch,2) and event.get('replace_existing') is not True:
+            raise ValueError('Phase 2 already exists for batch %s; set replace_existing=true only to intentionally refresh this phase'%batch)
+        prior_state=state1
+        before=state1['hosts']
+        if set(before)!=set(hostnames):raise ValueError('Saved Phase 1 hostnames do not match')
+        # Re-render the baseline HTML with the current template so CSV export
+        # controls are present even when the saved Phase 1 state was produced by V3.
+        baseline_report_key=key_for(prefix,batch,'phase-1.html')
+        write(s3,bucket,baseline_report_key,phase_html(state1),'text/html; charset=utf-8')
+
+    start_by_host={};start_sydney_by_host={}
+    if phase==2:
+        times=event.get('upgrade_completed_at_sydney')
         if not isinstance(times,dict) or set(times)!=set(hostnames):
-            raise ValueError('Run %d requires upgrade_completed_at_utc mapping for every hostname'%phase)
-        start_by_host={h:parse_time(times[h]) for h in hostnames}
-    else:
-        start_by_host={}
+            raise ValueError('Phase 2 requires upgrade_completed_at_sydney mapping for every hostname, using Sydney local time')
+        for host in hostnames:
+            utc_value,local_value=parse_sydney_time(times[host])
+            start_by_host[host]=utc_value
+            start_sydney_by_host[host]=iso_sydney_time(local_value)
+
     host_data=resolve_instances(ec2,hostnames)
-    if phase>1:
+    if phase==2:
         for h in hostnames:
             if host_data[h]['instance_id']!=state1['hosts'][h]['instance_id']:
                 raise ValueError('%s Name tag now resolves to a different EC2 instance ID'%h)
@@ -1490,23 +1564,18 @@ def _run_phase(event, context):
         if start>=t:raise ValueError('%s upgrade completion timestamp is in the future'%host)
         preceding_report_time=parse_time(prior_state['generated_at_utc'])
         if start<=preceding_report_time:
-            raise ValueError('%s upgrade completion must occur AFTER preceding phase report was generated'%host)
+            raise ValueError('%s upgrade completion must occur AFTER the Phase 1 baseline report was generated'%host)
         if (t-start).days>455:
             raise ValueError('%s upgrade completion is beyond 455-day hourly CloudWatch retention'%host)
-        if phase==3:
-            last=datetime_from_state(before[host].get('upgrade_completed_at_utc'))
-            if last and start<=last:
-                raise ValueError('%s Phase 3 completion time must be later than Phase 2 completion'%host)
+
     LOG.info('Starting RHEL OS report batch=%s phase=%d region=%s hosts=%s',batch,phase,region,hostnames)
     tracked_by_host={}
-    if phase>1:
+    if phase==2:
         for h in hostnames:
-            saved=[state1['hosts'][h]]
-            if phase==3:saved.append(before[h])
-            tracked_by_host[h]=sorted({svc.get('name') for old in saved for svc in (old.get('snapshot') or {}).get('non_os_services',[]) if svc.get('name')})
+            tracked_by_host[h]=sorted({svc.get('name') for svc in (state1['hosts'][h].get('snapshot') or {}).get('non_os_services',[]) if svc.get('name')})
     snapshot_results=query_os_snapshots(ssm,host_data,checked_services,service_inclusions,service_exclusions,tracked_by_host)
-    state={'schema_version':2,'batch_id':batch,'phase':phase,'account_id':account,
-           'region':region,'generated_at_utc':iso_time(t),'hosts':{}}
+    state={'schema_version':3,'batch_id':batch,'phase':phase,'account_id':account,
+           'region':region,'generated_at_utc':iso_time(t),'generated_at_sydney':format_sydney_time(t),'hosts':{}}
     for host in hostnames:
         info=host_data[host]
         start_raw=t-dt.timedelta(days=baseline_days) if phase==1 else start_by_host[host]
@@ -1516,15 +1585,17 @@ def _run_phase(event, context):
         ss=snapshot_results[host]
         if discovered==0:
             warnings.append('No CWAgent metrics discovered by InstanceId. Verify CWAgent is installed, running and includes append_dimensions InstanceId; historical guest metrics may be absent.')
-        if phase>1 and (t-start_raw)<dt.timedelta(hours=24):
-            warnings.append('Less than 24 hours after upgrade: performance comparisons may be unreliable; rerun when enough normal-load data exists.')
+        if phase==2 and (t-start_raw)<dt.timedelta(hours=24):
+            warnings.append('Less than 24 hours after final upgrade: performance comparisons may be unreliable; rerun after more normal-load data is available.')
         if not any(m['samples'] for m in metrics):
             warnings.append('No CloudWatch points returned in this phase window')
         rec={'hostname':host,'instance_id':info['instance_id'],
              'instance_type':info['instance_type'],'availability_zone':info['availability_zone'],
              'server_type':types[host],'phase':phase,'critical_services':checked_services[host],
              'service_exclusions':service_exclusions[host], 'service_inclusions':service_inclusions[host],
-             'volumes':vols,'upgrade_completed_at_utc':iso_time(start_raw) if phase>1 else None,
+             'volumes':vols,
+             'upgrade_completed_at_sydney':start_sydney_by_host.get(host),
+             'upgrade_completed_at_utc':iso_time(start_raw) if phase==2 else None,
              'window':{'start':iso_time(start),'end':iso_time(end),
                        'hours':max(0,int((end-start).total_seconds()/PERIOD))},
              'ssm_status':ss['status'],'ssm_error':ss.get('error'),
@@ -1532,16 +1603,16 @@ def _run_phase(event, context):
              'snapshot':ss.get('snapshot'),'metrics':metrics,'warnings':warnings}
         baseline=state1['hosts'][host] if state1 is not None else None
         rec['checks']=validate_host(host,rec,before.get(host),baseline)
-        if phase>1:
+        if phase==2:
             rec['prior_comparison']=calculate_prior_changes(rec,before.get(host))
             regressions=[x for x in rec['prior_comparison'] if x['status']=='WARN']
             for item in regressions:
-                rec['checks'].append(check('WARN','Regression vs previous phase: '+item['metric'],
-                    'Hourly mean %+.1f%% from previous stage; check workload comparability'%item['change_pct'],
+                rec['checks'].append(check('WARN','Regression vs RHEL 8.8 baseline: '+item['metric'],
+                    'Hourly mean %+.1f%% from baseline; check workload comparability'%item['change_pct'],
                     'Performance'))
         else:rec['prior_comparison']=[]
         state['hosts'][host]=rec
-    # Persist report first; data-state is not a user-facing report.
+
     report_key=key_for(prefix,batch,'phase-%d.html'%phase)
     write(s3,bucket,report_key,phase_html(state),'text/html; charset=utf-8')
     data_key=key_for(prefix,batch,'.state/phase-%d.json'%phase)
@@ -1550,15 +1621,14 @@ def _run_phase(event, context):
     result={'batch_id':batch,'phase':phase,'account_id':account,'region':region,'script_version':VERSION,
             'report':'s3://%s/%s'%(bucket,report_key),
             'status_json':'s3://%s/%s'%(bucket,status_key),
-            'host_statuses':{
-                 host:status_of(rec['checks']) for host,rec in state['hosts'].items()}}
-    if phase==3:
-        phase2=read_state(s3,bucket,prefix,batch,2)
+            'host_statuses':{host:status_of(rec['checks']) for host,rec in state['hosts'].items()}}
+    summary_key=None
+    if phase==2:
         summary_key=key_for(prefix,batch,'final-summary.html')
-        write(s3,bucket,summary_key,final_html([state1,phase2,state]),'text/html; charset=utf-8')
+        write(s3,bucket,summary_key,final_html([state1,state]),'text/html; charset=utf-8')
         result['final_summary']='s3://%s/%s'%(bucket,summary_key)
     diagnostic=phase_diagnostic(state,report_key,data_key)
-    diagnostic['final_summary_s3_key']=summary_key if phase==3 else None
+    diagnostic['final_summary_s3_key']=summary_key
     write(s3,bucket,status_key,json.dumps(diagnostic,ensure_ascii=False,indent=2),'application/json')
     result['execution_status']=diagnostic['execution_status']
     return result
@@ -1577,7 +1647,7 @@ def lambda_handler(event, context):
             if isinstance(event,dict):
                 phase=int(event.get('phase',0))
                 batch=clean_batch(event.get('batch_id'))
-                if phase in (1,2,3):
+                if phase in (1,2):
                     bucket=setting('REPORT_BUCKET',True)
                     prefix=setting('REPORT_PREFIX',default='rhel-upgrade-reports').strip('/')
                     key=key_for(prefix,batch,'phase-%d-execution-error-%s.json'%(phase,now_utc().strftime('%Y%m%dT%H%M%S%fZ')))
@@ -1585,7 +1655,7 @@ def lambda_handler(event, context):
                           'generated_at_utc':iso_time(now_utc()),'execution_status':'ERROR',
                           'exception_type':type(error).__name__,
                           'error':str(error)[:1500],
-                          'note':'Lambda failed before a successful phase report. See CloudWatch Lambda logs. Existing success state has not been deleted.'}
+                          'note':'Lambda failed before a successful phase report. See CloudWatch Lambda logs. Existing success state has not been deleted. Phase 1 is before upgrade; Phase 2 is after final RHEL 9.6 upgrade.'}
                     client=boto3.client('s3')
                     write(client,bucket,key,json.dumps(body,indent=2),'application/json')
                     html_key=key[:-5]+'.html'
